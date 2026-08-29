@@ -124,6 +124,17 @@ async function validateGenerationFile(filePath) {
   return metadata;
 }
 
+async function readCompletedProbeResult(paths, request) {
+  const generation = generationProbePaths(paths, request?.probeId);
+  try {
+    await validateGenerationFile(generation.resultFile);
+    const result = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
+    return result != null && sameRequest(result, request) ? result : null;
+  } catch {
+    return null;
+  }
+}
+
 async function readJsonIfExists(filePath) {
   let handle;
   try {
@@ -350,18 +361,11 @@ export async function readEventWakeProbeResult(
     const firstRequest = await readCurrentProbeRequest(paths);
     if (firstRequest == null) return { status: "missing" };
     await cleanupOrphanedProbeGenerations(paths, firstRequest, observedAt).catch(() => {});
-    const generation = generationProbePaths(paths, firstRequest.probeId);
-    let result = null;
-    try {
-      await validateGenerationFile(generation.resultFile);
-      result = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
-    } catch {
-      return { status: "missing" };
-    }
+    const result = await readCompletedProbeResult(paths, firstRequest);
     await afterResultRead({ attempt, probeId: firstRequest.probeId });
     const secondRequest = await readCurrentProbeRequest(paths);
     if (!sameRequest(firstRequest, secondRequest)) continue;
-    if (result != null && sameRequest(result, firstRequest)) return result;
+    if (result != null) return result;
     if (observedAt > firstRequest.expiresAt) return { status: "expired", ...firstRequest };
     return { status: "pending", ...firstRequest };
   }
@@ -387,11 +391,10 @@ export async function claimEventWakeProbe(
   const request = await readCurrentProbeRequest(paths);
   if (request == null) return { status: "none" };
   await cleanupOrphanedProbeGenerations(paths, request, observedAt).catch(() => {});
-  const generation = generationProbePaths(paths, request.probeId);
-  await validateGenerationFile(generation.resultFile);
-  const result = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
-  if (result != null && sameRequest(result, request)) return { status: "complete", result };
+  const result = await readCompletedProbeResult(paths, request);
+  if (result != null) return { status: "complete", result };
   if (observedAt > request.expiresAt) return { status: "expired", ...request };
+  const generation = generationProbePaths(paths, request.probeId);
   await afterInitialResultRead({ probeId: request.probeId });
   const claimId = createClaimId();
   if (!validProbeId(claimId)) throw new Error("Invalid event-wake probe claim identity");
@@ -405,10 +408,9 @@ export async function claimEventWakeProbe(
     );
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
-    const completedResult = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
-    return completedResult != null && sameRequest(completedResult, request)
-      ? { status: "complete", result: completedResult }
-      : { status: "busy" };
+    const completedResult = await readCompletedProbeResult(paths, request);
+    if (completedResult != null) return { status: "complete", result: completedResult };
+    return observedAt > request.expiresAt ? { status: "expired", ...request } : { status: "busy" };
   }
   const claimRecord = {
     protocol: EVENT_WAKE_PROBE_PROTOCOL,
@@ -430,14 +432,13 @@ export async function claimEventWakeProbe(
       await releaseOwnedClaimPath(claim);
       return { status: "none" };
     }
-    await validateGenerationFile(generation.resultFile);
-    const completedResult = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
+    const completedResult = await readCompletedProbeResult(paths, request);
     const requestAfterResult = await readCurrentProbeRequest(paths);
     if (!sameRequest(requestAfterResult, request)) {
       await releaseOwnedClaimPath(claim);
       return { status: "none" };
     }
-    if (completedResult != null && sameRequest(completedResult, request)) {
+    if (completedResult != null) {
       await releaseOwnedClaimPath(claim);
       return { status: "complete", result: completedResult };
     }

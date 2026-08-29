@@ -356,6 +356,57 @@ test("doctor CLI stays healthy after request ttl when a matching present probe r
   }
 });
 
+test("invalid generation result files never mask expiry or pending probe state", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-invalid-result-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const config = defaultConfig(codexHome, "source");
+  const unrelatedFile = path.join(codexHome, "unrelated.txt");
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    await writeFile(unrelatedFile, "keep\n", { mode: 0o600 });
+
+    const expired = await armEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 1_000,
+      createProbeId: () => "probe-invalid-expired",
+    });
+    await symlink(unrelatedFile, generationProbePaths(config, expired.probeId).resultFile);
+    assert.deepEqual(await readEventWakeProbeResult(config, { runtimeRoot, now: () => 400_000 }), {
+      status: "expired",
+      probeId: expired.probeId,
+      armedAt: expired.armedAt,
+      expiresAt: expired.expiresAt,
+    });
+    assert.deepEqual(await claimEventWakeProbe(config, { runtimeRoot, now: () => 400_000 }), {
+      status: "expired",
+      probeId: expired.probeId,
+      armedAt: expired.armedAt,
+      expiresAt: expired.expiresAt,
+    });
+    assert.equal(await readFile(unrelatedFile, "utf8"), "keep\n");
+
+    await rm(config.eventWakeProbeRequestFile, { force: true });
+    await rm(generationProbePaths(config, expired.probeId).resultFile, { force: true });
+    const pending = await armEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 500_000,
+      createProbeId: () => "probe-invalid-pending",
+    });
+    await mkdir(generationProbePaths(config, pending.probeId).resultFile);
+    assert.deepEqual(await readEventWakeProbeResult(config, { runtimeRoot, now: () => 500_100 }), {
+      status: "pending",
+      probeId: pending.probeId,
+      armedAt: pending.armedAt,
+      expiresAt: pending.expiresAt,
+    });
+    const claim = await claimEventWakeProbe(config, { runtimeRoot, now: () => 500_100 });
+    assert.equal(claim.status, "claimed");
+    await releaseEventWakeProbeClaim(config, claim, { runtimeRoot });
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("probe paths are exact runtime files and unsafe targets are untouched", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-paths-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");

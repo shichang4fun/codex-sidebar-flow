@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -1296,6 +1296,97 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
     });
     assert.equal(result.status, "expired");
     assert.equal(result.probeId, "probe-expired-0001");
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-invalid-result-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let wakeCalls = 0;
+  let managedUpdate = null;
+  const unrelatedFile = path.join(codexHome, "unrelated.txt");
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    await writeFile(unrelatedFile, "keep\n", { mode: 0o600 });
+    const armed = await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => "probe-invalid-hook",
+    });
+    await symlink(unrelatedFile, generationProbeResultFile(runtimeConfig, armed.probeId));
+
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        now: () => 400_000,
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: ["local:thread-1"],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+            },
+          };
+        },
+        createAppTools(_config, options) {
+          if ((options?.requiredTools ?? []).includes("send_message_to_thread")) return { reset() {} };
+          return {
+            async connect() {
+              throw new Error("expired invalid probe result must not inspect capability");
+            },
+            reset() {},
+          };
+        },
+        async updateManaged(_stateFile, update) {
+          managedUpdate = update;
+        },
+        async wake() {
+          wakeCalls += 1;
+          return { status: "sent" };
+        },
+      },
+    );
+
+    assert.deepEqual(managedUpdate, {
+      add: [],
+      remove: [],
+      observe: ["local:thread-1"],
+    });
+    assert.equal(wakeCalls, 1);
+    assert.deepEqual(await readEventWakeProbeResult(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 400_000,
+    }), {
+      status: "expired",
+      probeId: armed.probeId,
+      armedAt: armed.armedAt,
+      expiresAt: armed.expiresAt,
+    });
+    assert.equal(await readFile(unrelatedFile, "utf8"), "keep\n");
+    assert.equal((await lstat(generationProbeResultFile(runtimeConfig, armed.probeId))).isSymbolicLink(), true);
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;

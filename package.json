@@ -6,7 +6,7 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test",
-    "check": "node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs"
+    "check": "node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs && sh -n scripts/plugin-hook.sh"
   },
   "license": "MIT",
   "repository": {

@@ -13,3 +13,5 @@ All notable changes to this project are documented here.
 ### Changed
 
 - Isolated the unsupported Desktop sidebar protocol behind an explicit experimental macOS boundary.
+- Hardened remote host discovery, parent Project protection, needs-attention handling, Hook deadlines, state locking, socket ownership checks, and log redaction after independent review.
+- Split source and plugin installation modes so only one Hook set is active.

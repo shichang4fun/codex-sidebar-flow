@@ -15,8 +15,7 @@ const sidebarRealtime = await import("../scripts/sidebar-realtime.mjs");
 const config = {
   actorThreadId: "automation",
   sections: { inProgress: "In Progress", forReview: "For Review", forLater: "For Later" },
-  excludeThreadIds: ["automation"],
-  ignoreSummaryContains: ["Automation ID: codex"],
+  excludeThreadIds: ["automation", "automation-copy"],
   maxMovesPerRun: 10,
 };
 
@@ -97,8 +96,16 @@ assert.throws(
       { success: false, contentItems: [{ type: "inputText", text: "move rejected" }] },
       "move_thread_to_sidebar_section",
     ),
-  /move rejected/,
+  /move_thread_to_sidebar_section returned an error/,
 );
+try {
+  sidebarRealtime.assertToolSuccess(
+    { success: false, contentItems: [{ type: "inputText", text: "secret task body" }] },
+    "move_thread_to_sidebar_section",
+  );
+} catch (error) {
+  assert.equal(error.message.includes("secret task body"), false);
+}
 assert.equal(typeof sidebarRealtime.hydrateCustomThreads, "function");
 
 const hydrationSnapshot = snapshot([
@@ -192,6 +199,14 @@ const managedState = {
 await sidebarRealtime.saveManagedState(statePath, managedState);
 assert.deepEqual(await sidebarRealtime.loadManagedState(statePath, 99_999, 2_000), managedState);
 assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+await Promise.all([
+  sidebarRealtime.updateManagedState(statePath, { add: ["local:task-b"] }),
+  sidebarRealtime.updateManagedState(statePath, { add: ["local:task-c"] }),
+]);
+assert.deepEqual(
+  new Set((await sidebarRealtime.loadManagedState(statePath)).managedThreadIds),
+  new Set(["local:task-a", "local:task-b", "local:task-c"]),
+);
 await rm(stateDirectory, { recursive: true, force: true });
 
 assert.equal(typeof sidebarRealtime.recordSessionActivity, "function");
@@ -325,6 +340,52 @@ assert.deepEqual(remoteHydrationCalls, [{ threadId: remoteNotLoaded.id, hostId: 
 assert.equal(remoteHydrated.threads[0].status, "completed");
 assert.equal(planMoves(remoteHydrated, config)[0].hostId, remoteHostId);
 
+const remoteMissingFromList = snapshot([]);
+remoteMissingFromList.sections.find((section) => section.sectionId === "progress").itemKeys.push(
+  "codex:thread:local:remote-stale",
+);
+const remoteMissingCalls = [];
+const remoteMissingHydrated = await sidebarRealtime.hydrateCustomThreads(
+  remoteMissingFromList,
+  config,
+  {
+    readThread: async (threadId, hostId) => {
+      remoteMissingCalls.push({ threadId, hostId });
+      return {
+        thread: { id: threadId, kind: "codex", hostId: remoteHostId, status: { type: "idle" } },
+        turns: [{ status: "completed" }],
+      };
+    },
+  },
+  new Map([["remote-stale", remoteHostId]]),
+);
+assert.deepEqual(remoteMissingCalls, [{ threadId: "remote-stale", hostId: remoteHostId }]);
+assert.equal(planMoves(remoteMissingHydrated, config)[0].hostId, remoteHostId);
+
+const hostlessMissing = snapshot([]);
+hostlessMissing.sections.find((section) => section.sectionId === "progress").itemKeys.push(
+  "codex:thread:local:hostless-remote",
+);
+const hostlessCalls = [];
+await sidebarRealtime.hydrateCustomThreads(hostlessMissing, config, {
+  readThread: async (threadId, hostId) => {
+    hostlessCalls.push({ threadId, hostId });
+    return { thread: { id: threadId, kind: "codex", hostId: remoteHostId, status: { type: "idle" } }, turns: [] };
+  },
+});
+assert.deepEqual(hostlessCalls, [{ threadId: "hostless-remote", hostId: undefined }]);
+
+for (const protectedSection of ["pinned", "later"]) {
+  const child = thread(`protected-parent-${protectedSection}`, "idle", "progress", {
+    projectId: `project-${protectedSection}`,
+  });
+  const protectedSnapshot = snapshot([child]);
+  protectedSnapshot.sections.find((section) => section.sectionId === protectedSection).itemKeys.push(
+    `codex:project:${child.projectId}`,
+  );
+  assert.deepEqual(planMoves(protectedSnapshot, config), []);
+}
+
 assert.deepEqual(planMoves(snapshot([thread("remote-active-idempotent", "active", "progress", {
   hostId: remoteHostId,
   sidebarItemKey: "codex:thread:local:remote-active-idempotent",
@@ -360,6 +421,37 @@ assert.equal(
   statusFromThreadRead({ thread: { status: { type: "notLoaded" } }, turns: [{ status: "failed" }] }),
   "needsattention",
 );
+for (const activeFlag of ["waitingOnApproval", "waitingOnUserInput"]) {
+  assert.equal(
+    statusFromThreadRead({
+      thread: { status: { type: "active", activeFlags: [activeFlag] } },
+      turns: [{ status: "inProgress" }],
+    }),
+    "needsattention",
+  );
+}
+
+const attentionTask = thread("attention-task", { type: "active", activeFlags: [] }, "progress");
+const attentionHydrated = await sidebarRealtime.hydrateCustomThreads(snapshot([attentionTask]), config, {
+  readThread: async () => ({
+    thread: {
+      id: attentionTask.id,
+      hostId: "local",
+      status: { type: "active", activeFlags: ["waitingOnApproval"] },
+    },
+    turns: [{ status: "inProgress" }],
+  }),
+});
+assert.equal(attentionHydrated.threads[0].status, "needsattention");
+assert.equal(planMoves(attentionHydrated, config)[0].sectionName, "For Review");
+
+assert.deepEqual(
+  sidebarRealtime.managedHostsByThreadId([
+    "local:task-a",
+    `${remoteHostId}:remote-a`,
+  ]),
+  new Map([["task-a", "local"], ["remote-a", remoteHostId]]),
+);
 
 assert.throws(
   () => planMoves({ ...snapshot([]), sections: snapshot([]).sections.filter((section) => section.name !== "For Review") }, config),
@@ -386,6 +478,19 @@ assert.deepEqual(
 assert.equal(typeof sidebarRealtime.isTrustedSocketMetadata, "function");
 assert.equal(sidebarRealtime.isTrustedSocketMetadata({ isSocket: () => true, uid: 501 }, 501), true);
 assert.equal(sidebarRealtime.isTrustedSocketMetadata({ isSocket: () => true, uid: 502 }, 501), false);
+assert.deepEqual(
+  await sidebarRealtime.filterTrustedSocketPaths(
+    ["/tmp/owned.sock", "/tmp/not-a-socket", "/tmp/foreign.sock"],
+    {
+      userId: 501,
+      statPath: async (socketPath) => ({
+        uid: socketPath === "/tmp/foreign.sock" ? 502 : 501,
+        isSocket: () => socketPath !== "/tmp/not-a-socket",
+      }),
+    },
+  ),
+  ["/tmp/owned.sock"],
+);
 assert.equal(typeof sidebarRealtime.promoteClientTimeout, "function");
 const promotedClient = new sidebarRealtime.NativePipeClient("/tmp/not-used.sock", 100);
 sidebarRealtime.promoteClientTimeout(promotedClient, 15_000);

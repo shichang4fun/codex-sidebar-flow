@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/sidebar-hook.mjs\"",
-            "timeout": 20
+            "command": "exec /bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/plugin-hook.sh\"",
+            "timeout": 15
           }
         ]
       }
@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/sidebar-hook.mjs\"",
-            "timeout": 20
+            "command": "exec /bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/plugin-hook.sh\"",
+            "timeout": 15
           }
         ]
       }

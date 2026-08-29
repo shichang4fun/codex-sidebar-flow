@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createReadStream, existsSync, watch } from "node:fs";
-import { readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -156,7 +156,9 @@ export class NativePipeClient {
       if (pending == null) continue;
       this.pending.delete(Number(response.id));
       if (response.error != null) {
-        pending.reject(new Error(response.error.message ?? "Codex app tool failed"));
+        const error = new Error("Codex app tools RPC failed");
+        error.code = "APP_TOOLS_RPC_ERROR";
+        pending.reject(error);
       } else {
         pending.resolve(response.result);
       }
@@ -271,9 +273,60 @@ export async function loadManagedState(filePath, currentTime = Date.now(), grace
 export async function saveManagedState(filePath, state) {
   if (!filePath) return;
   const normalized = normalizeManagedState(state);
-  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(normalized)}\n`, { encoding: "utf8", mode: 0o600 });
   await rename(temporaryPath, filePath);
+}
+
+async function withFileLock(lockPath, task, { attempts = 80, delayMs = 25 } = {}) {
+  let handle;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      handle = await open(lockPath, "wx", 0o600);
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST" || attempt + 1 >= attempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  try {
+    return await task();
+  } finally {
+    await handle?.close().catch(() => {});
+    await unlink(lockPath).catch(() => {});
+  }
+}
+
+export async function updateManagedState(filePath, { add = [], remove = [] } = {}) {
+  if (!filePath) return normalizeManagedState(null);
+  return withFileLock(`${filePath}.lock`, async () => {
+    const current = await loadManagedState(filePath);
+    const managedThreadIds = new Set(current.managedThreadIds);
+    for (const identity of add) if (typeof identity === "string") managedThreadIds.add(identity);
+    for (const identity of remove) if (typeof identity === "string") managedThreadIds.delete(identity);
+    const next = { ...current, managedThreadIds: [...managedThreadIds] };
+    await saveManagedState(filePath, next);
+    return next;
+  });
+}
+
+export function managedHostsByThreadId(managedThreadIds = []) {
+  const candidates = new Map();
+  for (const identity of managedThreadIds) {
+    if (typeof identity !== "string") continue;
+    const separator = identity.lastIndexOf(":");
+    if (separator <= 0 || separator === identity.length - 1) continue;
+    const hostId = identity.slice(0, separator);
+    const threadId = identity.slice(separator + 1);
+    const hosts = candidates.get(threadId) ?? new Set();
+    hosts.add(hostId);
+    candidates.set(threadId, hosts);
+  }
+  return new Map(
+    [...candidates].flatMap(([threadId, hosts]) =>
+      hosts.size === 1 ? [[threadId, [...hosts][0]]] : [],
+    ),
+  );
 }
 
 export function recordSessionActivity(state, sessionId, observedAt = Date.now(), hostId = "local") {
@@ -302,7 +355,7 @@ export function recordSnapshotActivity(state, snapshot) {
   const managedThreadIds = new Set(normalized.managedThreadIds);
   for (const thread of snapshot?.threads ?? []) {
     if (thread.kind !== "codex") continue;
-    const status = normalizedStatus(thread.status);
+    const status = normalizedThreadStatus(thread);
     if (!["active", "running", "inprogress"].includes(status)) continue;
     const identity = managedIdentity(thread.hostId, thread.id);
     if (identity != null) managedThreadIds.add(identity);
@@ -414,28 +467,46 @@ async function declaredSocketPaths() {
   }
 }
 
-async function socketCandidates(socketDir, explicitPath, maximum, allowSocketDiscovery) {
-  const preferred = [explicitPath].filter(Boolean);
-  if (!allowSocketDiscovery) return selectSocketCandidates(preferred, [], maximum);
-  preferred.push(...(await declaredSocketPaths()));
-  const entries = await readdir(socketDir, { withFileTypes: true }).catch(() => []);
-  const candidates = [];
-  for (const entry of entries) {
-    if (!entry.name.endsWith(".sock")) continue;
-    const socketPath = path.join(socketDir, entry.name);
+export async function filterTrustedSocketPaths(
+  paths,
+  { statPath = stat, userId = process.getuid?.() } = {},
+) {
+  const trusted = [];
+  for (const socketPath of paths) {
     try {
-      const metadata = await stat(socketPath);
-      if (isTrustedSocketMetadata(metadata)) {
-        candidates.push({ socketPath, mtimeMs: metadata.mtimeMs });
-      }
+      const metadata = await statPath(socketPath);
+      if (isTrustedSocketMetadata(metadata, userId)) trusted.push(socketPath);
     } catch {
-      // Socket disappeared during discovery.
+      // Fail closed when a candidate disappears or is not inspectable.
     }
   }
-  const discovered = candidates
-    .sort((a, b) => b.mtimeMs - a.mtimeMs)
-    .map((entry) => entry.socketPath);
-  return selectSocketCandidates(preferred, discovered, maximum);
+  return trusted;
+}
+
+async function socketCandidates(socketDir, explicitPath, maximum, allowSocketDiscovery) {
+  const preferred = [explicitPath].filter(Boolean);
+  const discovered = [];
+  if (allowSocketDiscovery) {
+    preferred.push(...(await declaredSocketPaths()));
+    const entries = await readdir(socketDir, { withFileTypes: true }).catch(() => []);
+    const candidates = [];
+    for (const entry of entries) {
+      if (!entry.name.endsWith(".sock")) continue;
+      const socketPath = path.join(socketDir, entry.name);
+      try {
+        const metadata = await stat(socketPath);
+        if (isTrustedSocketMetadata(metadata)) {
+          candidates.push({ socketPath, mtimeMs: metadata.mtimeMs });
+        }
+      } catch {
+        // Socket disappeared during discovery.
+      }
+    }
+    discovered.push(
+      ...candidates.sort((a, b) => b.mtimeMs - a.mtimeMs).map((entry) => entry.socketPath),
+    );
+  }
+  return filterTrustedSocketPaths(selectSocketCandidates(preferred, discovered, maximum));
 }
 
 async function discoverHost(config) {
@@ -484,9 +555,10 @@ async function discoverHost(config) {
 
 export function assertToolSuccess(result, toolName) {
   if (result?.success === true) return result;
-  const detail = result?.contentItems?.find((item) => item.type === "inputText")?.text;
-  const suffix = typeof detail === "string" && detail.length > 0 ? `: ${detail.slice(0, 500)}` : "";
-  throw new Error(`${toolName} returned an error${suffix}`);
+  const error = new Error(`${toolName} returned an error`);
+  error.code = "APP_TOOL_ERROR";
+  error.toolName = toolName;
+  throw error;
 }
 
 function parseToolText(result, toolName) {
@@ -626,6 +698,19 @@ function normalizedStatus(status) {
   return String(status ?? "").toLowerCase().replaceAll(" ", "");
 }
 
+export function normalizedThreadStatus(thread) {
+  const status = thread?.status;
+  const type = normalizedStatus(status?.type ?? status);
+  const flags = new Set((status?.activeFlags ?? []).map(normalizedStatus));
+  if (
+    type === "active" &&
+    (flags.has("waitingonapproval") || flags.has("waitingonuserinput"))
+  ) {
+    return "needsattention";
+  }
+  return type;
+}
+
 function parseThreadItemKey(key) {
   const prefix = "codex:thread:";
   if (!key.startsWith(prefix)) return null;
@@ -635,33 +720,44 @@ function parseThreadItemKey(key) {
 }
 
 export function sidebarMembershipForThread(sections, thread) {
+  let directMembership = null;
   let projectMembership = null;
   for (const section of sections ?? []) {
     for (const key of section.itemKeys ?? []) {
       const parsed = parseThreadItemKey(key);
       if (parsed?.threadId === thread.id) {
-        return {
+        directMembership = {
           sectionId: section.sectionId,
           itemKey: key,
-          itemHostId: parsed.hostId,
-          viaProject: false,
         };
       }
       if (thread.projectId && key === `codex:project:${thread.projectId}`) {
         projectMembership = {
           sectionId: section.sectionId,
           itemKey: key,
-          itemHostId: null,
-          viaProject: true,
         };
       }
     }
   }
-  return projectMembership;
+  if (directMembership == null && projectMembership == null) return null;
+  const current = directMembership ?? projectMembership;
+  return {
+    ...current,
+    viaProject: directMembership == null,
+    direct: directMembership,
+    project: projectMembership,
+  };
+}
+
+export function membershipIsProtected(membership, protectedSectionIds) {
+  if (membership == null) return false;
+  return [membership.direct?.sectionId, membership.project?.sectionId].some((sectionId) =>
+    protectedSectionIds.has(sectionId),
+  );
 }
 
 export function statusFromThreadRead(result) {
-  const threadStatus = normalizedStatus(result?.thread?.status?.type ?? result?.thread?.status);
+  const threadStatus = normalizedThreadStatus(result?.thread);
   if (threadStatus !== "notloaded" && threadStatus !== "") return threadStatus;
   const turnStatus = normalizedStatus(result?.turns?.[0]?.status);
   if (["running", "inprogress", "active"].includes(turnStatus)) return "active";
@@ -672,7 +768,7 @@ export function statusFromThreadRead(result) {
   return threadStatus;
 }
 
-export async function hydrateCustomThreads(snapshot, config, appTools) {
+export async function hydrateCustomThreads(snapshot, config, appTools, knownHosts = new Map()) {
   const threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
   const threadById = new Map(threads.map((thread) => [thread.id, thread]));
   const customSections = (snapshot.sections ?? []).filter((section) =>
@@ -694,8 +790,9 @@ export async function hydrateCustomThreads(snapshot, config, appTools) {
     const parsed = parseThreadItemKey(key);
     if (parsed == null) continue;
     const existing = threadById.get(parsed.threadId);
-    if (existing != null && normalizedStatus(existing.status) !== "notloaded") continue;
-    const executionHostId = existing?.hostId ?? parsed.hostId;
+    const existingStatus = normalizedThreadStatus(existing);
+    if (existing != null && !["notloaded", "active"].includes(existingStatus)) continue;
+    const executionHostId = existing?.hostId ?? knownHosts.get(parsed.threadId);
     reads.push({
       key,
       parsed,
@@ -718,13 +815,22 @@ export async function hydrateCustomThreads(snapshot, config, appTools) {
       continue;
     }
     const result = outcome.value;
+    const resolvedHostId = result.thread?.hostId ?? existing?.hostId ?? executionHostId;
+    if (typeof resolvedHostId !== "string" || resolvedHostId.length === 0) {
+      snapshot.hydrationErrors.push({
+        threadId: parsed.threadId,
+        error: "read_thread did not return an authoritative hostId",
+      });
+      continue;
+    }
     const hydrated = existing ?? {
       id: result.thread?.id ?? parsed.threadId,
       kind: result.thread?.kind ?? "codex",
-      hostId: result.thread?.hostId ?? executionHostId,
+      hostId: resolvedHostId,
       title: result.thread?.title ?? parsed.threadId,
       summary: null,
     };
+    hydrated.hostId = resolvedHostId;
     hydrated.sidebarItemKey = key;
     hydrated.status = statusFromThreadRead(result);
     if (existing == null) {
@@ -753,14 +859,13 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
 
   for (const thread of snapshot.threads ?? []) {
     if (thread.kind !== "codex" || !thread.hostId || excludedIds.has(thread.id)) continue;
-    if ((config.ignoreSummaryContains ?? []).some((marker) => thread.summary?.includes(marker))) continue;
 
     const membership = sidebarMembershipForThread(sections, thread);
     const currentSectionId = membership?.sectionId;
-    if (currentSectionId == null || currentSectionId === forLater.sectionId) continue;
-    if (currentSectionId === pinned.sectionId) continue;
+    if (currentSectionId == null) continue;
+    if (membershipIsProtected(membership, new Set([pinned.sectionId, forLater.sectionId]))) continue;
 
-    const status = normalizedStatus(thread.status);
+    const status = normalizedThreadStatus(thread);
     let destination = null;
     if (status === "active") {
       if (
@@ -867,6 +972,7 @@ async function main() {
           await appTools.listThreads(),
           config,
           appTools,
+          managedHostsByThreadId(managedState.managedThreadIds),
         );
         if (snapshot.hydrationErrors?.length > 0) {
           log("warn", "some custom-section tasks could not be refreshed", {

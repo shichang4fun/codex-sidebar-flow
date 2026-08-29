@@ -105,7 +105,7 @@ assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
         return {
           async listThreads() {
             if (currentAttempt === 1) throw new Error("Codex app tools pipe closed");
-            return snapshot();
+            return snapshot({ hostId: "remote-control:env_remote_test" });
           },
           async moveThread() {
             throw new Error("lifecycle hooks must not mutate sidebar state");
@@ -121,7 +121,7 @@ assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
   assert.equal(result.attempts, 2);
   assert.equal(result.move, null);
   assert.deepEqual(result.managedAdds, []);
-  assert.deepEqual(result.observedIdentities, ["local:thread-1"]);
+  assert.deepEqual(result.observedIdentities, ["remote-control:env_remote_test:thread-1"]);
   assert.equal(created, 2);
   assert.equal(reset, 2);
 }
@@ -171,12 +171,228 @@ assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
   }]);
   assert.deepEqual(result.managedAdds, []);
   assert.deepEqual(result.observedIdentities, ["remote-control:env_remote_test:thread-1"]);
-  assert.deepEqual(result.eventEnvelope, {
+  const { fingerprint, ...routingEnvelope } = result.eventEnvelope;
+  assert.match(fingerprint, /^[a-f0-9]{64}$/);
+  assert.deepEqual(routingEnvelope, {
     protocol: "codex-sidebar-flow/event-v1",
     event: "UserPromptSubmit",
     threadId: "thread-1",
     hostId: "remote-control:env_remote_test",
   });
+}
+
+{
+  const execute = async (prompt) => executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "UserPromptSubmit",
+      host_id: "local",
+      transcript_path: "/private/opaque/transcript.jsonl",
+      prompt,
+    },
+    {
+      ...config,
+      eventWake: eventWakeConfig,
+    },
+    {
+      createAppTools() {
+        return {
+          async listThreads() {
+            return snapshot({ hostId: "local" });
+          },
+          reset() {},
+        };
+      },
+      wait: async () => {},
+    },
+  );
+  const first = await execute("raw secret task content one");
+  const duplicate = await execute("raw secret task content one");
+  const distinct = await execute("raw secret task content two");
+  assert.match(first.eventEnvelope.fingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(duplicate.eventEnvelope.fingerprint, first.eventEnvelope.fingerprint);
+  assert.notEqual(distinct.eventEnvelope.fingerprint, first.eventEnvelope.fingerprint);
+  assert.equal(JSON.stringify(first.eventEnvelope).includes("raw secret"), false);
+  assert.equal(JSON.stringify(first.eventEnvelope).includes("transcript"), false);
+}
+
+{
+  const executeStop = async (transcriptPath, stopHookActive) => executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "Stop",
+      host_id: "local",
+      transcript_path: transcriptPath,
+      stop_hook_active: stopHookActive,
+    },
+    {
+      ...config,
+      stopSettleDelayMs: 0,
+      eventWake: eventWakeConfig,
+    },
+    {
+      createAppTools() {
+        return {
+          async listThreads() {
+            return snapshot({ hostId: "local" });
+          },
+          reset() {},
+        };
+      },
+      wait: async () => {},
+    },
+  );
+  const first = await executeStop("/private/first.jsonl", false);
+  const duplicate = await executeStop("/private/second.jsonl", true);
+  assert.equal(duplicate.eventEnvelope.fingerprint, first.eventEnvelope.fingerprint);
+}
+
+{
+  const result = await executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "UserPromptSubmit",
+      host_id: "bad\nhost",
+    },
+    {
+      ...config,
+      eventWake: eventWakeConfig,
+    },
+    {
+      createAppTools() {
+        return {
+          async listThreads() {
+            return snapshot({ includeThread: false });
+          },
+          async readThread() {
+            assert.fail("an invalid host hint must never reach read_thread");
+          },
+          reset() {},
+        };
+      },
+      wait: async () => {},
+    },
+  );
+  assert.deepEqual(result.observedIdentities, []);
+  assert.equal(result.eventEnvelope, null);
+}
+
+for (const threads of [
+  [
+    { id: "thread-1", hostId: "local", kind: "codex", status: "active" },
+    { id: "thread-1", hostId: "remote-control:env_remote_test", kind: "codex", status: "active" },
+  ],
+  [
+    { id: "thread-1", hostId: "remote-control:env_remote_test", kind: "codex", status: "active" },
+    { id: "thread-1", hostId: "local", kind: "codex", status: "active" },
+  ],
+]) {
+  const result = await executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "UserPromptSubmit",
+      host_id: "remote-control:env_remote_test",
+    },
+    {
+      ...config,
+      eventWake: eventWakeConfig,
+    },
+    {
+      createAppTools() {
+        return {
+          async listThreads() {
+            return { threads, sections: [] };
+          },
+          async readThread() {
+            assert.fail("an exact host-qualified list candidate must not require hydration");
+          },
+          reset() {},
+        };
+      },
+      wait: async () => {},
+    },
+  );
+  assert.deepEqual(result.observedIdentities, ["remote-control:env_remote_test:thread-1"]);
+  assert.equal(result.eventEnvelope?.hostId, "remote-control:env_remote_test");
+}
+
+for (const threads of [
+  [
+    { id: "thread-1", hostId: "local", kind: "codex", status: "active" },
+    { id: "thread-1", hostId: "remote-control:env_remote_test", kind: "codex", status: "active" },
+  ],
+  [
+    { id: "thread-1", hostId: "remote-control:env_remote_test", kind: "codex", status: "active" },
+    { id: "thread-1", hostId: "local", kind: "codex", status: "active" },
+  ],
+]) {
+  const result = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+    {
+      ...config,
+      eventWake: eventWakeConfig,
+    },
+    {
+      createAppTools() {
+        return {
+          async listThreads() {
+            return { threads, sections: [] };
+          },
+          async readThread() {
+            assert.fail("an ambiguous hostless identity must fail closed without hydration");
+          },
+          reset() {},
+        };
+      },
+      wait: async () => {},
+    },
+  );
+  assert.deepEqual(result.observedIdentities, []);
+  assert.equal(result.eventEnvelope, null);
+}
+
+{
+  const result = await executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "Stop",
+      host_id: "remote-control:env_expected",
+    },
+    {
+      ...config,
+      stopSettleDelayMs: 0,
+      eventWake: eventWakeConfig,
+    },
+    {
+      createAppTools() {
+        return {
+          async listThreads() {
+            return {
+              threads: [{ id: "thread-1", hostId: "local", kind: "codex", status: "idle" }],
+              sections: [],
+            };
+          },
+          async readThread(threadId, hostId) {
+            assert.equal(threadId, "thread-1");
+            assert.equal(hostId, "remote-control:env_expected");
+            return {
+              thread: {
+                id: "thread-other",
+                hostId: "remote-control:env_expected",
+                kind: "codex",
+                status: { type: "idle" },
+              },
+              turns: [],
+            };
+          },
+          reset() {},
+        };
+      },
+      wait: async () => {},
+    },
+  );
+  assert.deepEqual(result.observedIdentities, []);
+  assert.equal(result.eventEnvelope, null);
 }
 
 for (const event of ["UserPromptSubmit", "Stop"]) {
@@ -245,12 +461,8 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     },
   );
   assert.deepEqual(phases, ["wait:500", "list", "read:thread-1:remote-control:env_input"]);
-  assert.deepEqual(result.eventEnvelope, {
-    protocol: "codex-sidebar-flow/event-v1",
-    event: "Stop",
-    threadId: "thread-1",
-    hostId: "remote-control:env_actual",
-  });
+  assert.deepEqual(result.observedIdentities, []);
+  assert.equal(result.eventEnvelope, null);
 }
 
 {
@@ -518,6 +730,37 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     const records = (await readFile(hookLogFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(records.at(-1).wakeStatus, "sent");
     assert.equal("wakeErrorCode" in records.at(-1), false);
+
+    const fingerprint = "a".repeat(64);
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit", prompt: "raw secret prompt" },
+      configPath,
+      {
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+              fingerprint,
+            },
+          };
+        },
+        async wake() {
+          return { status: "excluded", errorCode: "duplicate_event" };
+        },
+      },
+    );
+    const duplicateRecord = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
+    assert.equal(duplicateRecord.wakeStatus, "excluded");
+    assert.equal(duplicateRecord.wakeErrorCode, "duplicate_event");
+    assert.equal(JSON.stringify(duplicateRecord).includes(fingerprint), false);
+    assert.equal(JSON.stringify(duplicateRecord).includes("raw secret"), false);
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;

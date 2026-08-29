@@ -2,6 +2,7 @@
 
 import { appendFile, chmod, mkdir, rename, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -30,6 +31,53 @@ const DEFAULT_HOOK_DEADLINE_MS = 9000;
 const OBSERVATION_REQUIRED_TOOLS = ["list_threads", "read_thread"];
 const EVENT_WAKE_REQUIRED_TOOLS = ["list_threads", "read_thread", "send_message_to_thread"];
 const MAX_LOG_BYTES = 1024 * 1024;
+const LIFECYCLE_ID_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
+
+function lifecycleFingerprint(input, thread) {
+  const source = input?.hook_event_name === "UserPromptSubmit"
+    ? {
+        prompt: typeof input?.prompt === "string" ? input.prompt : null,
+        transcriptPath: typeof input?.transcript_path === "string" ? input.transcript_path : null,
+      }
+    : null;
+  return createHash("sha256").update(JSON.stringify({
+    event: input?.hook_event_name,
+    threadId: thread?.id,
+    hostId: thread?.hostId,
+    source,
+  })).digest("hex");
+}
+
+export function selectLifecycleThread(snapshot, input) {
+  const threadId = input?.session_id;
+  if (typeof threadId !== "string" || !LIFECYCLE_ID_PATTERN.test(threadId) || threadId.startsWith("-")) {
+    return { status: "invalid", thread: null, hostId: null };
+  }
+  const hasHostHint = Object.hasOwn(input ?? {}, "host_id");
+  const hostId = hasHostHint ? input.host_id : null;
+  if (
+    hasHostHint
+    && (typeof hostId !== "string" || !LIFECYCLE_ID_PATTERN.test(hostId) || hostId.startsWith("-"))
+  ) {
+    return { status: "invalid", thread: null, hostId: null };
+  }
+  const idMatches = (snapshot?.threads ?? []).filter((candidate) => candidate?.id === threadId);
+  const candidates = hasHostHint
+    ? idMatches.filter((candidate) => candidate?.hostId === hostId)
+    : idMatches;
+  if (candidates.length !== 1) {
+    return {
+      status: candidates.length > 1 ? "ambiguous" : "missing",
+      thread: null,
+      hostId: hasHostHint ? hostId : null,
+    };
+  }
+  return {
+    status: "selected",
+    thread: candidates[0],
+    hostId: candidates[0]?.hostId ?? (hasHostHint ? hostId : null),
+  };
+}
 
 export function managedMutationFromLifecycle(snapshot, input, config) {
   const threadId = input?.session_id;
@@ -38,7 +86,7 @@ export function managedMutationFromLifecycle(snapshot, input, config) {
   if (event !== "UserPromptSubmit") return null;
   if ((config.excludeThreadIds ?? []).includes(threadId)) return null;
 
-  const thread = (snapshot.threads ?? []).find((candidate) => candidate.id === threadId);
+  const thread = selectLifecycleThread(snapshot, input).thread;
   if (thread == null || thread.kind !== "codex" || !thread.hostId) return null;
   const identity = managedIdentity(thread.hostId, thread.id);
   if (identity == null) return null;
@@ -59,7 +107,7 @@ function authoritativeEventEnvelope(snapshot, input, config) {
   if ((config.excludeThreadIds ?? []).includes(threadId)) return null;
   if (threadId === config?.eventWake?.organizerThreadId) return null;
 
-  const thread = (snapshot.threads ?? []).find((candidate) => candidate.id === threadId);
+  const thread = selectLifecycleThread(snapshot, input).thread;
   if (thread == null || thread.kind !== "codex" || typeof thread.hostId !== "string" || thread.hostId.length === 0) {
     return null;
   }
@@ -67,6 +115,7 @@ function authoritativeEventEnvelope(snapshot, input, config) {
     event,
     threadId: thread.id,
     hostId: thread.hostId,
+    fingerprint: lifecycleFingerprint(input, thread),
   });
 }
 
@@ -152,20 +201,25 @@ function remainingDeadlineMs(deadlineAt, now = Date.now) {
 async function hydrateHookThread(snapshot, input, appTools, deadlineAt, now = Date.now) {
   const threadId = input.session_id;
   const threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
-  const existing = threads.find((thread) => thread.id === threadId);
-  const mustRead = existing == null || !existing.hostId;
+  const selection = selectLifecycleThread(snapshot, input);
+  const existing = selection.thread;
+  const mustRead = existing == null || !existing.hostId || !existing.kind;
   if (!mustRead) return snapshot;
-  const executionHostId = existing?.hostId ?? input.host_id;
+  if (selection.status === "ambiguous" || selection.status === "invalid") return snapshot;
+  const executionHostId = selection.hostId;
   if (typeof executionHostId !== "string" || executionHostId.length === 0) return snapshot;
   const result = await runBeforeDeadline(
     () => appTools.readThread(threadId, executionHostId),
     deadlineAt,
     now,
   );
-  if (result?.thread == null || typeof result.thread !== "object") return snapshot;
-  const hostId = typeof result.thread.hostId === "string" && result.thread.hostId.length > 0
-    ? result.thread.hostId
-    : existing?.hostId;
+  if (
+    result?.thread == null
+    || typeof result.thread !== "object"
+    || result.thread.id !== threadId
+    || result.thread.hostId !== executionHostId
+  ) return snapshot;
+  const hostId = result.thread.hostId;
   const kind = typeof result.thread.kind === "string" && result.thread.kind.length > 0
     ? result.thread.kind
     : existing?.kind;
@@ -173,7 +227,7 @@ async function hydrateHookThread(snapshot, input, appTools, deadlineAt, now = Da
   if (typeof kind !== "string" || kind.length === 0) return snapshot;
   const hydrated = {
     ...existing,
-    id: result.thread?.id ?? threadId,
+    id: threadId,
     kind,
     hostId,
     projectId: result.thread?.projectId ?? existing?.projectId ?? input.project_id,
@@ -264,6 +318,7 @@ function boundedWakeResult(result) {
 
 const STABLE_WAKE_ERROR_CODES = new Set([
   "invalid_config",
+  "duplicate_event",
   "invalid_envelope",
   "invalid_state",
   "io_failure",

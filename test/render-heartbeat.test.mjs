@@ -49,6 +49,12 @@ test("heartbeat prompt enforces audited allowlist, protections, and fail-closed 
     prompt.includes("A `Stop`-equivalent terminal move requires a confirmed idle, completed, failed, or needs-attention task before moving a task already in In Progress to For Review."),
     true,
   );
+  assert.equal(
+    prompt.includes("Immediately before every move, call `read_thread` for that exact task and authoritative host"),
+    true,
+  );
+  assert.equal(prompt.includes("with no intervening tool call"), true);
+  assert.equal(prompt.includes("does not make the move atomic or compare-and-swap"), true);
   assert.equal(prompt.includes("from Tasks, In Progress, or an eligible Project task to For Review"), false);
   assert.equal(prompt.includes("at most 10 moves"), true);
   assert.equal(

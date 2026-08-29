@@ -1,12 +1,12 @@
 {
   "name": "codex-sidebar-flow",
   "version": "0.1.0",
-  "description": "Real-time Codex Desktop sidebar organization with lifecycle hooks.",
+  "description": "Deterministic cross-host Codex Desktop sidebar reconciliation.",
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test",
-    "check": "node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs && sh -n scripts/plugin-hook.sh"
+    "check": "node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs && node --check scripts/render-heartbeat.mjs && sh -n scripts/plugin-hook.sh"
   },
   "license": "MIT",
   "repository": {

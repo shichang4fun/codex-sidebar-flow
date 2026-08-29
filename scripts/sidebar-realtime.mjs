@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { createReadStream, existsSync, watch } from "node:fs";
+import { createReadStream, existsSync, realpathSync, watch } from "node:fs";
 import { open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -235,12 +235,19 @@ export function normalizeManagedState(raw, currentTime = Date.now(), graceMs = 3
         .map((value) => (value.includes(":") ? value : managedIdentity("local", value))),
     ),
   ];
+  const knownThreadIdentities = [
+    ...new Set(
+      (raw?.knownThreadIdentities ?? []).filter(
+        (value) => typeof value === "string" && value.includes(":"),
+      ),
+    ),
+  ];
   const sessionFiles = Object.fromEntries(
     Object.entries(raw?.sessionFiles ?? {}).filter(
       ([filePath, mtimeMs]) => typeof filePath === "string" && Number.isFinite(mtimeMs),
     ),
   );
-  return { version: 3, manageSince, lastSessionScanAt, managedThreadIds, sessionFiles };
+  return { version: 4, manageSince, lastSessionScanAt, managedThreadIds, knownThreadIdentities, sessionFiles };
 }
 
 export function managedIdentity(hostId, threadId) {
@@ -270,22 +277,61 @@ export async function loadManagedState(filePath, currentTime = Date.now(), grace
   }
 }
 
-export async function saveManagedState(filePath, state) {
-  if (!filePath) return;
+async function writeManagedStateFile(filePath, state) {
   const normalized = normalizeManagedState(state);
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(normalized)}\n`, { encoding: "utf8", mode: 0o600 });
   await rename(temporaryPath, filePath);
+  return normalized;
 }
 
-async function withFileLock(lockPath, task, { attempts = 80, delayMs = 25 } = {}) {
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+async function clearStaleLock(lockPath, staleAfterMs = 30000) {
+  const [contents, metadata] = await Promise.all([
+    readFile(lockPath, "utf8").catch(() => null),
+    stat(lockPath).catch(() => null),
+  ]);
+  if (metadata == null) return true;
+  let owner = null;
+  try {
+    owner = JSON.parse(contents);
+  } catch {}
+  const createdAt = Number.isFinite(owner?.createdAt) ? owner.createdAt : metadata.mtimeMs;
+  const staleByAge = Date.now() - createdAt > staleAfterMs;
+  const ownerGone = Number.isInteger(owner?.pid) && !processIsAlive(owner.pid);
+  if (!staleByAge && !ownerGone) return false;
+  await unlink(lockPath).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+  return true;
+}
+
+async function withFileLock(lockPath, task, { attempts = 80, delayMs = 25, staleAfterMs = 30000 } = {}) {
   let handle;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: Date.now() })}\n`);
+      } catch (error) {
+        await handle.close().catch(() => {});
+        handle = null;
+        await unlink(lockPath).catch(() => {});
+        throw error;
+      }
       break;
     } catch (error) {
       if (error.code !== "EEXIST" || attempt + 1 >= attempts) throw error;
+      if (await clearStaleLock(lockPath, staleAfterMs)) continue;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
@@ -297,16 +343,54 @@ async function withFileLock(lockPath, task, { attempts = 80, delayMs = 25 } = {}
   }
 }
 
-export async function updateManagedState(filePath, { add = [], remove = [] } = {}) {
+export async function saveManagedState(filePath, state) {
+  if (!filePath) return normalizeManagedState(state);
+  return withFileLock(`${filePath}.lock`, async () => {
+    let current = null;
+    try {
+      current = normalizeManagedState(JSON.parse(await readFile(filePath, "utf8")));
+    } catch (error) {
+      if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    }
+    const proposed = normalizeManagedState(state);
+    const next = current == null
+      ? proposed
+      : {
+          ...proposed,
+          manageSince: Math.min(current.manageSince, proposed.manageSince),
+          lastSessionScanAt: Math.max(current.lastSessionScanAt, proposed.lastSessionScanAt),
+          managedThreadIds: [...new Set([...current.managedThreadIds, ...proposed.managedThreadIds])],
+          knownThreadIdentities: [
+            ...new Set([...current.knownThreadIdentities, ...proposed.knownThreadIdentities]),
+          ],
+          sessionFiles: { ...current.sessionFiles, ...proposed.sessionFiles },
+        };
+    return writeManagedStateFile(filePath, next);
+  });
+}
+
+export async function updateManagedState(
+  filePath,
+  { add = [], remove = [], observe = [], lastSessionScanAt = null, sessionFiles = null } = {},
+) {
   if (!filePath) return normalizeManagedState(null);
   return withFileLock(`${filePath}.lock`, async () => {
     const current = await loadManagedState(filePath);
     const managedThreadIds = new Set(current.managedThreadIds);
     for (const identity of add) if (typeof identity === "string") managedThreadIds.add(identity);
     for (const identity of remove) if (typeof identity === "string") managedThreadIds.delete(identity);
-    const next = { ...current, managedThreadIds: [...managedThreadIds] };
-    await saveManagedState(filePath, next);
-    return next;
+    const knownThreadIdentities = new Set(current.knownThreadIdentities);
+    for (const identity of observe) if (typeof identity === "string") knownThreadIdentities.add(identity);
+    const next = {
+      ...current,
+      lastSessionScanAt: Number.isFinite(lastSessionScanAt)
+        ? Math.max(current.lastSessionScanAt, lastSessionScanAt)
+        : current.lastSessionScanAt,
+      managedThreadIds: [...managedThreadIds],
+      knownThreadIdentities: [...knownThreadIdentities],
+      sessionFiles: sessionFiles == null ? current.sessionFiles : { ...current.sessionFiles, ...sessionFiles },
+    };
+    return writeManagedStateFile(filePath, next);
   });
 }
 
@@ -944,15 +1028,43 @@ async function main() {
   let retryTimer = null;
   let backlogTimer = null;
   let stateSaveTimer = null;
+  let stateSavePromise = Promise.resolve();
+  const pendingStateAdds = new Set();
+  const pendingStateRemoves = new Set();
   let watcherDayPath = null;
   const sessionWatchers = new Map();
   const sessionIdsByFile = new Map();
 
-  const scheduleManagedStateSave = () => {
+  const flushManagedStateUpdates = async () => {
+    const add = [...pendingStateAdds];
+    const remove = [...pendingStateRemoves];
+    pendingStateAdds.clear();
+    pendingStateRemoves.clear();
+    const patch = {
+      add,
+      remove,
+      lastSessionScanAt: managedState.lastSessionScanAt,
+      sessionFiles: managedState.sessionFiles,
+    };
+    stateSavePromise = stateSavePromise
+      .catch(() => {})
+      .then(() => updateManagedState(config.stateFile, patch));
+    await stateSavePromise;
+  };
+
+  const scheduleManagedStateSave = ({ add = [], remove = [] } = {}) => {
+    for (const identity of add) {
+      pendingStateRemoves.delete(identity);
+      pendingStateAdds.add(identity);
+    }
+    for (const identity of remove) {
+      pendingStateAdds.delete(identity);
+      pendingStateRemoves.add(identity);
+    }
     clearTimeout(stateSaveTimer);
     stateSaveTimer = setTimeout(() => {
       stateSaveTimer = null;
-      void saveManagedState(config.stateFile, managedState).catch((error) =>
+      void flushManagedStateUpdates().catch((error) =>
         log("warn", "managed state save failed", { error: error.message }),
       );
     }, 250);
@@ -968,11 +1080,29 @@ async function main() {
     try {
       do {
         pending = false;
+        const persistedState = await loadManagedState(config.stateFile);
+        managedState = {
+          ...managedState,
+          manageSince: Math.min(managedState.manageSince, persistedState.manageSince),
+          lastSessionScanAt: Math.max(managedState.lastSessionScanAt, persistedState.lastSessionScanAt),
+          managedThreadIds: [...new Set([
+            ...managedState.managedThreadIds,
+            ...persistedState.managedThreadIds.filter((identity) => !pendingStateRemoves.has(identity)),
+          ])],
+          knownThreadIdentities: [...new Set([
+            ...managedState.knownThreadIdentities,
+            ...persistedState.knownThreadIdentities,
+          ])],
+          sessionFiles: { ...persistedState.sessionFiles, ...managedState.sessionFiles },
+        };
         const snapshot = await hydrateCustomThreads(
           await appTools.listThreads(),
           config,
           appTools,
-          managedHostsByThreadId(managedState.managedThreadIds),
+          managedHostsByThreadId([
+            ...managedState.managedThreadIds,
+            ...managedState.knownThreadIdentities,
+          ]),
         );
         if (snapshot.hydrationErrors?.length > 0) {
           log("warn", "some custom-section tasks could not be refreshed", {
@@ -999,10 +1129,13 @@ async function main() {
               .map((thread) => ({ id: thread.id, hostId: thread.hostId, status: thread.status })),
           });
         }
+        const previousManagedIds = new Set(managedState.managedThreadIds);
         const nextManagedState = recordSnapshotActivity(managedState, snapshot);
         if (nextManagedState.managedThreadIds.length !== managedState.managedThreadIds.length) {
           managedState = nextManagedState;
-          scheduleManagedStateSave();
+          scheduleManagedStateSave({
+            add: managedState.managedThreadIds.filter((identity) => !previousManagedIds.has(identity)),
+          });
         }
         const moves = planMoves(snapshot, config, new Set(managedState.managedThreadIds));
         if (options.verbose || moves.length > 0) log("info", "sidebar reconciliation", { reason, moves: moves.length });
@@ -1016,7 +1149,7 @@ async function main() {
             const nextState = forgetManagedThread(managedState, move.threadId, move.hostId);
             if (nextState.managedThreadIds.length !== managedState.managedThreadIds.length) {
               managedState = nextState;
-              scheduleManagedStateSave();
+              scheduleManagedStateSave({ remove: [managedIdentity(move.hostId, move.threadId)] });
             }
           }
         }
@@ -1058,9 +1191,14 @@ async function main() {
 
   if (options.once) {
     if (existsSync(config.sessionsDir)) {
+      const previousManagedIds = new Set(managedState.managedThreadIds);
       const scannedSessions = await scanManagedSessionFiles(managedState, config.sessionsDir);
       managedState = scannedSessions.state;
-      await saveManagedState(config.stateFile, managedState);
+      managedState = await updateManagedState(config.stateFile, {
+        add: managedState.managedThreadIds.filter((identity) => !previousManagedIds.has(identity)),
+        lastSessionScanAt: managedState.lastSessionScanAt,
+        sessionFiles: managedState.sessionFiles,
+      });
     }
     await runWithRetries(
       (attempt) => reconcile(attempt === 0 ? "startup" : `startup-retry-${attempt}`),
@@ -1092,6 +1230,7 @@ async function main() {
   }, config.socketKeepAliveIntervalMs ?? 10000);
 
   const refreshSessionWatchers = async () => {
+    const previousManagedIds = new Set(managedState.managedThreadIds);
     const targetPaths = sessionDayDirectories(config.sessionsDir);
     watcherDayPath = targetPaths[0];
     const currentFiles = new Set();
@@ -1134,7 +1273,8 @@ async function main() {
         const observedSessionId = sessionIdsByFile.get(filePath);
         if (observedSessionId != null) {
           managedState = recordSessionActivity(managedState, observedSessionId);
-          scheduleManagedStateSave();
+          const identity = managedIdentity("local", observedSessionId);
+          scheduleManagedStateSave({ add: identity == null ? [] : [identity] });
         }
         schedule("session-event");
       });
@@ -1152,7 +1292,11 @@ async function main() {
       managedState.sessionFiles = retainedSessionFiles;
       stateChanged = true;
     }
-    if (stateChanged) scheduleManagedStateSave();
+    if (stateChanged) {
+      scheduleManagedStateSave({
+        add: managedState.managedThreadIds.filter((identity) => !previousManagedIds.has(identity)),
+      });
+    }
   };
 
   const safelyRefreshSessionWatchers = createSingleFlight(() =>
@@ -1189,7 +1333,7 @@ async function main() {
     clearTimeout(backlogTimer);
     clearTimeout(stateSaveTimer);
     appTools.reset();
-    await saveManagedState(config.stateFile, managedState);
+    await flushManagedStateUpdates();
     await writeHealth(config, { state: "stopped" });
     process.exit(0);
   };
@@ -1197,7 +1341,7 @@ async function main() {
   process.once("SIGTERM", () => void shutdown());
 }
 
-const isMain = process.argv[1] != null && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+const isMain = process.argv[1] != null && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
 if (isMain) {
   main().catch((error) => {
     log("error", "fatal", { error: error.message });

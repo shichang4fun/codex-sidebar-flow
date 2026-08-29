@@ -9,5 +9,6 @@ do
   fi
 done
 
+printf '%s\n' 'sidebar-flow: bundled Desktop Node unavailable' >&2
 printf '{}\n'
-exit 0
+exit 1

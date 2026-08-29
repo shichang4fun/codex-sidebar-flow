@@ -1,7 +1,7 @@
 {
   "name": "codex-sidebar-flow",
   "version": "0.1.0",
-  "description": "Move Codex tasks between In Progress and For Review from lifecycle hooks.",
+  "description": "Observe lifecycle identity and reconcile Codex sidebar task state.",
   "author": {
     "name": "shichang4fun"
   },
@@ -9,13 +9,13 @@
   "interface": {
     "displayName": "Codex Sidebar Flow",
     "shortDescription": "Keep review and active tasks organized.",
-    "longDescription": "Uses Codex lifecycle hooks and an experimental macOS Desktop adapter to keep task sections synchronized without model calls.",
+    "longDescription": "Uses observation-only lifecycle hooks plus deterministic observed-state reconciliation through an experimental macOS Desktop adapter.",
     "developerName": "shichang4fun",
     "category": "Productivity",
-    "capabilities": ["lifecycle hooks", "sidebar organization"],
+    "capabilities": ["lifecycle observation", "sidebar reconciliation"],
     "websiteURL": "https://github.com/shichang4fun/codex-sidebar-flow",
     "defaultPrompt": [
-      "Set up real-time sidebar organization",
+      "Set up bounded-delay sidebar organization",
       "Check my sidebar flow installation"
     ]
   }

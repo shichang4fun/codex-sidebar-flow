@@ -15,7 +15,7 @@ Lifecycle hooks run with the local Codex process permissions. Review the scripts
 - Private tool error bodies are discarded before logging.
 - Task titles, summaries, previews, and bodies are untrusted and never drive the deterministic state machine.
 
-The optional heartbeat uses a model and must use the audited allowlisted prompt in `docs/heartbeat-prompt.md`. It may call only task-management tools, must make at most 10 moves, and must fail closed on ambiguous host or membership data.
+The optional heartbeat uses a model and must use the audited allowlisted prompt in `docs/heartbeat-prompt.md`. Its `list_threads`/`read_thread` tool results can expose visible task titles and summaries to that model even though content must not drive classification. It may call only task-management tools, must make at most 10 moves, and must fail closed on ambiguous host or membership data. Do not enable it when this metadata exposure is outside the user's privacy boundary.
 
 Protocol failure is fail-closed: tasks remain in their current sections and a local diagnostic is recorded.
 

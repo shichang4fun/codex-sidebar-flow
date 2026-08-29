@@ -6,7 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- Real-time local lifecycle movement and bounded-delay remote reconciliation without model classification.
+- Observation-only local lifecycle identity and bounded-delay cross-host reconciliation without content classification.
 - Cross-host membership resolution, remote hydration, Project-task support, managed identities, idempotent retries, and protected manual sections.
 - Source installer, uninstaller, doctor, plugin manifest, security documentation, tests, and CI.
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFile, chmod, mkdir, rename, stat } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -9,11 +10,6 @@ import {
   loadConfig,
   loadManagedState,
   managedIdentity,
-  membershipIsProtected,
-  normalizedThreadStatus,
-  recordSessionActivity,
-  sidebarMembershipForThread,
-  statusFromThreadRead,
   updateManagedState,
 } from "./sidebar-realtime.mjs";
 import { defaultConfig, writeJsonAtomic } from "./setup.mjs";
@@ -26,64 +22,22 @@ const DEFAULT_ATTEMPTS = 2;
 const DEFAULT_HOOK_DEADLINE_MS = 9000;
 const MAX_LOG_BYTES = 1024 * 1024;
 
-function exactSection(sections, name) {
-  const matches = sections.filter((section) => section.name === name);
-  if (matches.length !== 1) {
-    throw new Error(`Expected exactly one sidebar section named ${name}; found ${matches.length}`);
-  }
-  return matches[0];
-}
-
-export function planHookMove(snapshot, input, config) {
+export function managedMutationFromLifecycle(snapshot, input, config) {
   const threadId = input?.session_id;
   const event = input?.hook_event_name;
   if (typeof threadId !== "string" || threadId.length === 0) return null;
-  if (!new Set(["UserPromptSubmit", "Stop"]).has(event)) return null;
+  if (event !== "UserPromptSubmit") return null;
   if ((config.excludeThreadIds ?? []).includes(threadId)) return null;
-
-  const sections = Array.isArray(snapshot?.sections) ? snapshot.sections : [];
-  const inProgress = exactSection(sections, config.sections.inProgress);
-  const forReview = exactSection(sections, config.sections.forReview);
-  const forLater = exactSection(sections, config.sections.forLater);
-  const pinned = sections.find((section) => section.sectionId === "pinned");
-  const tasks = sections.find((section) => section.sectionId === "chats");
-  const projects = sections.find((section) => section.sectionId === "threads");
-  if (pinned == null || tasks == null || projects == null) {
-    throw new Error("Missing built-in Projects, Tasks, or Pinned section");
-  }
 
   const thread = (snapshot.threads ?? []).find((candidate) => candidate.id === threadId);
   if (thread == null || thread.kind !== "codex" || !thread.hostId) return null;
-  const membership = sidebarMembershipForThread(sections, thread);
-  if (membership == null) return null;
-  if (membershipIsProtected(membership, new Set([pinned.sectionId, forLater.sectionId]))) return null;
-
-  let destination = null;
-  if (
-    event === "UserPromptSubmit" &&
-    (
-      [tasks.sectionId, forReview.sectionId].includes(membership.sectionId) ||
-      (membership.viaProject && membership.sectionId === projects.sectionId)
-    )
-  ) {
-    destination = inProgress;
-  } else if (
-    event === "Stop" &&
-    new Set(["idle", "completed", "needsattention"]).has(normalizedThreadStatus(thread)) &&
-    (
-      membership.sectionId === inProgress.sectionId ||
-      (membership.viaProject && membership.sectionId === projects.sectionId)
-    )
-  ) {
-    destination = forReview;
-  }
-  if (destination == null || destination.sectionId === membership.sectionId) return null;
-
+  const identity = managedIdentity(thread.hostId, thread.id);
+  if (identity == null) return null;
   return {
-    threadId,
+    action: "observe",
+    identity,
+    threadId: thread.id,
     hostId: thread.hostId,
-    sectionId: destination.sectionId,
-    sectionName: destination.name,
   };
 }
 
@@ -166,7 +120,7 @@ async function hydrateHookThread(snapshot, input, appTools, deadlineAt) {
   const threadId = input.session_id;
   const threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
   const existing = threads.find((thread) => thread.id === threadId);
-  const mustRead = existing == null || input.hook_event_name === "Stop" || !existing.hostId;
+  const mustRead = existing == null || !existing.hostId;
   if (!mustRead) return snapshot;
   const result = await runBeforeDeadline(
     () => appTools.readThread(threadId, existing?.hostId ?? input.host_id),
@@ -180,7 +134,7 @@ async function hydrateHookThread(snapshot, input, appTools, deadlineAt) {
     kind: result.thread?.kind ?? existing?.kind ?? "codex",
     hostId,
     projectId: result.thread?.projectId ?? existing?.projectId ?? input.project_id,
-    status: statusFromThreadRead(result),
+    status: result.thread?.status ?? existing?.status ?? "notLoaded",
     summary: null,
   };
   if (existing == null) threads.push(hydrated);
@@ -189,7 +143,7 @@ async function hydrateHookThread(snapshot, input, appTools, deadlineAt) {
   return snapshot;
 }
 
-export async function executeHookMove(
+export async function executeHookEvent(
   input,
   config,
   {
@@ -202,12 +156,6 @@ export async function executeHookMove(
   } = {},
 ) {
   const deadlineAt = Date.now() + deadlineMs;
-  if (input.hook_event_name === "Stop") {
-    await runBeforeDeadline(
-      () => wait(Math.min(config.stopSettleDelayMs ?? 500, Math.max(0, deadlineAt - Date.now()))),
-      deadlineAt,
-    );
-  }
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const appTools = createAppTools();
@@ -215,24 +163,20 @@ export async function executeHookMove(
       let snapshot = await runBeforeDeadline(() => appTools.listThreads(), deadlineAt);
       snapshot = await hydrateHookThread(snapshot, input, appTools, deadlineAt);
       let nextManagedState = managedState;
-      const move = planHookMove(snapshot, input, config);
       const managedAdds = [];
       const managedRemoves = [];
-      if (move != null) {
-        await runBeforeDeadline(() => appTools.moveThread(move), deadlineAt);
-        const identity = managedIdentity(move.hostId, move.threadId);
-        if (move.sectionName === config.sections.inProgress && identity != null) {
-          managedAdds.push(identity);
-          nextManagedState = recordSessionActivity(nextManagedState, move.threadId, Date.now(), move.hostId);
-        } else if (move.sectionName === config.sections.forReview && identity != null) {
-          managedRemoves.push(identity);
-          nextManagedState = {
-            ...nextManagedState,
-            managedThreadIds: (nextManagedState?.managedThreadIds ?? []).filter((value) => value !== identity),
-          };
-        }
-      }
-      return { move, moves: move == null ? [] : [move], managedState: nextManagedState, managedAdds, managedRemoves, attempts: attempt };
+      const observedIdentities = [];
+      const mutation = managedMutationFromLifecycle(snapshot, input, config);
+      if (mutation?.action === "observe") observedIdentities.push(mutation.identity);
+      return {
+        move: null,
+        moves: [],
+        managedState: nextManagedState,
+        managedAdds,
+        managedRemoves,
+        observedIdentities,
+        attempts: attempt,
+      };
     } catch (error) {
       lastError = error;
       if (attempt >= attempts || !isRetryableHookError(error)) {
@@ -267,15 +211,17 @@ export async function handleHook(input, configPath = DEFAULT_CONFIG_PATH) {
 
   const startedAt = Date.now();
   const managedState = await loadManagedState(config.stateFile);
-  const result = await executeHookMove(input, config, { managedState });
+  const result = await executeHookEvent(input, config, { managedState });
   await updateManagedState(config.stateFile, {
     add: result.managedAdds,
     remove: result.managedRemoves,
+    observe: result.observedIdentities,
   });
   await writeHookLog(config.hookLogFile ?? DEFAULT_LOG_PATH, {
     event: input.hook_event_name,
     threadId: input.session_id,
-    destination: result.move?.sectionName ?? null,
+    destination: null,
+    observationOnly: true,
     attempts: result.attempts,
     pid: process.pid,
     ppid: process.ppid,
@@ -285,7 +231,7 @@ export async function handleHook(input, configPath = DEFAULT_CONFIG_PATH) {
     toolsListSucceeded: true,
     durationMs: Date.now() - startedAt,
   });
-  return result.move;
+  return null;
 }
 
 async function main() {
@@ -311,5 +257,5 @@ async function main() {
   process.stdout.write("{}\n");
 }
 
-const isMain = process.argv[1] != null && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+const isMain = process.argv[1] != null && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
 if (isMain) void main();

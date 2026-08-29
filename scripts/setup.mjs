@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 
-import { chmod, copyFile, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { chmod, copyFile, link, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-export const HOOK_MARKER = "/scripts/sidebar-hook.mjs";
+export const HOOK_MARKER = "CODEX_SIDEBAR_FLOW_OWNER=codex-sidebar-flow-v1";
 
 function quote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
@@ -25,11 +25,19 @@ export function detectNodeExecutable() {
 }
 
 export function hookCommand(root = ROOT, nodeExecutable = detectNodeExecutable()) {
-  return `exec /usr/bin/env -u FORCE_COLOR ${quote(nodeExecutable)} ${quote(path.join(root, "scripts", "sidebar-hook.mjs"))}`;
+  return `exec /usr/bin/env -u FORCE_COLOR ${HOOK_MARKER} ${quote(nodeExecutable)} ${quote(path.join(root, "scripts", "sidebar-hook.mjs"))}`;
 }
 
 function isOwnedHook(hook) {
   return typeof hook?.command === "string" && hook.command.includes(HOOK_MARKER);
+}
+
+export function hasOwnedHooks(existing = {}) {
+  return ["UserPromptSubmit", "Stop"].some((event) =>
+    (existing.hooks?.[event] ?? []).some((matcher) =>
+      (matcher.hooks ?? []).some(isOwnedHook),
+    ),
+  );
 }
 
 function removeOwnedHandlers(matchers) {
@@ -134,10 +142,24 @@ export async function setup({
   const hooksPath = path.join(codexHome, "hooks.json");
   const backupPath = `${hooksPath}.sidebar-flow.bak`;
   const configPath = path.join(runtimeRoot, "config.json");
-  const hooks = mode === "source"
-    ? installHooks(await readJson(hooksPath, {}), hookCommand(runtimeRoot))
-    : null;
+  const existingHooks = await readJson(hooksPath, {});
   const existingConfig = await readJson(configPath, null);
+  const installedMode = existingConfig?.installMode ?? (hasOwnedHooks(existingHooks) ? "source" : null);
+  if (installedMode != null && installedMode !== mode) {
+    const error = new Error(
+      `Sidebar Flow is installed in ${installedMode} mode; uninstall that mode before installing ${mode} mode`,
+    );
+    error.code = "INSTALL_MODE_CONFLICT";
+    throw error;
+  }
+  if (mode === "plugin" && hasOwnedHooks(existingHooks)) {
+    const error = new Error("Source hooks are still installed; run source uninstall before plugin setup");
+    error.code = "MIXED_INSTALLATION";
+    throw error;
+  }
+  const hooks = mode === "source"
+    ? installHooks(existingHooks, hookCommand(runtimeRoot))
+    : null;
   if (!dryRun) {
     if (mode === "source") {
       await mkdir(runtimeScripts, { recursive: true, mode: 0o700 });
@@ -145,11 +167,17 @@ export async function setup({
         copyFile(path.join(ROOT, "scripts", "sidebar-hook.mjs"), path.join(runtimeScripts, "sidebar-hook.mjs")),
         copyFile(path.join(ROOT, "scripts", "sidebar-realtime.mjs"), path.join(runtimeScripts, "sidebar-realtime.mjs")),
         copyFile(path.join(ROOT, "scripts", "setup.mjs"), path.join(runtimeScripts, "setup.mjs")),
+        copyFile(path.join(ROOT, "scripts", "uninstall.mjs"), path.join(runtimeScripts, "uninstall.mjs")),
+        copyFile(path.join(ROOT, "scripts", "doctor.mjs"), path.join(runtimeScripts, "doctor.mjs")),
       ]);
       if (existsSync(hooksPath)) await writePrivateBackup(hooksPath, backupPath);
       await writeJsonAtomic(hooksPath, hooks);
     }
-    if (existingConfig == null) await writeJsonAtomic(configPath, defaultConfig(codexHome));
+    await writeJsonAtomic(configPath, {
+      ...(existingConfig ?? defaultConfig(codexHome)),
+      installMode: mode,
+    });
+    if (mode === "plugin") await rm(runtimeScripts, { recursive: true, force: true });
   }
   return { mode, hooksPath, backupPath, configPath, runtimeRoot, dryRun, nodeExecutable: detectNodeExecutable() };
 }
@@ -165,7 +193,7 @@ function parseArgs(argv) {
   return result;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (process.argv[1] != null && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   setup(parseArgs(process.argv.slice(2)))
     .then((result) => {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

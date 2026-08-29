@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,7 @@ export function inspectInstallation({
   mode = "source",
   nodeExecutable = detectNodeExecutable(),
   runtimeProbe = null,
+  pluginBundle = null,
 } = {}) {
   const checks = [];
   checks.push({
@@ -30,6 +31,13 @@ export function inspectInstallation({
     name: "config",
     message: configValid ? "Section configuration is valid" : "Three unique section names are required",
   });
+  checks.push({
+    level: config?.installMode === mode ? "ok" : (config?.installMode == null ? "warning" : "error"),
+    name: "install-mode",
+    message: config?.installMode === mode
+      ? `${mode} mode recorded`
+      : (config?.installMode == null ? "Install mode is not recorded" : `Configuration records ${config.installMode} mode`),
+  });
   if (mode === "source") {
     for (const event of ["UserPromptSubmit", "Stop"]) {
       const installed = (hooks?.hooks?.[event] ?? []).some((matcher) =>
@@ -42,13 +50,24 @@ export function inspectInstallation({
       });
     }
   } else {
-    checks.push({ level: "ok", name: "hooks", message: "Plugin bundled hooks selected" });
+    const bundleComplete = pluginBundle != null && ["manifest", "hooks", "launcher"].every(
+      (name) => pluginBundle[name] === true,
+    );
+    checks.push({
+      level: !bundleComplete ? "error" : (pluginBundle.enabledContext ? "ok" : "warning"),
+      name: "plugin-bundle",
+      message: !bundleComplete
+        ? "Plugin manifest, hooks, or launcher is missing"
+        : (pluginBundle.enabledContext
+            ? "Plugin bundle is complete in an active plugin context"
+            : "Plugin bundle is complete, but app enablement is unverified"),
+    });
   }
   const bundledNode = existsSync(nodeExecutable) && nodeExecutable.includes("/cua_node/bin/node");
   checks.push({
     level: bundledNode ? "ok" : "warning",
     name: "runtime",
-    message: bundledNode ? "Bundled Desktop Node selected" : "Signed bundled Desktop Node was not found",
+    message: bundledNode ? "Bundled Desktop Node path selected" : "Bundled Desktop Node path was not found",
   });
   checks.push({
     level: runtimeProbe?.ok ? "ok" : "warning",
@@ -66,13 +85,15 @@ async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (process.argv[1] != null && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   const homeIndex = process.argv.indexOf("--codex-home");
+  const pluginRootIndex = process.argv.indexOf("--plugin-root");
   const mode = process.argv.includes("--plugin") ? "plugin" : "source";
   const probe = process.argv.includes("--probe");
   const codexHome = homeIndex === -1
     ? process.env.CODEX_HOME || path.join(os.homedir(), ".codex")
     : process.argv[homeIndex + 1];
+  const pluginRoot = pluginRootIndex === -1 ? process.env.CLAUDE_PLUGIN_ROOT : process.argv[pluginRootIndex + 1];
   const [hooks, config] = await Promise.all([
     readJson(path.join(codexHome, "hooks.json")).catch(() => ({})),
     readJson(path.join(codexHome, "sidebar-flow", "config.json")).catch(() => ({})),
@@ -98,6 +119,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     mode,
     pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH,
     runtimeProbe,
+    pluginBundle: mode === "plugin"
+      ? {
+          manifest: pluginRoot != null && existsSync(path.join(pluginRoot, ".codex-plugin", "plugin.json")),
+          hooks: pluginRoot != null && existsSync(path.join(pluginRoot, "hooks", "hooks.json")),
+          launcher: pluginRoot != null && existsSync(path.join(pluginRoot, "scripts", "plugin-hook.sh")),
+          enabledContext: pluginRoot != null && process.env.CLAUDE_PLUGIN_ROOT === pluginRoot,
+        }
+      : null,
   });
   process.stdout.write(`${JSON.stringify({ mode, checks }, null, 2)}\n`);
   if (checks.some((check) => check.level === "error") || runtimeProbe?.ok === false) process.exitCode = 1;

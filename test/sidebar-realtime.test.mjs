@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -146,10 +146,11 @@ assert.equal(sidebarRealtime.sessionIdFromMetaLine("{}"), null);
 
 assert.equal(typeof sidebarRealtime.normalizeManagedState, "function");
 assert.deepEqual(sidebarRealtime.normalizeManagedState(null, 10_000, 2_000), {
-  version: 3,
+  version: 4,
   manageSince: 8_000,
   lastSessionScanAt: 8_000,
   managedThreadIds: [],
+  knownThreadIdentities: [],
   sessionFiles: {},
 });
 assert.deepEqual(
@@ -165,10 +166,11 @@ assert.deepEqual(
     2_000,
   ),
   {
-    version: 3,
+    version: 4,
     manageSince: 6_000,
     lastSessionScanAt: 7_000,
     managedThreadIds: ["local:a", "local:b"],
+    knownThreadIdentities: [],
     sessionFiles: { "/tmp/a.jsonl": 6_500 },
   },
 );
@@ -190,10 +192,11 @@ assert.equal(typeof sidebarRealtime.loadManagedState, "function");
 const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "sidebar-realtime-state-test-"));
 const statePath = path.join(stateDirectory, "state.json");
 const managedState = {
-  version: 3,
+  version: 4,
   manageSince: 10_000,
   lastSessionScanAt: 12_345,
   managedThreadIds: ["local:task-a"],
+  knownThreadIdentities: [],
   sessionFiles: { "/tmp/task-a.jsonl": 12_000 },
 };
 await sidebarRealtime.saveManagedState(statePath, managedState);
@@ -207,6 +210,35 @@ assert.deepEqual(
   new Set((await sidebarRealtime.loadManagedState(statePath)).managedThreadIds),
   new Set(["local:task-a", "local:task-b", "local:task-c"]),
 );
+const staleForegroundSnapshot = { ...managedState, managedThreadIds: ["local:task-a"] };
+await sidebarRealtime.updateManagedState(statePath, { add: ["local:hook-task"] });
+await sidebarRealtime.saveManagedState(statePath, staleForegroundSnapshot);
+assert.equal(
+  (await sidebarRealtime.loadManagedState(statePath)).managedThreadIds.includes("local:hook-task"),
+  true,
+);
+await writeFile(
+  `${statePath}.lock`,
+  `${JSON.stringify({ pid: 999_999_999, createdAt: Date.now() - 60_000 })}\n`,
+  { mode: 0o600 },
+);
+await sidebarRealtime.updateManagedState(statePath, { add: ["local:after-stale-lock"] });
+assert.equal(
+  JSON.parse(await readFile(statePath, "utf8")).managedThreadIds.includes("local:after-stale-lock"),
+  true,
+);
+await sidebarRealtime.updateManagedState(statePath, { observe: ["remote-control:env_remote_test:blocked-prompt"] });
+const observedOnlyState = await sidebarRealtime.loadManagedState(statePath);
+assert.equal(observedOnlyState.knownThreadIdentities.includes("remote-control:env_remote_test:blocked-prompt"), true);
+assert.equal(observedOnlyState.managedThreadIds.includes("remote-control:env_remote_test:blocked-prompt"), false);
+assert.deepEqual(
+  planMoves(
+    snapshot([thread("blocked-prompt", "idle", "chats", { hostId: "remote-control:env_remote_test" })]),
+    config,
+    new Set(observedOnlyState.managedThreadIds),
+  ),
+  [],
+);
 await rm(stateDirectory, { recursive: true, force: true });
 
 assert.equal(typeof sidebarRealtime.recordSessionActivity, "function");
@@ -217,16 +249,18 @@ assert.deepEqual(
       manageSince: 0,
       lastSessionScanAt: 10,
       managedThreadIds: ["local:task-a"],
+      knownThreadIdentities: [],
       sessionFiles: {},
     },
     "task-b",
     20,
   ),
   {
-    version: 3,
+    version: 4,
     manageSince: 0,
     lastSessionScanAt: 20,
     managedThreadIds: ["local:task-a", "local:task-b"],
+    knownThreadIdentities: [],
     sessionFiles: {},
   },
 );
@@ -237,15 +271,17 @@ assert.deepEqual(
       manageSince: 0,
       lastSessionScanAt: 20,
       managedThreadIds: ["local:task-a", "local:task-b"],
+      knownThreadIdentities: [],
       sessionFiles: {},
     },
     "task-a",
   ),
   {
-    version: 3,
+    version: 4,
     manageSince: 0,
     lastSessionScanAt: 20,
     managedThreadIds: ["local:task-b"],
+    knownThreadIdentities: [],
     sessionFiles: {},
   },
 );

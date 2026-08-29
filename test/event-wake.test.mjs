@@ -165,6 +165,19 @@ test("acquireWakePermit fails closed on malformed state", async () => {
   }
 });
 
+test("acquireWakePermit fails closed on json null state", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-null-state-"));
+  const stateFile = path.join(directory, "wake-state.json");
+
+  try {
+    await writeFile(stateFile, "null\n", { encoding: "utf8", mode: 0o600 });
+    const accepted = await acquireWakePermit(stateFile, { maxPerMinute: 2 }, { now: () => 100_000 });
+    assert.deepEqual(accepted, { ok: false, errorCode: "invalid_state" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("acquireWakePermit fails closed on malformed timestamp entries", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-bad-timestamp-"));
   const stateFile = path.join(directory, "wake-state.json");

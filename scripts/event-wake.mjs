@@ -144,7 +144,6 @@ async function withFileLock(
 }
 
 function normalizeWakeState(raw, nowValue) {
-  if (raw == null) return { timestamps: [] };
   if (!isRecord(raw) || !Array.isArray(raw.timestamps)) {
     throw new Error("Invalid wake state");
   }

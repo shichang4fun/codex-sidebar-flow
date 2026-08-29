@@ -1,6 +1,6 @@
 {
   "name": "codex-sidebar-flow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Observe lifecycle identity and reconcile Codex sidebar task state.",
   "author": {
     "name": "shichang4fun"

@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.0] - 2026-08-30
+
+### Added
+
+- Opt-in lifecycle event wake through a content-free organizer envelope, with a five-minute heartbeat retained as deterministic recovery.
+- Exact local/remote `<hostId, threadId>` lifecycle selection, Project-contained task support, and final authoritative reads before targeted moves.
+- Mode-specific runtime fingerprints, immutable source releases, one-shot capability probes, and live runtime verification in `doctor`.
+
+### Changed
+
+- Keep event wake disabled across upgrades until a fresh probe confirms the exact installed runtime and mode.
+- Harden wake and managed-state locks against crashed owners, live-owner eviction, symlink attacks, and replacement-inode races.
+- Restrict lifecycle logging to bounded statuses, timings, booleans, and stable error codes.
+- Document that model tool restrictions are prompt-enforced and sidebar moves are not atomic compare-and-swap operations.
+
 ## [0.1.0] - 2026-08-29
 
 ### Added

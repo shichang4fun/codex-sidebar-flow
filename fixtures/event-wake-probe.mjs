@@ -1,7 +1,7 @@
 import { access, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { handleHook } from "../../scripts/sidebar-hook.mjs";
-import { INSTALL_MODE_ENV } from "../../scripts/setup.mjs";
+import { handleHook } from "../scripts/sidebar-hook.mjs";
+import { INSTALL_MODE_ENV } from "../scripts/setup.mjs";
 
 const [configPath, barrierDirectory] = process.argv.slice(2);
 if (configPath != null && barrierDirectory != null) {

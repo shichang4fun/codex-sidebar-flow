@@ -1194,7 +1194,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-probe-process-race-"));
   const runtime = path.join(codexHome, "sidebar-flow");
   const configPath = path.join(runtime, "config.json");
-  const fixture = path.resolve("test/fixtures/event-wake-probe.mjs");
+  const fixture = path.resolve("fixtures/event-wake-probe.mjs");
   try {
     const runtimeConfig = {
       ...defaultConfig(codexHome, "source"),

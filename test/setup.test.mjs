@@ -5,7 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { HOOK_MARKER, installHooks, removeHooks, setup } from "../scripts/setup.mjs";
+import {
+  findUnmarkedSidebarHookPaths,
+  HOOK_MARKER,
+  installHooks,
+  removeHooks,
+  setup,
+} from "../scripts/setup.mjs";
 import { uninstall } from "../scripts/uninstall.mjs";
 
 const ownedCommand = `${HOOK_MARKER} node /repo/scripts/sidebar-hook.mjs`;
@@ -70,6 +76,83 @@ test("setup preserves the original backup across reruns", async () => {
     assert.equal((await stat(path.join(codexHome, "sidebar-flow", "scripts", "sidebar-hook.mjs"))).isFile(), true);
     assert.equal((await stat(path.join(codexHome, "sidebar-flow", "scripts", "uninstall.mjs"))).isFile(), true);
     assert.equal(JSON.parse(await readFile(path.join(codexHome, "sidebar-flow", "config.json"), "utf8")).installMode, "source");
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("source setup migrates the standard unmarked Hook and uninstall removes it", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-legacy-standard-"));
+  try {
+    const hooksPath = path.join(codexHome, "hooks.json");
+    const legacyPath = path.join(codexHome, "sidebar-flow", "scripts", "sidebar-hook.mjs");
+    const legacyCommand = `node '${legacyPath}'`;
+    await writeFile(hooksPath, `${JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: "command", command: legacyCommand }] }],
+        Stop: [{ hooks: [{ type: "command", command: legacyCommand }] }],
+      },
+    })}\n`, { mode: 0o600 });
+
+    await setup({ codexHome, mode: "source" });
+    const installed = JSON.parse(await readFile(hooksPath, "utf8"));
+    for (const event of ["UserPromptSubmit", "Stop"]) {
+      const commands = installed.hooks[event].flatMap((matcher) =>
+        matcher.hooks.map((hook) => hook.command));
+      assert.equal(commands.filter((command) => command.includes(HOOK_MARKER)).length, 1);
+      assert.equal(commands.filter((command) => command === legacyCommand).length, 0);
+    }
+    assert.deepEqual(findUnmarkedSidebarHookPaths(installed), []);
+
+    await uninstall({ codexHome, mode: "source" });
+    const uninstalled = JSON.parse(await readFile(hooksPath, "utf8"));
+    assert.equal(uninstalled.hooks?.UserPromptSubmit, undefined);
+    assert.equal(uninstalled.hooks?.Stop, undefined);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("plugin setup refuses the standard unmarked source Hook", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-legacy-plugin-"));
+  try {
+    const hooksPath = path.join(codexHome, "hooks.json");
+    const legacyPath = path.join(codexHome, "sidebar-flow", "scripts", "sidebar-hook.mjs");
+    await writeFile(hooksPath, `${JSON.stringify({
+      hooks: { Stop: [{ hooks: [{ type: "command", command: `node '${legacyPath}'` }] }] },
+    })}\n`, { mode: 0o600 });
+    await assert.rejects(
+      setup({ codexHome, mode: "plugin" }),
+      (error) => error.code === "INSTALL_MODE_CONFLICT",
+    );
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("setup fails closed on an unknown legacy Hook unless its exact path is authorized", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-legacy-explicit-"));
+  try {
+    const hooksPath = path.join(codexHome, "hooks.json");
+    const legacyPath = "/opt/old-sidebar-flow/scripts/sidebar-hook.mjs";
+    const unrelated = "echo keep";
+    await writeFile(hooksPath, `${JSON.stringify({
+      hooks: { Stop: [{ hooks: [
+        { type: "command", command: unrelated },
+        { type: "command", command: `node '${legacyPath}'` },
+      ] }] },
+    })}\n`, { mode: 0o600 });
+
+    await assert.rejects(
+      setup({ codexHome, mode: "source" }),
+      (error) => error.code === "LEGACY_HOOK_CONFLICT" && error.paths.includes(legacyPath),
+    );
+    await setup({ codexHome, mode: "source", migrateLegacyHookPaths: [legacyPath] });
+    const installed = JSON.parse(await readFile(hooksPath, "utf8"));
+    const commands = installed.hooks.Stop.flatMap((matcher) =>
+      matcher.hooks.map((hook) => hook.command));
+    assert.equal(commands.includes(unrelated), true);
+    assert.equal(commands.some((command) => command.includes(legacyPath) && !command.includes(HOOK_MARKER)), false);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }

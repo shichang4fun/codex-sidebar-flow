@@ -28,6 +28,14 @@ node scripts/setup.mjs
 node scripts/doctor.mjs
 ```
 
+If setup reports `LEGACY_HOOK_CONFLICT`, inspect the reported absolute path. Migrate it only when it is an older Sidebar Flow installation you recognize:
+
+```bash
+node scripts/setup.mjs --migrate-legacy-hook /absolute/path/to/sidebar-hook.mjs
+```
+
+The installer automatically migrates the prior standard `~/.codex/sidebar-flow/scripts/sidebar-hook.mjs` command. Other unmarked commands fail closed and are never removed without the exact option above.
+
 Restart Codex Desktop after setup. The installer:
 
 - preserves unrelated hooks;

@@ -413,6 +413,31 @@ export function managedHostsByThreadId(managedThreadIds = []) {
   );
 }
 
+export function mergePersistedManagedState(
+  localState,
+  persistedState,
+  { pendingAdds = [], pendingRemoves = [] } = {},
+) {
+  const local = normalizeManagedState(localState);
+  const persisted = normalizeManagedState(persistedState);
+  const removed = new Set(pendingRemoves);
+  const managedThreadIds = new Set(
+    persisted.managedThreadIds.filter((identity) => !removed.has(identity)),
+  );
+  for (const identity of pendingAdds) managedThreadIds.add(identity);
+  return {
+    ...local,
+    manageSince: Math.min(local.manageSince, persisted.manageSince),
+    lastSessionScanAt: Math.max(local.lastSessionScanAt, persisted.lastSessionScanAt),
+    managedThreadIds: [...managedThreadIds],
+    knownThreadIdentities: [...new Set([
+      ...local.knownThreadIdentities,
+      ...persisted.knownThreadIdentities,
+    ])],
+    sessionFiles: { ...persisted.sessionFiles, ...local.sessionFiles },
+  };
+}
+
 export function recordSessionActivity(state, sessionId, observedAt = Date.now(), hostId = "local") {
   const normalized = normalizeManagedState(state, observedAt, 0);
   const managedThreadIds = new Set(normalized.managedThreadIds);
@@ -1035,21 +1060,33 @@ async function main() {
   const sessionWatchers = new Map();
   const sessionIdsByFile = new Map();
 
-  const flushManagedStateUpdates = async () => {
-    const add = [...pendingStateAdds];
-    const remove = [...pendingStateRemoves];
-    pendingStateAdds.clear();
-    pendingStateRemoves.clear();
-    const patch = {
-      add,
-      remove,
-      lastSessionScanAt: managedState.lastSessionScanAt,
-      sessionFiles: managedState.sessionFiles,
-    };
+  const flushManagedStateUpdates = () => {
     stateSavePromise = stateSavePromise
       .catch(() => {})
-      .then(() => updateManagedState(config.stateFile, patch));
-    await stateSavePromise;
+      .then(async () => {
+        const add = [...pendingStateAdds];
+        const remove = [...pendingStateRemoves];
+        pendingStateAdds.clear();
+        pendingStateRemoves.clear();
+        try {
+          return await updateManagedState(config.stateFile, {
+            add,
+            remove,
+            lastSessionScanAt: managedState.lastSessionScanAt,
+            sessionFiles: managedState.sessionFiles,
+          });
+        } catch (error) {
+          for (const identity of add) {
+            if (!pendingStateRemoves.has(identity)) pendingStateAdds.add(identity);
+          }
+          for (const identity of remove) {
+            pendingStateAdds.delete(identity);
+            pendingStateRemoves.add(identity);
+          }
+          throw error;
+        }
+      });
+    return stateSavePromise;
   };
 
   const scheduleManagedStateSave = ({ add = [], remove = [] } = {}) => {
@@ -1080,21 +1117,12 @@ async function main() {
     try {
       do {
         pending = false;
+        await stateSavePromise.catch(() => {});
         const persistedState = await loadManagedState(config.stateFile);
-        managedState = {
-          ...managedState,
-          manageSince: Math.min(managedState.manageSince, persistedState.manageSince),
-          lastSessionScanAt: Math.max(managedState.lastSessionScanAt, persistedState.lastSessionScanAt),
-          managedThreadIds: [...new Set([
-            ...managedState.managedThreadIds,
-            ...persistedState.managedThreadIds.filter((identity) => !pendingStateRemoves.has(identity)),
-          ])],
-          knownThreadIdentities: [...new Set([
-            ...managedState.knownThreadIdentities,
-            ...persistedState.knownThreadIdentities,
-          ])],
-          sessionFiles: { ...persistedState.sessionFiles, ...managedState.sessionFiles },
-        };
+        managedState = mergePersistedManagedState(managedState, persistedState, {
+          pendingAdds: pendingStateAdds,
+          pendingRemoves: pendingStateRemoves,
+        });
         const snapshot = await hydrateCustomThreads(
           await appTools.listThreads(),
           config,

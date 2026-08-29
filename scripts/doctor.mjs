@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppTools } from "./sidebar-realtime.mjs";
-import { detectNodeExecutable, HOOK_MARKER } from "./setup.mjs";
+import { detectNodeExecutable, findUnmarkedSidebarHookPaths, HOOK_MARKER } from "./setup.mjs";
 
 export function inspectInstallation({
   hooks,
@@ -17,12 +17,20 @@ export function inspectInstallation({
   nodeExecutable = detectNodeExecutable(),
   runtimeProbe = null,
   pluginBundle = null,
+  legacyHookConflicts = [],
 } = {}) {
   const checks = [];
   checks.push({
     level: platform === "darwin" ? "ok" : "warning",
     name: "platform",
     message: platform === "darwin" ? "macOS detected" : "Desktop adapter is only verified on macOS",
+  });
+  checks.push({
+    level: legacyHookConflicts.length === 0 ? "ok" : "error",
+    name: "legacy-hook-conflict",
+    message: legacyHookConflicts.length === 0
+      ? "No unowned legacy sidebar Hooks detected"
+      : `Unowned legacy sidebar Hooks detected: ${legacyHookConflicts.join(", ")}`,
   });
   const names = Object.values(config?.sections ?? {});
   const configValid = names.length === 3 && names.every(Boolean) && new Set(names).size === 3;
@@ -119,6 +127,7 @@ if (process.argv[1] != null && realpathSync(process.argv[1]) === realpathSync(fi
     mode,
     pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH,
     runtimeProbe,
+    legacyHookConflicts: findUnmarkedSidebarHookPaths(hooks),
     pluginBundle: mode === "plugin"
       ? {
           manifest: pluginRoot != null && existsSync(path.join(pluginRoot, ".codex-plugin", "plugin.json")),

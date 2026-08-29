@@ -243,6 +243,31 @@ await rm(stateDirectory, { recursive: true, force: true });
 
 assert.equal(typeof sidebarRealtime.recordSessionActivity, "function");
 assert.deepEqual(
+  sidebarRealtime.mergePersistedManagedState(
+    {
+      version: 4,
+      manageSince: 10,
+      lastSessionScanAt: 20,
+      managedThreadIds: [],
+      knownThreadIdentities: [],
+      sessionFiles: {},
+    },
+    {
+      version: 4,
+      manageSince: 10,
+      lastSessionScanAt: 20,
+      managedThreadIds: ["local:remove-in-flight", "local:keep"],
+      knownThreadIdentities: [],
+      sessionFiles: {},
+    },
+    {
+      pendingAdds: ["local:add-pending"],
+      pendingRemoves: ["local:remove-in-flight"],
+    },
+  ).managedThreadIds.sort(),
+  ["local:add-pending", "local:keep"],
+);
+assert.deepEqual(
   sidebarRealtime.recordSessionActivity(
     {
       version: 3,

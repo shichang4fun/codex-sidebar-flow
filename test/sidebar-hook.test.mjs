@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   executeHookEvent,
+  handleHook,
   isRetryableHookError,
   managedMutationFromLifecycle,
 } from "../scripts/sidebar-hook.mjs";
+import { INSTALL_MODE_ENV } from "../scripts/setup.mjs";
 
 const config = { excludeThreadIds: ["automation"] };
 
@@ -163,6 +168,36 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     /Hook deadline exceeded/,
   );
   assert.equal(Date.now() - startedAt < 200, true);
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-bootstrap-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "plugin";
+  try {
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        async execute(_input, loadedConfig) {
+          assert.equal(loadedConfig.installMode, "plugin");
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+          };
+        },
+      },
+    );
+    const bootstrapped = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(bootstrapped.installMode, "plugin");
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
 }
 
 process.stdout.write("sidebar-hook tests passed\n");

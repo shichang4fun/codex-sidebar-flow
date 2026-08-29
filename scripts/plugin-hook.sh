@@ -5,7 +5,8 @@ for candidate in \
   /Applications/Codex.app/Contents/Resources/cua_node/bin/node
 do
   if [ -x "$candidate" ]; then
-    exec /usr/bin/env -u FORCE_COLOR "$candidate" "${CLAUDE_PLUGIN_ROOT}/scripts/sidebar-hook.mjs"
+    exec /usr/bin/env -u FORCE_COLOR CODEX_SIDEBAR_FLOW_INSTALL_MODE=plugin \
+      "$candidate" "${CLAUDE_PLUGIN_ROOT}/scripts/sidebar-hook.mjs"
   fi
 done
 

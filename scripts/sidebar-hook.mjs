@@ -12,7 +12,7 @@ import {
   managedIdentity,
   updateManagedState,
 } from "./sidebar-realtime.mjs";
-import { defaultConfig, writeJsonAtomic } from "./setup.mjs";
+import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "./setup.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_PATH = process.env.CODEX_SIDEBAR_FLOW_CONFIG ?? path.join(os.homedir(), ".codex", "sidebar-flow", "config.json");
@@ -191,7 +191,11 @@ export async function executeHookEvent(
   throw lastError;
 }
 
-export async function handleHook(input, configPath = DEFAULT_CONFIG_PATH) {
+export async function handleHook(
+  input,
+  configPath = DEFAULT_CONFIG_PATH,
+  { execute = executeHookEvent } = {},
+) {
   if (!["UserPromptSubmit", "Stop"].includes(input?.hook_event_name)) return null;
   let config;
   try {
@@ -199,7 +203,11 @@ export async function handleHook(input, configPath = DEFAULT_CONFIG_PATH) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     const codexHome = path.dirname(path.dirname(configPath));
-    await writeJsonAtomic(configPath, defaultConfig(codexHome));
+    const installMode = process.env[INSTALL_MODE_ENV];
+    if (!new Set(["source", "plugin"]).has(installMode)) {
+      throw new Error(`Missing ${INSTALL_MODE_ENV} for configuration bootstrap`);
+    }
+    await writeJsonAtomic(configPath, defaultConfig(codexHome, installMode));
     config = await loadConfig(configPath);
   }
   config.actorThreadId = input.session_id;
@@ -211,7 +219,7 @@ export async function handleHook(input, configPath = DEFAULT_CONFIG_PATH) {
 
   const startedAt = Date.now();
   const managedState = await loadManagedState(config.stateFile);
-  const result = await executeHookEvent(input, config, { managedState });
+  const result = await execute(input, config, { managedState });
   await updateManagedState(config.stateFile, {
     add: result.managedAdds,
     remove: result.managedRemoves,

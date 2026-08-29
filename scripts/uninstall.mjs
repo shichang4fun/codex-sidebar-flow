@@ -15,6 +15,7 @@ export async function uninstall({
   if (!new Set(["source", "plugin"]).has(mode)) throw new Error(`Unknown uninstall mode: ${mode}`);
   const hooksPath = path.join(codexHome, "hooks.json");
   const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const legacyHookPath = path.join(codexHome, "sidebar-flow", "scripts", "sidebar-hook.mjs");
   let hooks = {};
   let config = null;
   try {
@@ -27,7 +28,7 @@ export async function uninstall({
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  const installedMode = config?.installMode ?? (hasOwnedHooks(hooks) ? "source" : null);
+  const installedMode = config?.installMode ?? (hasOwnedHooks(hooks, legacyHookPath) ? "source" : null);
   if (installedMode != null && installedMode !== mode) {
     const error = new Error(
       `Sidebar Flow is installed in ${installedMode} mode; uninstall with ${installedMode} mode`,
@@ -36,7 +37,7 @@ export async function uninstall({
     throw error;
   }
   if (mode === "source") {
-    await writeJsonAtomic(hooksPath, removeHooks(hooks));
+    await writeJsonAtomic(hooksPath, removeHooks(hooks, legacyHookPath));
   }
   if (purge) {
     await rm(path.join(codexHome, "sidebar-flow"), { recursive: true, force: true });

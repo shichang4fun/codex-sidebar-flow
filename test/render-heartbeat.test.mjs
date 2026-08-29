@@ -5,7 +5,7 @@ import { renderHeartbeatPrompt } from "../scripts/render-heartbeat.mjs";
 
 test("heartbeat renderer injects exact organizer IDs and removes its placeholder", async () => {
   const template = await readFile(new URL("../docs/heartbeat-prompt.md", import.meta.url), "utf8");
-  const organizerId = "01a04c01-f7d1-7cc2-9b3b-4929e422f8c6";
+  const organizerId = "01a00000-0000-7000-8000-000000000001";
   const prompt = renderHeartbeatPrompt(template, [organizerId]);
   assert.equal(prompt.includes(organizerId), true);
   assert.equal(prompt.includes("{{EXCLUDED_TASK_IDS}}"), false);

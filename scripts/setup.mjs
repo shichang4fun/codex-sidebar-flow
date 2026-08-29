@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const HOOK_MARKER = "CODEX_SIDEBAR_FLOW_OWNER=codex-sidebar-flow-v1";
+export const INSTALL_MODE_ENV = "CODEX_SIDEBAR_FLOW_INSTALL_MODE";
 
 function quote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
@@ -25,44 +26,90 @@ export function detectNodeExecutable() {
 }
 
 export function hookCommand(root = ROOT, nodeExecutable = detectNodeExecutable()) {
-  return `exec /usr/bin/env -u FORCE_COLOR ${HOOK_MARKER} ${quote(nodeExecutable)} ${quote(path.join(root, "scripts", "sidebar-hook.mjs"))}`;
+  return `exec /usr/bin/env -u FORCE_COLOR ${HOOK_MARKER} ${INSTALL_MODE_ENV}=source ${quote(nodeExecutable)} ${quote(path.join(root, "scripts", "sidebar-hook.mjs"))}`;
 }
 
-function isOwnedHook(hook) {
-  return typeof hook?.command === "string" && hook.command.includes(HOOK_MARKER);
+function normalizeLegacyHookPaths(paths = []) {
+  return [...new Set((Array.isArray(paths) ? paths : [paths])
+    .filter((candidate) => typeof candidate === "string" && candidate.length > 0)
+    .map((candidate) => path.normalize(candidate)))];
 }
 
-export function hasOwnedHooks(existing = {}) {
+function commandContainsExactPath(command, targetPath) {
+  if (typeof command !== "string" || typeof targetPath !== "string") return false;
+  const escaped = targetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\s)(?:"${escaped}"|'${escaped}'|${escaped})(?=\\s|$)`).test(command);
+}
+
+function sidebarHookPaths(command) {
+  if (typeof command !== "string") return [];
+  const matches = [];
+  for (const token of command.match(/"[^"]*"|'[^']*'|[^\s]+/g) ?? []) {
+    let candidate = token;
+    if ((candidate.startsWith('"') && candidate.endsWith('"'))
+      || (candidate.startsWith("'") && candidate.endsWith("'"))) {
+      candidate = candidate.slice(1, -1);
+    }
+    candidate = candidate.replace(/[;&|]+$/, "");
+    if (path.isAbsolute(candidate) && path.basename(candidate) === "sidebar-hook.mjs") {
+      matches.push(path.normalize(candidate));
+    }
+  }
+  return matches;
+}
+
+export function findUnmarkedSidebarHookPaths(existing = {}) {
+  const paths = new Set();
+  for (const event of ["UserPromptSubmit", "Stop"]) {
+    for (const matcher of existing.hooks?.[event] ?? []) {
+      for (const hook of matcher?.hooks ?? []) {
+        if (typeof hook?.command !== "string" || hook.command.includes(HOOK_MARKER)) continue;
+        for (const candidate of sidebarHookPaths(hook.command)) paths.add(candidate);
+      }
+    }
+  }
+  return [...paths];
+}
+
+function isOwnedHook(hook, legacyHookPaths = []) {
+  return typeof hook?.command === "string" && (
+    hook.command.includes(HOOK_MARKER)
+    || normalizeLegacyHookPaths(legacyHookPaths).some((candidate) =>
+      commandContainsExactPath(hook.command, candidate))
+  );
+}
+
+export function hasOwnedHooks(existing = {}, legacyHookPaths = []) {
   return ["UserPromptSubmit", "Stop"].some((event) =>
     (existing.hooks?.[event] ?? []).some((matcher) =>
-      (matcher.hooks ?? []).some(isOwnedHook),
+      (matcher.hooks ?? []).some((hook) => isOwnedHook(hook, legacyHookPaths)),
     ),
   );
 }
 
-function removeOwnedHandlers(matchers) {
+function removeOwnedHandlers(matchers, legacyHookPaths = []) {
   return (Array.isArray(matchers) ? matchers : []).flatMap((matcher) => {
-    const hooks = (matcher?.hooks ?? []).filter((hook) => !isOwnedHook(hook));
+    const hooks = (matcher?.hooks ?? []).filter((hook) => !isOwnedHook(hook, legacyHookPaths));
     return hooks.length === 0 ? [] : [{ ...matcher, hooks }];
   });
 }
 
-export function installHooks(existing = {}, command = hookCommand()) {
+export function installHooks(existing = {}, command = hookCommand(), legacyHookPaths = []) {
   const result = structuredClone(existing);
   result.hooks ??= {};
   for (const event of ["UserPromptSubmit", "Stop"]) {
-    const matchers = removeOwnedHandlers(result.hooks[event]);
+    const matchers = removeOwnedHandlers(result.hooks[event], legacyHookPaths);
     matchers.push({ hooks: [{ type: "command", command, timeout: 15 }] });
     result.hooks[event] = matchers;
   }
   return result;
 }
 
-export function removeHooks(existing = {}) {
+export function removeHooks(existing = {}, legacyHookPaths = []) {
   const result = structuredClone(existing);
   for (const event of ["UserPromptSubmit", "Stop"]) {
     if (!Array.isArray(result.hooks?.[event])) continue;
-    result.hooks[event] = removeOwnedHandlers(result.hooks[event]);
+    result.hooks[event] = removeOwnedHandlers(result.hooks[event], legacyHookPaths);
     if (result.hooks[event].length === 0) delete result.hooks[event];
   }
   return result;
@@ -104,9 +151,10 @@ async function writePrivateBackup(sourcePath, backupPath) {
   }
 }
 
-export function defaultConfig(codexHome) {
+export function defaultConfig(codexHome, installMode = null) {
   const runtime = path.join(codexHome, "sidebar-flow");
   return {
+    ...(installMode == null ? {} : { installMode }),
     actorThreadId: "codex-sidebar-flow",
     sections: {
       inProgress: "In Progress",
@@ -135,6 +183,7 @@ export async function setup({
   codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
   dryRun = false,
   mode = "source",
+  migrateLegacyHookPaths = [],
 } = {}) {
   if (!new Set(["source", "plugin"]).has(mode)) throw new Error(`Unknown setup mode: ${mode}`);
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
@@ -142,9 +191,36 @@ export async function setup({
   const hooksPath = path.join(codexHome, "hooks.json");
   const backupPath = `${hooksPath}.sidebar-flow.bak`;
   const configPath = path.join(runtimeRoot, "config.json");
+  const standardLegacyHookPath = path.join(runtimeScripts, "sidebar-hook.mjs");
+  const authorizedLegacyHookPaths = normalizeLegacyHookPaths(migrateLegacyHookPaths);
+  for (const candidate of authorizedLegacyHookPaths) {
+    if (!path.isAbsolute(candidate) || path.basename(candidate) !== "sidebar-hook.mjs") {
+      const error = new Error(`Legacy Hook migration requires an absolute sidebar-hook.mjs path: ${candidate}`);
+      error.code = "INVALID_LEGACY_HOOK_PATH";
+      throw error;
+    }
+  }
   const existingHooks = await readJson(hooksPath, {});
   const existingConfig = await readJson(configPath, null);
-  const installedMode = existingConfig?.installMode ?? (hasOwnedHooks(existingHooks) ? "source" : null);
+  const ownedLegacyHookPaths = normalizeLegacyHookPaths([
+    standardLegacyHookPath,
+    ...authorizedLegacyHookPaths,
+  ]);
+  const allowedLegacyHookPaths = new Set(ownedLegacyHookPaths);
+  const legacyHookConflicts = findUnmarkedSidebarHookPaths(existingHooks)
+    .filter((candidate) => !allowedLegacyHookPaths.has(candidate));
+  if (legacyHookConflicts.length > 0) {
+    const error = new Error(
+      `Unowned legacy sidebar Hook detected: ${legacyHookConflicts.join(", ")}. `
+      + "Review it, then pass --migrate-legacy-hook with that exact absolute path if it belongs to Sidebar Flow.",
+    );
+    error.code = "LEGACY_HOOK_CONFLICT";
+    error.paths = legacyHookConflicts;
+    throw error;
+  }
+  const installedMode = existingConfig?.installMode ?? (
+    hasOwnedHooks(existingHooks, ownedLegacyHookPaths) ? "source" : null
+  );
   if (installedMode != null && installedMode !== mode) {
     const error = new Error(
       `Sidebar Flow is installed in ${installedMode} mode; uninstall that mode before installing ${mode} mode`,
@@ -152,13 +228,13 @@ export async function setup({
     error.code = "INSTALL_MODE_CONFLICT";
     throw error;
   }
-  if (mode === "plugin" && hasOwnedHooks(existingHooks)) {
+  if (mode === "plugin" && hasOwnedHooks(existingHooks, ownedLegacyHookPaths)) {
     const error = new Error("Source hooks are still installed; run source uninstall before plugin setup");
     error.code = "MIXED_INSTALLATION";
     throw error;
   }
   const hooks = mode === "source"
-    ? installHooks(existingHooks, hookCommand(runtimeRoot))
+    ? installHooks(existingHooks, hookCommand(runtimeRoot), ownedLegacyHookPaths)
     : null;
   if (!dryRun) {
     if (mode === "source") {
@@ -174,20 +250,30 @@ export async function setup({
       await writeJsonAtomic(hooksPath, hooks);
     }
     await writeJsonAtomic(configPath, {
-      ...(existingConfig ?? defaultConfig(codexHome)),
+      ...(existingConfig ?? defaultConfig(codexHome, mode)),
       installMode: mode,
     });
     if (mode === "plugin") await rm(runtimeScripts, { recursive: true, force: true });
   }
-  return { mode, hooksPath, backupPath, configPath, runtimeRoot, dryRun, nodeExecutable: detectNodeExecutable() };
+  return {
+    mode,
+    hooksPath,
+    backupPath,
+    configPath,
+    runtimeRoot,
+    dryRun,
+    migratedLegacyHookPaths: authorizedLegacyHookPaths,
+    nodeExecutable: detectNodeExecutable(),
+  };
 }
 
 function parseArgs(argv) {
-  const result = { dryRun: false };
+  const result = { dryRun: false, migrateLegacyHookPaths: [] };
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--dry-run") result.dryRun = true;
     else if (argv[index] === "--plugin") result.mode = "plugin";
     else if (argv[index] === "--codex-home") result.codexHome = argv[++index];
+    else if (argv[index] === "--migrate-legacy-hook") result.migrateLegacyHookPaths.push(argv[++index]);
     else throw new Error(`Unknown argument: ${argv[index]}`);
   }
   return result;

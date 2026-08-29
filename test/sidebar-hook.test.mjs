@@ -11,10 +11,29 @@ import {
   managedMutationFromLifecycle,
 } from "../scripts/sidebar-hook.mjs";
 import { AppTools } from "../scripts/sidebar-realtime.mjs";
-import { armEventWakeProbe, readEventWakeProbeResult } from "../scripts/doctor.mjs";
+import {
+  armEventWakeProbe,
+  claimEventWakeProbe,
+  readEventWakeProbeResult,
+  releaseEventWakeProbeClaim,
+} from "../scripts/doctor.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/setup.mjs";
 
 const execFileAsync = promisify(execFile);
+
+async function withinTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function generationProbeResultFile(config, probeId) {
   return `${config.eventWakeProbeResultFile}.result.${probeId}`;
@@ -1278,6 +1297,148 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
     assert.equal(result.status, "expired");
     assert.equal(result.probeId, "probe-expired-0001");
   } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-probe-post-claim-race-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let resolveWinnerClaimed;
+  let resolveContenderChecked;
+  let resolveWinnerReleased;
+  const winnerClaimed = new Promise((resolve) => { resolveWinnerClaimed = resolve; });
+  const contenderChecked = new Promise((resolve) => { resolveContenderChecked = resolve; });
+  const winnerReleased = new Promise((resolve) => { resolveWinnerReleased = resolve; });
+  const claimStatuses = [];
+  let toolsListCalls = 0;
+  let wakeCalls = 0;
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    const armed = await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => "probe-hook-post-claim",
+    });
+    const eventResult = {
+      attempts: 1,
+      managedAdds: [], managedRemoves: [], observedIdentities: [],
+      eventEnvelope: {
+        protocol: "codex-sidebar-flow/event-v1",
+        event: "UserPromptSubmit",
+        threadId: "thread-1",
+        hostId: "local",
+      },
+    };
+    const commonDependencies = {
+      async execute() { return eventResult; },
+      async updateManaged() {},
+      async wake() {
+        wakeCalls += 1;
+        return { status: "sent" };
+      },
+    };
+    const winnerRun = handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        ...commonDependencies,
+        now: () => 2_000,
+        async claimProbe(probeConfig, options) {
+          const outcome = await claimEventWakeProbe(probeConfig, {
+            ...options,
+            createClaimId: () => "claim-hook-winner",
+          });
+          claimStatuses.push(outcome.status);
+          resolveWinnerClaimed();
+          return outcome;
+        },
+        createAppTools(_config, options) {
+          if ((options?.requiredTools ?? []).includes("send_message_to_thread")) return { reset() {} };
+          return {
+            async connect() {
+              toolsListCalls += 1;
+              return { toolMap: new Map([["send_message_to_thread", { name: "send_message_to_thread" }]]) };
+            },
+            reset() {},
+          };
+        },
+        async inspectCapability(appTools) {
+          await contenderChecked;
+          const host = await appTools.connect();
+          return host.toolMap.has("send_message_to_thread");
+        },
+        async releaseProbeClaim(probeConfig, claim, options) {
+          try {
+            return await releaseEventWakeProbeClaim(probeConfig, claim, options);
+          } finally {
+            resolveWinnerReleased();
+          }
+        },
+      },
+    );
+    await winnerClaimed;
+    const contenderRun = handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        ...commonDependencies,
+        now: () => 3_000,
+        async claimProbe(probeConfig, options) {
+          let interleaved = false;
+          const outcome = await claimEventWakeProbe(probeConfig, {
+            ...options,
+            createClaimId: () => "claim-hook-contender",
+            async afterInitialResultRead() {
+              interleaved = true;
+              resolveContenderChecked();
+              await winnerReleased;
+            },
+          });
+          if (!interleaved) resolveContenderChecked();
+          claimStatuses.push(outcome.status);
+          return outcome;
+        },
+        createAppTools() {
+          return { reset() {} };
+        },
+        async inspectCapability() {
+          toolsListCalls += 1;
+          throw new Error("completed probe must not be inspected again");
+        },
+      },
+    );
+    await withinTimeout(
+      Promise.all([winnerRun, contenderRun]),
+      2_000,
+      "post-claim probe interleaving timed out",
+    );
+
+    assert.deepEqual(claimStatuses, ["claimed", "complete"]);
+    assert.equal(toolsListCalls, 1);
+    assert.equal(wakeCalls, 1);
+    const result = JSON.parse(await readFile(generationProbeResultFile(runtimeConfig, armed.probeId), "utf8"));
+    assert.equal(result.status, "present");
+    assert.equal(result.claimedAt, 2_000);
+    assert.equal(result.observedAt, 2_000);
+  } finally {
+    resolveContenderChecked();
+    resolveWinnerReleased();
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;
     await rm(codexHome, { recursive: true, force: true });

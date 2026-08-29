@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { constants, existsSync, realpathSync } from "node:fs";
-import { access, lstat, open, readFile, rename, unlink } from "node:fs/promises";
+import { access, lstat, open, opendir, readFile, rename, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,8 @@ const PROBE_RESULT_NAME = "event-wake-probe-result.json";
 const MAX_PROBE_FILE_BYTES = 4096;
 const MAX_PROBE_SNAPSHOT_ATTEMPTS = 4;
 const MAX_PROBE_ID_ATTEMPTS = 8;
+const MAX_PROBE_CLEANUP_ENTRIES = 256;
+const MAX_PROBE_CLEANUP_DELETIONS = 32;
 
 function isBoundedAbsolutePath(value) {
   return typeof value === "string"
@@ -63,6 +65,19 @@ function generationProbePaths(paths, probeId) {
     claimFile: `${paths.requestFile}.claim.${probeId}`,
     resultFile: `${paths.resultBaseFile}.result.${probeId}`,
   };
+}
+
+function probeIdFromGenerationFilename(filename) {
+  const prefixes = [
+    `${PROBE_REQUEST_NAME}.claim.`,
+    `${PROBE_RESULT_NAME}.result.`,
+  ];
+  for (const prefix of prefixes) {
+    if (!filename.startsWith(prefix)) continue;
+    const probeId = filename.slice(prefix.length);
+    return validProbeId(probeId) && filename === `${prefix}${probeId}` ? probeId : null;
+  }
+  return null;
 }
 
 function validProbeConfig(config, runtimeRoot) {
@@ -241,22 +256,6 @@ async function releaseOwnedClaimPath(claim) {
   }
 }
 
-async function cleanupExpiredGeneration(paths, request, observedAt) {
-  if (request == null || observedAt <= request.expiresAt) return;
-  const generation = generationProbePaths(paths, request.probeId);
-  for (const filePath of [generation.claimFile, generation.resultFile]) {
-    const metadata = await lstat(filePath).catch((error) => {
-      if (error.code === "ENOENT") return null;
-      throw error;
-    });
-    if (metadata?.isFile() && !metadata.isSymbolicLink()) {
-      await unlink(filePath).catch((error) => {
-        if (error.code !== "ENOENT") throw error;
-      });
-    }
-  }
-}
-
 async function generationExists(paths, probeId) {
   const generation = generationProbePaths(paths, probeId);
   const metadata = await Promise.all([
@@ -274,6 +273,38 @@ async function generationExists(paths, probeId) {
 
 async function readCurrentProbeRequest(paths) {
   return normalizeProbeRequest(await readJsonIfExists(paths.requestFile));
+}
+
+async function cleanupOrphanedProbeGenerations(paths, currentRequest, observedAt) {
+  if (currentRequest == null || !validTimestamp(observedAt)) return;
+  const directory = await opendir(paths.runtimeRoot);
+  let inspected = 0;
+  let deleted = 0;
+  for await (const entry of directory) {
+    inspected += 1;
+    if (inspected > MAX_PROBE_CLEANUP_ENTRIES) break;
+    const probeId = probeIdFromGenerationFilename(entry.name);
+    if (probeId == null || probeId === currentRequest.probeId) continue;
+    const filePath = path.join(paths.runtimeRoot, entry.name);
+    const metadata = await lstat(filePath).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (
+      metadata == null
+      || metadata.isSymbolicLink()
+      || !metadata.isFile()
+      || !Number.isFinite(metadata.mtimeMs)
+      || observedAt - metadata.mtimeMs <= EVENT_WAKE_PROBE_TTL_MS
+    ) continue;
+    const latestRequest = await readCurrentProbeRequest(paths);
+    if (latestRequest == null || latestRequest.probeId === probeId) continue;
+    await unlink(filePath).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+    deleted += 1;
+    if (deleted >= MAX_PROBE_CLEANUP_DELETIONS) break;
+  }
 }
 
 export async function armEventWakeProbe(
@@ -300,7 +331,7 @@ export async function armEventWakeProbe(
     expiresAt: armedAt + EVENT_WAKE_PROBE_TTL_MS,
   };
   await writeProbeJsonAtomic(paths.requestFile, request);
-  await cleanupExpiredGeneration(paths, previousRequest, armedAt).catch(() => {});
+  await cleanupOrphanedProbeGenerations(paths, request, armedAt).catch(() => {});
   return { status: "pending", probeId, armedAt, expiresAt: request.expiresAt };
 }
 
@@ -314,9 +345,11 @@ export async function readEventWakeProbeResult(
   } catch (error) {
     return { status: "missing" };
   }
+  const observedAt = now();
   for (let attempt = 0; attempt < MAX_PROBE_SNAPSHOT_ATTEMPTS; attempt += 1) {
     const firstRequest = await readCurrentProbeRequest(paths);
     if (firstRequest == null) return { status: "missing" };
+    await cleanupOrphanedProbeGenerations(paths, firstRequest, observedAt).catch(() => {});
     const generation = generationProbePaths(paths, firstRequest.probeId);
     let result = null;
     try {
@@ -328,7 +361,7 @@ export async function readEventWakeProbeResult(
     await afterResultRead({ attempt, probeId: firstRequest.probeId });
     const secondRequest = await readCurrentProbeRequest(paths);
     if (!sameRequest(firstRequest, secondRequest)) continue;
-    if (now() > firstRequest.expiresAt) return { status: "expired", ...firstRequest };
+    if (observedAt > firstRequest.expiresAt) return { status: "expired", ...firstRequest };
     if (result != null && sameRequest(result, firstRequest)) return result;
     return { status: "pending", ...firstRequest };
   }
@@ -337,7 +370,12 @@ export async function readEventWakeProbeResult(
 
 export async function claimEventWakeProbe(
   config,
-  { runtimeRoot, now = Date.now, createClaimId = randomUUID } = {},
+  {
+    runtimeRoot,
+    now = Date.now,
+    createClaimId = randomUUID,
+    afterInitialResultRead = async () => {},
+  } = {},
 ) {
   let paths;
   try {
@@ -348,11 +386,13 @@ export async function claimEventWakeProbe(
   const observedAt = now();
   const request = await readCurrentProbeRequest(paths);
   if (request == null) return { status: "none" };
+  await cleanupOrphanedProbeGenerations(paths, request, observedAt).catch(() => {});
   if (observedAt > request.expiresAt) return { status: "expired", ...request };
   const generation = generationProbePaths(paths, request.probeId);
   await validateGenerationFile(generation.resultFile);
   const result = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
   if (result != null && sameRequest(result, request)) return { status: "complete", result };
+  await afterInitialResultRead({ probeId: request.probeId });
   const claimId = createClaimId();
   if (!validProbeId(claimId)) throw new Error("Invalid event-wake probe claim identity");
   await validateGenerationFile(generation.claimFile);
@@ -389,6 +429,17 @@ export async function claimEventWakeProbe(
     if (!sameRequest(latestRequest, request)) {
       await releaseOwnedClaimPath(claim);
       return { status: "none" };
+    }
+    await validateGenerationFile(generation.resultFile);
+    const completedResult = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
+    const requestAfterResult = await readCurrentProbeRequest(paths);
+    if (!sameRequest(requestAfterResult, request)) {
+      await releaseOwnedClaimPath(claim);
+      return { status: "none" };
+    }
+    if (completedResult != null && sameRequest(completedResult, request)) {
+      await releaseOwnedClaimPath(claim);
+      return { status: "complete", result: completedResult };
     }
     return claim;
   } catch (error) {

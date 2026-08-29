@@ -12,6 +12,7 @@ import {
   managedIdentity,
   updateManagedState,
 } from "./sidebar-realtime.mjs";
+import { normalizeLifecycleEnvelope, wakeOrganizer } from "./event-wake.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "./setup.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +21,8 @@ const DEFAULT_LOG_PATH = path.join(os.homedir(), ".codex", "sidebar-flow", "hook
 const DEFAULT_RETRY_DELAY_MS = 250;
 const DEFAULT_ATTEMPTS = 2;
 const DEFAULT_HOOK_DEADLINE_MS = 9000;
+const OBSERVATION_REQUIRED_TOOLS = ["list_threads", "read_thread"];
+const EVENT_WAKE_REQUIRED_TOOLS = ["list_threads", "read_thread", "send_message_to_thread"];
 const MAX_LOG_BYTES = 1024 * 1024;
 
 export function managedMutationFromLifecycle(snapshot, input, config) {
@@ -39,6 +42,26 @@ export function managedMutationFromLifecycle(snapshot, input, config) {
     threadId: thread.id,
     hostId: thread.hostId,
   };
+}
+
+function authoritativeEventEnvelope(snapshot, input, config) {
+  const threadId = input?.session_id;
+  const event = input?.hook_event_name;
+  if (typeof threadId !== "string" || threadId.length === 0) return null;
+  if (!["UserPromptSubmit", "Stop"].includes(event)) return null;
+  if (config?.eventWake?.enabled !== true) return null;
+  if ((config.excludeThreadIds ?? []).includes(threadId)) return null;
+  if (threadId === config?.eventWake?.organizerThreadId) return null;
+
+  const thread = (snapshot.threads ?? []).find((candidate) => candidate.id === threadId);
+  if (thread == null || thread.kind !== "codex" || typeof thread.hostId !== "string" || thread.hostId.length === 0) {
+    return null;
+  }
+  return normalizeLifecycleEnvelope({
+    event,
+    threadId: thread.id,
+    hostId: thread.hostId,
+  });
 }
 
 async function readHookInput() {
@@ -92,8 +115,8 @@ export function isRetryableHookError(error) {
   );
 }
 
-async function runBeforeDeadline(task, deadlineAt) {
-  const remainingMs = deadlineAt - Date.now();
+async function runBeforeDeadline(task, deadlineAt, now = Date.now) {
+  const remainingMs = deadlineAt - now();
   if (remainingMs <= 0) {
     const error = new Error("Hook deadline exceeded");
     error.code = "HOOK_DEADLINE";
@@ -116,7 +139,7 @@ async function runBeforeDeadline(task, deadlineAt) {
   }
 }
 
-async function hydrateHookThread(snapshot, input, appTools, deadlineAt) {
+async function hydrateHookThread(snapshot, input, appTools, deadlineAt, now = Date.now) {
   const threadId = input.session_id;
   const threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
   const existing = threads.find((thread) => thread.id === threadId);
@@ -127,6 +150,7 @@ async function hydrateHookThread(snapshot, input, appTools, deadlineAt) {
   const result = await runBeforeDeadline(
     () => appTools.readThread(threadId, executionHostId),
     deadlineAt,
+    now,
   );
   const hostId = result.thread?.hostId ?? executionHostId;
   if (typeof hostId !== "string" || hostId.length === 0) return snapshot;
@@ -149,27 +173,33 @@ export async function executeHookEvent(
   input,
   config,
   {
-    createAppTools = () => new AppTools(config),
+    createAppTools = (runtimeConfig, options) => new AppTools(runtimeConfig, options),
     wait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
     attempts = DEFAULT_ATTEMPTS,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
     managedState = null,
+    now = Date.now,
     deadlineMs = config.hookDeadlineMs ?? DEFAULT_HOOK_DEADLINE_MS,
+    deadlineAt = now() + deadlineMs,
   } = {},
 ) {
-  const deadlineAt = Date.now() + deadlineMs;
   let lastError;
+  if (input?.hook_event_name === "Stop") {
+    const settleDelayMs = config.stopSettleDelayMs ?? 500;
+    await runBeforeDeadline(() => wait(settleDelayMs), deadlineAt, now);
+  }
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const appTools = createAppTools();
+    const appTools = createAppTools(config, { requiredTools: OBSERVATION_REQUIRED_TOOLS });
     try {
-      let snapshot = await runBeforeDeadline(() => appTools.listThreads(), deadlineAt);
-      snapshot = await hydrateHookThread(snapshot, input, appTools, deadlineAt);
+      let snapshot = await runBeforeDeadline(() => appTools.listThreads(), deadlineAt, now);
+      snapshot = await hydrateHookThread(snapshot, input, appTools, deadlineAt, now);
       let nextManagedState = managedState;
       const managedAdds = [];
       const managedRemoves = [];
       const observedIdentities = [];
       const mutation = managedMutationFromLifecycle(snapshot, input, config);
       if (mutation?.action === "observe") observedIdentities.push(mutation.identity);
+      const eventEnvelope = authoritativeEventEnvelope(snapshot, input, config);
       return {
         move: null,
         moves: [],
@@ -177,6 +207,7 @@ export async function executeHookEvent(
         managedAdds,
         managedRemoves,
         observedIdentities,
+        eventEnvelope,
         attempts: attempt,
       };
     } catch (error) {
@@ -188,16 +219,41 @@ export async function executeHookEvent(
     } finally {
       appTools.reset();
     }
-    await runBeforeDeadline(() => wait(retryDelayMs), deadlineAt);
+    await runBeforeDeadline(() => wait(retryDelayMs), deadlineAt, now);
   }
   throw lastError;
+}
+
+function boundedWakeResult(result) {
+  if (result == null || typeof result !== "object") return null;
+  const wakeStatus = typeof result.status === "string" ? result.status : "failed";
+  const wakeErrorCode = typeof result.errorCode === "string" ? result.errorCode : undefined;
+  return wakeErrorCode == null ? { wakeStatus } : { wakeStatus, wakeErrorCode };
+}
+
+function boundedWakeThrown(error) {
+  const wakeErrorCode = typeof error?.code === "string"
+    ? error.code
+    : typeof error?.message === "string" && error.message.length > 0
+      ? error.message.slice(0, 64)
+      : "WAKE_FAILED";
+  return { wakeStatus: "failed", wakeErrorCode };
 }
 
 export async function handleHook(
   input,
   configPath = DEFAULT_CONFIG_PATH,
-  { execute = executeHookEvent } = {},
-) {
+  dependencies = {},
+ ) {
+  const {
+    execute = executeHookEvent,
+    createAppTools = (runtimeConfig, options) => new AppTools(runtimeConfig, options),
+    load = dependencies.loadConfig ?? loadConfig,
+    loadState = loadManagedState,
+    updateManaged = updateManagedState,
+    wake = wakeOrganizer,
+    now = Date.now,
+  } = dependencies;
   if (!["UserPromptSubmit", "Stop"].includes(input?.hook_event_name)) return null;
   const installMode = process.env[INSTALL_MODE_ENV];
   if (!new Set(["source", "plugin"]).has(installMode)) {
@@ -207,12 +263,12 @@ export async function handleHook(
   }
   let config;
   try {
-    config = await loadConfig(configPath);
+    config = await load(configPath);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     const codexHome = path.dirname(path.dirname(configPath));
     await writeJsonAtomic(configPath, defaultConfig(codexHome, installMode));
-    config = await loadConfig(configPath);
+    config = await load(configPath);
   }
   if (config.installMode !== installMode) {
     const error = new Error(
@@ -228,17 +284,37 @@ export async function handleHook(
   config.maxSocketCandidates = Math.min(config.maxSocketCandidates, 4);
   config.requestTimeoutMs = Math.min(config.requestTimeoutMs, 2000);
 
-  const startedAt = Date.now();
-  const managedState = await loadManagedState(config.stateFile);
-  const result = await execute(input, config, { managedState });
-  await updateManagedState(config.stateFile, {
+  const startedAt = now();
+  const deadlineAt = startedAt + (config.hookDeadlineMs ?? DEFAULT_HOOK_DEADLINE_MS);
+  const managedState = await loadState(config.stateFile);
+  const result = await execute(input, config, {
+    managedState,
+    deadlineAt,
+    now,
+    createAppTools,
+  });
+  await updateManaged(config.stateFile, {
     add: result.managedAdds,
     remove: result.managedRemoves,
     observe: result.observedIdentities,
   });
+  let wakeOutcome = null;
+  if (result.eventEnvelope != null && now() < deadlineAt) {
+    const wakeTools = createAppTools(config, { requiredTools: EVENT_WAKE_REQUIRED_TOOLS });
+    try {
+      wakeOutcome = boundedWakeResult(
+        await wake(result.eventEnvelope, config.eventWake, wakeTools),
+      );
+    } catch (error) {
+      wakeOutcome = boundedWakeThrown(error);
+    } finally {
+      wakeTools.reset?.();
+    }
+  } else if (result.eventEnvelope != null) {
+    wakeOutcome = { wakeStatus: "failed", wakeErrorCode: "HOOK_DEADLINE" };
+  }
   await writeHookLog(config.hookLogFile ?? DEFAULT_LOG_PATH, {
     event: input.hook_event_name,
-    threadId: input.session_id,
     destination: null,
     observationOnly: true,
     attempts: result.attempts,
@@ -248,7 +324,8 @@ export async function handleHook(
     hasPipe: Boolean(process.env.CODEX_APP_TOOLS_PIPE_PATH),
     pipeBasename: path.basename(process.env.CODEX_APP_TOOLS_PIPE_PATH ?? ""),
     toolsListSucceeded: true,
-    durationMs: Date.now() - startedAt,
+    durationMs: now() - startedAt,
+    ...wakeOutcome,
   });
   return null;
 }

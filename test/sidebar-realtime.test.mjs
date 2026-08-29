@@ -582,12 +582,85 @@ await sidebarRealtime.keepHostAlive(
   2_000,
 );
 assert.deepEqual(keepAliveRequests, [["tools/list", { threadStartKind: "all" }, 2_000]]);
+await sidebarRealtime.keepHostAlive(
+  {
+    client: {
+      request: async () => ({
+        tools: [
+          { name: "list_threads" },
+          { name: "read_thread" },
+        ],
+      }),
+    },
+  },
+  2_000,
+  ["list_threads", "read_thread"],
+);
 await assert.rejects(
   sidebarRealtime.keepHostAlive(
     { client: { request: async () => ({ tools: [{ name: "list_threads" }] }) } },
     2_000,
   ),
   /required sidebar tools/,
+);
+
+assert.deepEqual(sidebarRealtime.RECONCILER_TOOLS, [
+  "list_threads",
+  "read_thread",
+  "move_thread_to_sidebar_section",
+]);
+
+const reconcilerTools = new sidebarRealtime.AppTools(config);
+assert.deepEqual(reconcilerTools.requiredTools, [
+  "list_threads",
+  "read_thread",
+  "move_thread_to_sidebar_section",
+]);
+
+const observationTools = new sidebarRealtime.AppTools(config, {
+  requiredTools: ["list_threads", "read_thread"],
+});
+assert.deepEqual(observationTools.requiredTools, ["list_threads", "read_thread"]);
+assert.equal(observationTools.requiredTools.includes("move_thread_to_sidebar_section"), false);
+
+const eventHookTools = new sidebarRealtime.AppTools(config, {
+  requiredTools: ["list_threads", "read_thread", "send_message_to_thread"],
+});
+assert.deepEqual(eventHookTools.requiredTools, [
+  "list_threads",
+  "read_thread",
+  "send_message_to_thread",
+]);
+
+const sendMessageCalls = [];
+eventHookTools.call = async (name, args) => {
+  sendMessageCalls.push({ name, args });
+  return { success: true, contentItems: [] };
+};
+await eventHookTools.sendMessageToThread({
+  threadId: "hook-target",
+  hostId: remoteHostId,
+  prompt: "hook prompt",
+});
+assert.deepEqual(sendMessageCalls, [{
+  name: "send_message_to_thread",
+  args: {
+    threadId: "hook-target",
+    hostId: remoteHostId,
+    prompt: "hook prompt",
+  },
+}]);
+const sidebarRealtimeSource = await readFile(
+  new URL("../scripts/sidebar-realtime.mjs", import.meta.url),
+  "utf8",
+);
+assert.match(
+  sidebarRealtimeSource,
+  /this\.host = await discoverHost\(this\.config, this\.requiredTools\);/,
+);
+assert.match(
+  sidebarRealtimeSource,
+  /await keepHostAlive\(\s*this\.host,\s*this\.config\.socketKeepAliveTimeoutMs \?\? 5000,\s*this\.requiredTools,\s*\);/s,
 );
 
 assert.equal(typeof sidebarRealtime.createEventScheduler, "function");

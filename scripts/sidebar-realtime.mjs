@@ -11,7 +11,11 @@ import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
-const REQUIRED_TOOLS = ["list_threads", "move_thread_to_sidebar_section", "read_thread"];
+export const RECONCILER_TOOLS = [
+  "list_threads",
+  "read_thread",
+  "move_thread_to_sidebar_section",
+];
 const DEFAULT_SOCKET_DIR = "/tmp/codex-browser-use";
 const DEFAULT_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
 const execFileAsync = promisify(execFile);
@@ -195,14 +199,14 @@ export function promoteClientTimeout(client, requestTimeoutMs) {
   return client;
 }
 
-export async function keepHostAlive(host, timeoutMs = 5000) {
+export async function keepHostAlive(host, timeoutMs = 5000, requiredTools = RECONCILER_TOOLS) {
   const result = await host.client.request(
     "tools/list",
     { threadStartKind: "all" },
     timeoutMs,
   );
   const names = new Set((result?.tools ?? []).map((tool) => tool.name));
-  if (!REQUIRED_TOOLS.every((name) => names.has(name))) {
+  if (!requiredTools.every((name) => names.has(name))) {
     throw new Error("Codex app tools keepalive lost required sidebar tools");
   }
 }
@@ -618,7 +622,7 @@ async function socketCandidates(socketDir, explicitPath, maximum, allowSocketDis
   return filterTrustedSocketPaths(selectSocketCandidates(preferred, discovered, maximum));
 }
 
-async function discoverHost(config) {
+async function discoverHost(config, requiredTools = RECONCILER_TOOLS) {
   const candidates = await socketCandidates(
     config.socketDir ?? DEFAULT_SOCKET_DIR,
     process.env.CODEX_APP_TOOLS_PIPE_PATH,
@@ -644,7 +648,7 @@ async function discoverHost(config) {
       );
       const tools = Array.isArray(result?.tools) ? result.tools : [];
       const toolMap = new Map(tools.map((tool) => [tool.name, tool]));
-      if (REQUIRED_TOOLS.every((name) => toolMap.has(name))) {
+      if (requiredTools.every((name) => toolMap.has(name))) {
         promoteClientTimeout(client, config.requestTimeoutMs ?? 15000);
         return { client, socketPath, toolMap };
       }
@@ -684,8 +688,9 @@ function parseToolText(result, toolName) {
 }
 
 export class AppTools {
-  constructor(config) {
+  constructor(config, { requiredTools = RECONCILER_TOOLS } = {}) {
     this.config = config;
+    this.requiredTools = [...requiredTools];
     this.host = null;
     this.failureCount = 0;
     this.nextConnectAt = 0;
@@ -700,7 +705,7 @@ export class AppTools {
       throw error;
     }
     try {
-      this.host = await discoverHost(this.config);
+      this.host = await discoverHost(this.config, this.requiredTools);
       this.failureCount = 0;
       this.nextConnectAt = 0;
     } catch (error) {
@@ -733,7 +738,11 @@ export class AppTools {
   async keepAlive() {
     if (this.host == null) return false;
     try {
-      await keepHostAlive(this.host, this.config.socketKeepAliveTimeoutMs ?? 5000);
+      await keepHostAlive(
+        this.host,
+        this.config.socketKeepAliveTimeoutMs ?? 5000,
+        this.requiredTools,
+      );
       return true;
     } catch (error) {
       this.noteFailure();
@@ -791,6 +800,15 @@ export class AppTools {
     return parseToolText(
       await this.call("read_thread", args),
       "read_thread",
+    );
+  }
+
+  async sendMessageToThread({ threadId, hostId, prompt }) {
+    const args = { threadId, prompt };
+    if (hostId) args.hostId = hostId;
+    return assertToolSuccess(
+      await this.call("send_message_to_thread", args),
+      "send_message_to_thread",
     );
   }
 }

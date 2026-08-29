@@ -15,6 +15,10 @@ import { armEventWakeProbe, readEventWakeProbeResult } from "../scripts/doctor.m
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/setup.mjs";
 
 const execFileAsync = promisify(execFile);
+
+function generationProbeResultFile(config, probeId) {
+  return `${config.eventWakeProbeResultFile}.result.${probeId}`;
+}
 const config = { excludeThreadIds: ["automation"] };
 const eventWakeConfig = {
   enabled: true,
@@ -971,7 +975,6 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   const codexHome = await mkdtemp(path.join(os.tmpdir(), `sidebar-flow-hook-probe-${expectedStatus}-`));
   const runtime = path.join(codexHome, "sidebar-flow");
   const configPath = path.join(runtime, "config.json");
-  const probeResultFile = path.join(runtime, "event-wake-probe-result.json");
   const previousMode = process.env[INSTALL_MODE_ENV];
   process.env[INSTALL_MODE_ENV] = "source";
   let wakeCalls = 0;
@@ -988,11 +991,12 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
       },
     };
     await writeJsonAtomic(configPath, runtimeConfig);
-    await armEventWakeProbe(runtimeConfig, {
+    const armed = await armEventWakeProbe(runtimeConfig, {
       runtimeRoot: runtime,
       now: () => 1_000,
       createProbeId: () => `probe-${expectedStatus}-0001`,
     });
+    const probeResultFile = generationProbeResultFile(runtimeConfig, armed.probeId);
 
     await handleHook(
       { session_id: "thread-1", hook_event_name: "UserPromptSubmit", prompt: "raw secret task content" },
@@ -1267,7 +1271,10 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
     );
     assert.equal(probeConnections, 0);
     assert.equal(wakeCalls, 1);
-    const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
+    const result = await readEventWakeProbeResult(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 400_000,
+    });
     assert.equal(result.status, "expired");
     assert.equal(result.probeId, "probe-expired-0001");
   } finally {
@@ -1297,7 +1304,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
       },
     };
     await writeJsonAtomic(configPath, runtimeConfig);
-    await armEventWakeProbe(runtimeConfig, {
+    const armed = await armEventWakeProbe(runtimeConfig, {
       runtimeRoot: runtime,
       now: () => 1_000,
       createProbeId: () => "probe-race-0001",
@@ -1341,7 +1348,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
     ]);
     assert.equal(probeConnections, 1);
     assert.equal(wakeCalls, 1);
-    const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
+    const result = JSON.parse(await readFile(generationProbeResultFile(runtimeConfig, armed.probeId), "utf8"));
     assert.equal(result.status, "present");
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
@@ -1369,7 +1376,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
       },
     };
     await writeJsonAtomic(configPath, runtimeConfig);
-    await armEventWakeProbe(runtimeConfig, {
+    const armed = await armEventWakeProbe(runtimeConfig, {
       runtimeRoot: runtime,
       now: () => 1_000,
       createProbeId: () => "probe-process-race-0001",
@@ -1400,7 +1407,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
     const outcomes = settled.map(({ value }) => JSON.parse(value.stdout));
     assert.equal(outcomes.reduce((sum, result) => sum + result.probeConnections, 0), 1);
     assert.equal(outcomes.reduce((sum, result) => sum + result.wakeCalls, 0), 1);
-    const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
+    const result = JSON.parse(await readFile(generationProbeResultFile(runtimeConfig, armed.probeId), "utf8"));
     assert.equal(result.status, "present");
   } finally {
     controller.abort();

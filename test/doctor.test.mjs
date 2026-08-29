@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,6 +17,13 @@ import {
 import { defaultConfig } from "../scripts/setup.mjs";
 
 const execFileAsync = promisify(execFile);
+
+function generationProbePaths(config, probeId) {
+  return {
+    claimFile: `${config.eventWakeProbeRequestFile}.claim.${probeId}`,
+    resultFile: `${config.eventWakeProbeResultFile}.result.${probeId}`,
+  };
+}
 
 const config = {
   installMode: "plugin",
@@ -227,12 +234,16 @@ test("doctor arms and reads bounded private event-wake probe state", async () =>
     });
     assert.equal(claim.status, "claimed");
     assert.equal(claim.probeId, pending.probeId);
+    const paths = generationProbePaths(config, pending.probeId);
+    assert.equal((await stat(paths.claimFile)).mode & 0o777, 0o600);
     assert.equal(await writeEventWakeProbeResult(config, "present", {
       runtimeRoot,
       now: () => 2_500,
       claim,
     }), true);
     await releaseEventWakeProbeClaim(config, claim, { runtimeRoot });
+    assert.equal((await stat(paths.resultFile)).mode & 0o777, 0o600);
+    await assert.rejects(stat(config.eventWakeProbeResultFile), (error) => error.code === "ENOENT");
     assert.deepEqual(await readEventWakeProbeResult(config, { runtimeRoot, now: () => 3_000 }), {
       status: "present",
       probeId: "probe-00000001",
@@ -309,13 +320,13 @@ test("probe paths are exact runtime files and unsafe targets are untouched", asy
   }
 });
 
-test("stale and superseded probe claims are recoverable and old commits are rejected", async () => {
+test("a dead old generation never blocks or deletes a newly armed generation", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-recovery-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
   const config = defaultConfig(codexHome, "source");
   try {
     await mkdir(runtimeRoot, { recursive: true });
-    await armEventWakeProbe(config, {
+    const old = await armEventWakeProbe(config, {
       runtimeRoot,
       now: () => 1_000,
       createProbeId: () => "probe-00000001",
@@ -326,27 +337,217 @@ test("stale and superseded probe claims are recoverable and old commits are reje
       createClaimId: () => "claim-00000001",
     });
     assert.equal(oldClaim.status, "claimed");
-
-    const recovered = await claimEventWakeProbe(config, {
-      runtimeRoot,
-      now: () => 40_000,
-      createClaimId: () => "claim-00000002",
-    });
-    assert.equal(recovered.status, "claimed");
-    assert.notEqual(recovered.claimId, oldClaim.claimId);
-    await releaseEventWakeProbeClaim(config, recovered, { runtimeRoot });
+    const oldPaths = generationProbePaths(config, old.probeId);
+    await assert.rejects(
+      armEventWakeProbe(config, {
+        runtimeRoot,
+        now: () => 2_500,
+        createProbeId: () => old.probeId,
+      }),
+      /unique|probe identity/i,
+    );
+    assert.equal((await readEventWakeProbeResult(config, { runtimeRoot, now: () => 2_600 })).probeId, old.probeId);
 
     const next = await armEventWakeProbe(config, {
       runtimeRoot,
-      now: () => 50_000,
+      now: () => 3_000,
       createProbeId: () => "probe-00000002",
     });
+    const nextClaim = await claimEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 4_000,
+      createClaimId: () => "claim-00000002",
+    });
+    assert.equal(nextClaim.status, "claimed");
+    const nextPaths = generationProbePaths(config, next.probeId);
+    assert.equal((await stat(oldPaths.claimFile)).isFile(), true);
+    assert.equal((await stat(nextPaths.claimFile)).isFile(), true);
+
     assert.equal(await writeEventWakeProbeResult(config, "present", {
       runtimeRoot,
-      now: () => 51_000,
+      now: () => 5_000,
       claim: oldClaim,
     }), false);
-    assert.deepEqual(await readEventWakeProbeResult(config, { runtimeRoot, now: () => 52_000 }), next);
+    assert.equal(await writeEventWakeProbeResult(config, "present", {
+      runtimeRoot,
+      now: () => 5_100,
+      claim: nextClaim,
+    }), true);
+    assert.equal(await releaseEventWakeProbeClaim(config, oldClaim, { runtimeRoot }), true);
+    assert.equal((await stat(nextPaths.claimFile)).isFile(), true);
+    await releaseEventWakeProbeClaim(config, nextClaim, { runtimeRoot });
+    assert.equal((await readEventWakeProbeResult(config, { runtimeRoot, now: () => 5_200 })).probeId, next.probeId);
+    assert.equal((await stat(nextPaths.resultFile)).isFile(), true);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("claim release verifies open-handle ownership before removing its generation path", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-owner-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const config = defaultConfig(codexHome, "source");
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    const pending = await armEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 1_000,
+      createProbeId: () => "probe-owner-0001",
+    });
+    const claim = await claimEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 2_000,
+      createClaimId: () => "claim-owner-0001",
+    });
+    const { claimFile } = generationProbePaths(config, pending.probeId);
+    const originalBytes = await readFile(claimFile);
+    const movedOwner = `${claimFile}.original`;
+    await rename(claimFile, movedOwner);
+    await writeFile(claimFile, originalBytes, { mode: 0o600 });
+
+    assert.equal(await releaseEventWakeProbeClaim(config, claim, { runtimeRoot }), false);
+    assert.equal((await stat(claimFile)).isFile(), true);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("generation result publication rejects symlink targets without touching their destination", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-result-path-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const config = defaultConfig(codexHome, "source");
+  const unrelatedFile = path.join(codexHome, "unrelated.json");
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    await writeFile(unrelatedFile, "keep\n", { mode: 0o600 });
+    const pending = await armEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 1_000,
+      createProbeId: () => "probe-result-path",
+    });
+    const claim = await claimEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 2_000,
+      createClaimId: () => "claim-result-path",
+    });
+    await symlink(unrelatedFile, generationProbePaths(config, pending.probeId).resultFile);
+    await assert.rejects(
+      writeEventWakeProbeResult(config, "present", {
+        runtimeRoot,
+        now: () => 2_500,
+        claim,
+      }),
+      /symlink|regular file|probe path/i,
+    );
+    assert.equal(await readFile(unrelatedFile, "utf8"), "keep\n");
+    await releaseEventWakeProbeClaim(config, claim, { runtimeRoot });
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("old result publication cannot overwrite or unlink a newer generation result", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-publish-race-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const config = defaultConfig(codexHome, "source");
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    const old = await armEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 1_000,
+      createProbeId: () => "probe-publish-old",
+    });
+    const oldClaim = await claimEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 2_000,
+      createClaimId: () => "claim-publish-old",
+    });
+    let next;
+    let nextClaim;
+    const oldCommitted = await writeEventWakeProbeResult(config, "present", {
+      runtimeRoot,
+      now: () => 5_000,
+      claim: oldClaim,
+      async afterRequestValidation() {
+        next = await armEventWakeProbe(config, {
+          runtimeRoot,
+          now: () => 3_000,
+          createProbeId: () => "probe-publish-new",
+        });
+        nextClaim = await claimEventWakeProbe(config, {
+          runtimeRoot,
+          now: () => 4_000,
+          createClaimId: () => "claim-publish-new",
+        });
+        assert.equal(await writeEventWakeProbeResult(config, "missing", {
+          runtimeRoot,
+          now: () => 4_500,
+          claim: nextClaim,
+        }), true);
+      },
+    });
+
+    assert.equal(oldCommitted, false);
+    assert.equal((await readEventWakeProbeResult(config, { runtimeRoot, now: () => 5_100 })).status, "missing");
+    assert.equal((await readEventWakeProbeResult(config, { runtimeRoot, now: () => 5_100 })).probeId, next.probeId);
+    assert.equal((await stat(generationProbePaths(config, next.probeId).resultFile)).isFile(), true);
+    await releaseEventWakeProbeClaim(config, oldClaim, { runtimeRoot });
+    await releaseEventWakeProbeClaim(config, nextClaim, { runtimeRoot });
+    assert.equal((await stat(generationProbePaths(config, next.probeId).resultFile)).isFile(), true);
+    assert.notEqual(old.probeId, next.probeId);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("doctor retries when request generation changes during its result snapshot", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-read-race-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const config = defaultConfig(codexHome, "source");
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    await armEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 1_000,
+      createProbeId: () => "probe-read-old",
+    });
+    const oldClaim = await claimEventWakeProbe(config, {
+      runtimeRoot,
+      now: () => 2_000,
+      createClaimId: () => "claim-read-old",
+    });
+    await writeEventWakeProbeResult(config, "present", {
+      runtimeRoot,
+      now: () => 2_500,
+      claim: oldClaim,
+    });
+    let next;
+    const observed = await readEventWakeProbeResult(config, {
+      runtimeRoot,
+      now: () => 5_000,
+      async afterResultRead() {
+        if (next != null) return;
+        next = await armEventWakeProbe(config, {
+          runtimeRoot,
+          now: () => 3_000,
+          createProbeId: () => "probe-read-new",
+        });
+        const nextClaim = await claimEventWakeProbe(config, {
+          runtimeRoot,
+          now: () => 4_000,
+          createClaimId: () => "claim-read-new",
+        });
+        await writeEventWakeProbeResult(config, "missing", {
+          runtimeRoot,
+          now: () => 4_500,
+          claim: nextClaim,
+        });
+        await releaseEventWakeProbeClaim(config, nextClaim, { runtimeRoot });
+      },
+    });
+    assert.equal(observed.status, "missing");
+    assert.equal(observed.probeId, next.probeId);
+    await releaseEventWakeProbeClaim(config, oldClaim, { runtimeRoot });
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }

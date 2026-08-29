@@ -1,6 +1,6 @@
 # Codex Sidebar Flow
 
-Codex Sidebar Flow v0.2 uses a hybrid control plane: lifecycle Hooks observe and persist task identity, then optionally send one content-free event envelope to an organizer task; the organizer reads confirmed state and performs at most one targeted move; a recurring heartbeat repairs missed events and stopped tasks that were already in `In Progress`. Classification is deterministic and never follows task content.
+Codex Sidebar Flow v0.2 uses a hybrid control plane: lifecycle Hooks observe and persist task identity, then optionally send one content-free event envelope containing only `protocol`, `event`, `threadId`, and `hostId` to an organizer task; the organizer reads confirmed state and performs at most one targeted move; a recurring heartbeat repairs missed events and stopped tasks that were already in `In Progress`. Classification is deterministic and never follows task content.
 
 > [!WARNING]
 > Codex Hooks are supported, but custom-sidebar mutation currently depends on a private Codex Desktop app-tools pipe. This experimental macOS integration can break after a Desktop update.
@@ -67,7 +67,7 @@ Cross-mode setup is rejected. To migrate plugin → source, first disable the pl
 ## Runtime model
 
 - **Lifecycle observer**: `UserPromptSubmit` and `Stop` record the current task's authoritative identity and bounded diagnostics. Neither event mutates the sidebar before sibling Hook outcomes are known.
-- **Event wake**: when `eventWake.enabled=true` and a real Hook-context probe has confirmed `send_message_to_thread`, the Hook sends one content-free envelope containing only `threadId` and `hostId` to the configured organizer task. The organizer reads confirmed state and performs at most one targeted move.
+- **Event wake**: when `eventWake.enabled=true` and a real Hook-context probe has confirmed `send_message_to_thread`, the Hook sends one content-free envelope containing only `protocol`, `event`, `threadId`, and `hostId` to the configured organizer task. The organizer reads confirmed state and performs at most one targeted move.
 - **Deterministic reconciler**: the organizer turn reads confirmed task status and performs event-path movement; the recurring heartbeat performs independent global recovery.
 - **Project tasks**: a task without direct membership uses its Project only as a source and protection signal. Moving the task creates explicit task membership in the destination section; the Project itself is not moved.
 - **Heartbeat recovery**: the recurring heartbeat performs global cross-host reconciliation and must call Codex task-management tools directly. It is the deterministic recovery path for missed events, unavailable remote event wake, and stopped tasks already in `In Progress`. A sandboxed heartbeat must not launch the native-pipe script because it lacks the trusted Desktop process context. Use the [audited prompt template](docs/heartbeat-prompt.md).

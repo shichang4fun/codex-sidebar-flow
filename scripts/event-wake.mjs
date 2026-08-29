@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -34,20 +34,26 @@ function assertSafeIdentifier(value, label) {
 
 function organizerConfig(config) {
   if (!isRecord(config)) throw new Error("Invalid event-wake config");
+  const hasWakeStateFile = Object.hasOwn(config, "wakeStateFile");
+  const hasMaxPerMinute = Object.hasOwn(config, "maxPerMinute");
+  if (!hasWakeStateFile || typeof config.wakeStateFile !== "string" || config.wakeStateFile.length === 0) {
+    throw new Error("Invalid wakeStateFile");
+  }
+  if (
+    hasMaxPerMinute &&
+    (!Number.isInteger(config.maxPerMinute) || config.maxPerMinute <= 0)
+  ) {
+    throw new Error("Invalid maxPerMinute");
+  }
   return {
     enabled: config.enabled === true,
     organizerThreadId: assertSafeIdentifier(config.organizerThreadId, "organizerThreadId"),
     organizerHostId: assertSafeIdentifier(config.organizerHostId, "organizerHostId"),
-    wakeStateFile:
-      typeof config.wakeStateFile === "string" && config.wakeStateFile.length > 0
-        ? config.wakeStateFile
-        : null,
+    wakeStateFile: hasWakeStateFile ? config.wakeStateFile : null,
     excludeThreadIds: Array.isArray(config.excludeThreadIds)
       ? config.excludeThreadIds.filter((value) => typeof value === "string")
       : [],
-    maxPerMinute: Number.isInteger(config.maxPerMinute) && config.maxPerMinute > 0
-      ? config.maxPerMinute
-      : 20,
+    maxPerMinute: hasMaxPerMinute ? config.maxPerMinute : 20,
   };
 }
 
@@ -104,6 +110,7 @@ async function withFileLock(
     delayMs = LOCK_DELAY_MS,
     now = Date.now,
     createToken = randomUUID,
+    writeOwnerRecord = null,
     onBeforeRelease = null,
   } = {},
 ) {
@@ -113,8 +120,30 @@ async function withFileLock(
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       handle = await open(lockPath, "wx", 0o600);
-      owner = { pid: process.pid, createdAt: now(), token: createToken() };
-      await handle.writeFile(`${JSON.stringify(owner)}\n`);
+      try {
+        owner = { pid: process.pid, createdAt: now(), token: createToken() };
+        const ownerRecord = `${JSON.stringify(owner)}\n`;
+        if (typeof writeOwnerRecord === "function") {
+          await writeOwnerRecord({ handle, owner, ownerRecord, lockPath });
+        } else {
+          await handle.writeFile(ownerRecord);
+        }
+      } catch (error) {
+        const ownedRecord = owner == null ? null : `${JSON.stringify(owner)}\n`;
+        await handle.close().catch(() => {});
+        handle = null;
+        const current = await readFile(lockPath, "utf8").catch((readError) => {
+          if (readError.code === "ENOENT") return null;
+          throw readError;
+        });
+        if (current == null || current === "" || current === ownedRecord) {
+          await unlink(lockPath).catch((unlinkError) => {
+            if (unlinkError.code !== "ENOENT") throw unlinkError;
+          });
+        }
+        owner = null;
+        throw error;
+      }
       break;
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
@@ -170,8 +199,15 @@ async function loadWakeState(filePath, now) {
 async function writeWakeState(filePath, state) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryPath, filePath);
+  const renameFile = arguments[2]?.renameFile ?? rename;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+    await renameFile(temporaryPath, filePath);
+  } finally {
+    await unlink(temporaryPath).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
 }
 
 function permitFailureCode(error) {
@@ -197,7 +233,7 @@ export async function acquireWakePermit(filePath, limits = {}, dependencies = {}
         const state = await loadWakeState(filePath, currentTime);
         if (state.timestamps.length >= maxPerMinute) return { ok: false, errorCode: "rate_limited" };
         const next = { timestamps: [...state.timestamps, currentTime] };
-        await writeWakeState(filePath, next);
+        await writeWakeState(filePath, next, dependencies);
         return { ok: true };
       },
       dependencies,
@@ -210,8 +246,14 @@ export async function acquireWakePermit(filePath, limits = {}, dependencies = {}
 function stableErrorCode(error) {
   const code = String(error?.code ?? "").toUpperCase();
   const name = String(error?.name ?? "").toLowerCase();
-  if (code === "ETIMEDOUT" || code === "ERR_TIMEOUT" || name.includes("timeout")) {
-    return "timeout";
+  const message = String(error?.message ?? "").toLowerCase();
+  if (
+    code === "ETIMEDOUT" ||
+    code === "ERR_TIMEOUT" ||
+    name.includes("timeout") ||
+    message.startsWith("timed out calling ")
+  ) {
+    return "send_timeout";
   }
   return "send_failed";
 }

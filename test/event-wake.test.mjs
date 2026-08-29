@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -219,6 +219,93 @@ test("acquireWakePermit never removes a replacement lock during release", async 
   }
 });
 
+test("acquireWakePermit cleans up lock and handle when token creation fails", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-init-fail-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+  let releaseCalled = false;
+
+  try {
+    const failed = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        createToken: () => {
+          throw new Error("token boom");
+        },
+        onBeforeRelease: async () => {
+          releaseCalled = true;
+        },
+      },
+    );
+    assert.deepEqual(failed, { ok: false, errorCode: "io_failure" });
+    assert.equal(releaseCalled, false);
+    await assert.rejects(access(lockFile), { code: "ENOENT" });
+
+    const recovered = await acquireWakePermit(stateFile, { maxPerMinute: 1 }, { now: () => 100_001 });
+    assert.deepEqual(recovered, { ok: true });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit cleans up lock and handle when lock write fails", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-lock-write-fail-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+  let releaseCalled = false;
+
+  try {
+    const failed = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        writeOwnerRecord: async () => {
+          throw new Error("owner write boom");
+        },
+        onBeforeRelease: async () => {
+          releaseCalled = true;
+        },
+      },
+    );
+    assert.deepEqual(failed, { ok: false, errorCode: "io_failure" });
+    assert.equal(releaseCalled, false);
+    await assert.rejects(access(lockFile), { code: "ENOENT" });
+
+    const recovered = await acquireWakePermit(stateFile, { maxPerMinute: 1 }, { now: () => 100_001 });
+    assert.deepEqual(recovered, { ok: true });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit unlinks orphan temp file when rename fails", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-rename-fail-"));
+  const stateFile = path.join(directory, "wake-state.json");
+
+  try {
+    const failed = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        renameFile: async () => {
+          const error = new Error("rename boom");
+          error.code = "EXDEV";
+          throw error;
+        },
+      },
+    );
+    assert.deepEqual(failed, { ok: false, errorCode: "io_failure" });
+    const entriesAfterFailure = await readdir(directory);
+    assert.deepEqual(entriesAfterFailure, []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("acquireWakePermit enforces the cap under concurrent callers", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-concurrency-"));
   const stateFile = path.join(directory, "wake-state.json");
@@ -303,7 +390,42 @@ test("wakeOrganizer returns invalid_config for enabled incomplete or invalid con
   assert.deepEqual(
     await wakeOrganizer(
       makeEnvelope(),
+      { enabled: true, organizerThreadId: "organizer-1", organizerHostId: "local" },
+      appTools,
+    ),
+    { status: "failed", errorCode: "invalid_config" },
+  );
+  assert.deepEqual(
+    await wakeOrganizer(
+      makeEnvelope(),
       { enabled: true, organizerThreadId: "", organizerHostId: "local", wakeStateFile: "/tmp/a" },
+      appTools,
+    ),
+    { status: "failed", errorCode: "invalid_config" },
+  );
+  assert.deepEqual(
+    await wakeOrganizer(
+      makeEnvelope(),
+      {
+        enabled: true,
+        organizerThreadId: "organizer-1",
+        organizerHostId: "local",
+        wakeStateFile: "",
+      },
+      appTools,
+    ),
+    { status: "failed", errorCode: "invalid_config" },
+  );
+  assert.deepEqual(
+    await wakeOrganizer(
+      makeEnvelope(),
+      {
+        enabled: true,
+        organizerThreadId: "organizer-1",
+        organizerHostId: "local",
+        wakeStateFile: "/tmp/a",
+        maxPerMinute: 0,
+      },
       appTools,
     ),
     { status: "failed", errorCode: "invalid_config" },
@@ -316,7 +438,6 @@ test("wakeOrganizer returns invalid_config for enabled incomplete or invalid con
         organizerThreadId: "organizer-1",
         organizerHostId: "bad\nhost",
         wakeStateFile: "/tmp/a",
-        maxPerMinute: 0,
       },
       appTools,
     ),
@@ -413,14 +534,13 @@ test("wakeOrganizer counts failed and timed out sends against the permit without
       makeConfig({ wakeStateFile: timeoutFile, maxPerMinute: 1 }),
       {
         sendMessageToThread: async () => {
-          const error = new Error("ambiguous timeout body");
-          error.code = "ETIMEDOUT";
+          const error = new Error("Timed out calling send_message_to_thread");
           throw error;
         },
       },
       { now: () => 200_000 },
     );
-    assert.deepEqual(timedOut, { status: "failed", errorCode: "timeout" });
+    assert.deepEqual(timedOut, { status: "failed", errorCode: "send_timeout" });
     assert.deepEqual(JSON.parse(await readFile(timeoutFile, "utf8")).timestamps, [200000]);
   } finally {
     await rm(directory, { recursive: true, force: true });

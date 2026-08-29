@@ -57,7 +57,9 @@ export function normalizeLifecycleEnvelope(input) {
   for (const key of keys) {
     if (!ALLOWED_KEYS.has(key)) throw new Error(`Unexpected lifecycle envelope field: ${key}`);
   }
-  if (input.protocol != null && input.protocol !== PROTOCOL) throw new Error("Invalid lifecycle protocol");
+  if (Object.hasOwn(input, "protocol") && input.protocol !== PROTOCOL) {
+    throw new Error("Invalid lifecycle protocol");
+  }
   if (!ALLOWED_EVENTS.has(input.event)) throw new Error("Invalid lifecycle event");
   return {
     protocol: PROTOCOL,
@@ -217,7 +219,12 @@ function stableErrorCode(error) {
 
 export async function wakeOrganizer(envelope, config, appTools, dependencies = {}) {
   if (!isRecord(config) || config.enabled !== true) return { status: "disabled" };
-  const organizer = organizerConfig(config);
+  let organizer;
+  try {
+    organizer = organizerConfig(config);
+  } catch {
+    return { status: "failed", errorCode: "invalid_config" };
+  }
 
   let normalized;
   try {

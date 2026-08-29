@@ -61,6 +61,7 @@ test("normalizeLifecycleEnvelope accepts only bounded content-free event envelop
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), hostId: "local\t" }), /hostId/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), event: "Resume" }), /event/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), protocol: "other" }), /protocol/i);
+  assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), protocol: null }), /protocol/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), threadId: "" }), /threadId/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), hostId: "" }), /hostId/i);
 });
@@ -273,6 +274,41 @@ test("wakeOrganizer is disabled by default and excludes recursive sends", async 
     { status: "excluded" },
   );
   assert.deepEqual(sendCalls, []);
+});
+
+test("wakeOrganizer returns invalid_config for enabled incomplete or invalid config", async () => {
+  const appTools = {
+    sendMessageToThread: async () => {
+      throw new Error("should not send");
+    },
+  };
+
+  assert.deepEqual(
+    await wakeOrganizer(makeEnvelope(), { enabled: true }, appTools),
+    { status: "failed", errorCode: "invalid_config" },
+  );
+  assert.deepEqual(
+    await wakeOrganizer(
+      makeEnvelope(),
+      { enabled: true, organizerThreadId: "", organizerHostId: "local", wakeStateFile: "/tmp/a" },
+      appTools,
+    ),
+    { status: "failed", errorCode: "invalid_config" },
+  );
+  assert.deepEqual(
+    await wakeOrganizer(
+      makeEnvelope(),
+      {
+        enabled: true,
+        organizerThreadId: "organizer-1",
+        organizerHostId: "bad\nhost",
+        wakeStateFile: "/tmp/a",
+        maxPerMinute: 0,
+      },
+      appTools,
+    ),
+    { status: "failed", errorCode: "invalid_config" },
+  );
 });
 
 test("wakeOrganizer routes local and remote organizers with exactly one send", async () => {

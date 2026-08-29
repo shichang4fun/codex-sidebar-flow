@@ -1,0 +1,18 @@
+{
+  "name": "codex-sidebar-flow",
+  "version": "0.1.0",
+  "description": "Deterministic cross-host Codex Desktop sidebar reconciliation.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs && node --check scripts/render-heartbeat.mjs && sh -n scripts/plugin-hook.sh"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shichang4fun/codex-sidebar-flow.git"
+  },
+  "bugs": { "url": "https://github.com/shichang4fun/codex-sidebar-flow/issues" },
+  "homepage": "https://github.com/shichang4fun/codex-sidebar-flow#readme"
+}

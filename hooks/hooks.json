@@ -1,0 +1,27 @@
+{
+  "description": "Record trusted lifecycle identity without committing sidebar state before sibling Hook outcomes are known.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "exec /bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/plugin-hook.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "exec /bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/plugin-hook.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

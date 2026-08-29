@@ -139,6 +139,10 @@ async function runBeforeDeadline(task, deadlineAt, now = Date.now) {
   }
 }
 
+function remainingDeadlineMs(deadlineAt, now = Date.now) {
+  return Math.max(0, deadlineAt - now());
+}
+
 async function hydrateHookThread(snapshot, input, appTools, deadlineAt, now = Date.now) {
   const threadId = input.session_id;
   const threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
@@ -152,12 +156,19 @@ async function hydrateHookThread(snapshot, input, appTools, deadlineAt, now = Da
     deadlineAt,
     now,
   );
-  const hostId = result.thread?.hostId ?? executionHostId;
+  if (result?.thread == null || typeof result.thread !== "object") return snapshot;
+  const hostId = typeof result.thread.hostId === "string" && result.thread.hostId.length > 0
+    ? result.thread.hostId
+    : existing?.hostId;
+  const kind = typeof result.thread.kind === "string" && result.thread.kind.length > 0
+    ? result.thread.kind
+    : existing?.kind;
   if (typeof hostId !== "string" || hostId.length === 0) return snapshot;
+  if (typeof kind !== "string" || kind.length === 0) return snapshot;
   const hydrated = {
     ...existing,
     id: result.thread?.id ?? threadId,
-    kind: result.thread?.kind ?? existing?.kind ?? "codex",
+    kind,
     hostId,
     projectId: result.thread?.projectId ?? existing?.projectId ?? input.project_id,
     status: result.thread?.status ?? existing?.status ?? "notLoaded",
@@ -186,7 +197,21 @@ export async function executeHookEvent(
   let lastError;
   if (input?.hook_event_name === "Stop") {
     const settleDelayMs = config.stopSettleDelayMs ?? 500;
-    await runBeforeDeadline(() => wait(settleDelayMs), deadlineAt, now);
+    const availableMs = remainingDeadlineMs(deadlineAt, now);
+    const boundedDelayMs = Math.min(settleDelayMs, availableMs);
+    if (boundedDelayMs > 0) await wait(boundedDelayMs);
+    if (boundedDelayMs < settleDelayMs || remainingDeadlineMs(deadlineAt, now) <= 0) {
+      return {
+        move: null,
+        moves: [],
+        managedState,
+        managedAdds: [],
+        managedRemoves: [],
+        observedIdentities: [],
+        eventEnvelope: null,
+        attempts: 0,
+      };
+    }
   }
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const appTools = createAppTools(config, { requiredTools: OBSERVATION_REQUIRED_TOOLS });
@@ -232,12 +257,26 @@ function boundedWakeResult(result) {
 }
 
 function boundedWakeThrown(error) {
-  const wakeErrorCode = typeof error?.code === "string"
+  const wakeErrorCode = typeof error?.code === "string" && error.code.length > 0
     ? error.code
-    : typeof error?.message === "string" && error.message.length > 0
-      ? error.message.slice(0, 64)
-      : "WAKE_FAILED";
+    : "wake_failed";
   return { wakeStatus: "failed", wakeErrorCode };
+}
+
+async function wakeBeforeDeadline(task, deadlineAt, now = Date.now) {
+  const remainingMs = remainingDeadlineMs(deadlineAt, now);
+  if (remainingMs <= 0) return { status: "failed", errorCode: "wake_deadline" };
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(task),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ status: "failed", errorCode: "wake_deadline" }), remainingMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function handleHook(
@@ -303,7 +342,11 @@ export async function handleHook(
     const wakeTools = createAppTools(config, { requiredTools: EVENT_WAKE_REQUIRED_TOOLS });
     try {
       wakeOutcome = boundedWakeResult(
-        await wake(result.eventEnvelope, config.eventWake, wakeTools),
+        await wakeBeforeDeadline(
+          () => wake(result.eventEnvelope, config.eventWake, wakeTools),
+          deadlineAt,
+          now,
+        ),
       );
     } catch (error) {
       wakeOutcome = boundedWakeThrown(error);
@@ -311,7 +354,7 @@ export async function handleHook(
       wakeTools.reset?.();
     }
   } else if (result.eventEnvelope != null) {
-    wakeOutcome = { wakeStatus: "failed", wakeErrorCode: "HOOK_DEADLINE" };
+    wakeOutcome = { wakeStatus: "failed", wakeErrorCode: "wake_deadline" };
   }
   await writeHookLog(config.hookLogFile ?? DEFAULT_LOG_PATH, {
     event: input.hook_event_name,

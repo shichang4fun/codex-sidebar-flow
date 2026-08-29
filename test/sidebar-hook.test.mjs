@@ -227,42 +227,140 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
 
 {
   const phases = [];
-  await assert.rejects(
-    executeHookEvent(
-      {
-        session_id: "thread-1",
-        hook_event_name: "Stop",
+  const result = await executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "Stop",
+    },
+    {
+      ...config,
+      stopSettleDelayMs: 500,
+      hookDeadlineMs: 400,
+    },
+    {
+      now: (() => {
+        let value = 0;
+        return () => {
+          value += 450;
+          return value;
+        };
+      })(),
+      wait: async (delayMs) => {
+        phases.push(`wait:${delayMs}`);
       },
-      {
-        ...config,
-        stopSettleDelayMs: 500,
-        hookDeadlineMs: 400,
+      createAppTools() {
+        return {
+          async listThreads() {
+            phases.push("list");
+            return snapshot();
+          },
+          reset() {},
+        };
       },
-      {
-        now: (() => {
-          let value = 0;
-          return () => {
-            value += 450;
-            return value;
-          };
-        })(),
-        wait: async (delayMs) => {
-          phases.push(`wait:${delayMs}`);
-        },
-        createAppTools() {
-          return {
-            async listThreads() {
-              phases.push("list");
-              return snapshot();
-            },
-            reset() {},
-          };
-        },
-      },
-    ),
-    /Hook deadline exceeded/,
+    },
   );
   assert.deepEqual(phases, []);
+  assert.equal(result.eventEnvelope, null);
+}
+
+{
+  let waitCalls = 0;
+  const result = await executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "Stop",
+    },
+    {
+      ...config,
+      stopSettleDelayMs: 500,
+      hookDeadlineMs: 400,
+      eventWake: eventWakeConfig,
+    },
+    {
+      now: () => 0,
+      deadlineAt: 400,
+      wait: async (delayMs) => {
+        waitCalls += 1;
+        assert.equal(delayMs, 400);
+      },
+      createAppTools() {
+        return {
+          async listThreads() {
+            assert.fail("dispatch must be skipped when full settle cannot complete before deadline");
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.equal(waitCalls, 1);
+  assert.equal(result.eventEnvelope, null);
+}
+
+{
+  const result = await executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "Stop",
+      host_id: "remote-control:env_hint",
+    },
+    {
+      ...config,
+      eventWake: eventWakeConfig,
+    },
+    {
+      wait: async () => {},
+      createAppTools() {
+        return {
+          async listThreads() {
+            return snapshot({ includeThread: false });
+          },
+          async readThread() {
+            return { thread: null, turns: [] };
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.equal(result.eventEnvelope, null);
+}
+
+{
+  const result = await executeHookEvent(
+    {
+      session_id: "thread-1",
+      hook_event_name: "Stop",
+      host_id: "remote-control:env_hint",
+    },
+    {
+      ...config,
+      eventWake: eventWakeConfig,
+    },
+    {
+      wait: async () => {},
+      createAppTools() {
+        return {
+          async listThreads() {
+            return snapshot({ includeThread: false });
+          },
+          async readThread(threadId, hostId) {
+            assert.equal(threadId, "thread-1");
+            assert.equal(hostId, "remote-control:env_hint");
+            return {
+              thread: {
+                id: threadId,
+                status: { type: "idle" },
+              },
+              turns: [],
+            };
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.equal(result.eventEnvelope, null);
 }
 
 {
@@ -400,6 +498,66 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
 }
 
 {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-wake-deadline-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "plugin";
+  let currentTime = 0;
+  let released = false;
+  try {
+    await writeJsonAtomic(configPath, {
+      ...defaultConfig(codexHome, "plugin"),
+      hookDeadlineMs: 20,
+      hookLogFile,
+      eventWake: {
+        ...eventWakeConfig,
+        wakeStateFile: path.join(codexHome, "sidebar-flow", "wake.json"),
+      },
+    });
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        now: () => currentTime,
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+            },
+          };
+        },
+        async wake() {
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              currentTime = 100;
+              released = true;
+              resolve({ status: "sent" });
+            }, 100);
+          });
+        },
+        async updateManaged() {},
+      },
+    );
+    assert.equal(released, false);
+    const record = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
+    assert.equal(record.wakeStatus, "failed");
+    assert.equal(record.wakeErrorCode, "wake_deadline");
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-wake-failure-"));
   const configPath = path.join(codexHome, "sidebar-flow", "config.json");
   const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");
@@ -433,15 +591,62 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
           };
         },
         async wake() {
-          throw Object.assign(new Error("raw thread-1 remote-control:env crash"), { code: "ETIMEDOUT" });
+          throw new Error("secret prompt body with thread-1 remote-control:env crash");
         },
       },
     );
     const record = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
     assert.equal(record.wakeStatus, "failed");
-    assert.equal(record.wakeErrorCode, "ETIMEDOUT");
+    assert.equal(record.wakeErrorCode, "wake_failed");
     assert.equal(JSON.stringify(record).includes("thread-1"), false);
     assert.equal(JSON.stringify(record).includes("remote-control:env"), false);
+    assert.equal(JSON.stringify(record).includes("secret prompt body"), false);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-organizer-recursion-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "plugin";
+  let wakeCalls = 0;
+  try {
+    await writeJsonAtomic(configPath, {
+      ...defaultConfig(codexHome, "plugin"),
+      hookLogFile,
+      eventWake: {
+        ...eventWakeConfig,
+        organizerThreadId: "thread-1",
+        wakeStateFile: path.join(codexHome, "sidebar-flow", "wake.json"),
+      },
+    });
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: ["local:thread-1"],
+            eventEnvelope: null,
+          };
+        },
+        async wake() {
+          wakeCalls += 1;
+          return { status: "sent" };
+        },
+      },
+    );
+    assert.equal(wakeCalls, 0);
+    const record = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
+    assert.equal("wakeStatus" in record, false);
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;

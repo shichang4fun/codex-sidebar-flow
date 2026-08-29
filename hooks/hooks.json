@@ -1,0 +1,27 @@
+{
+  "description": "Move active Codex tasks to In Progress and stopped tasks to For Review.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/sidebar-hook.mjs\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/sidebar-hook.mjs\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

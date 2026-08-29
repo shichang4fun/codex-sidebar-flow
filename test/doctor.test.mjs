@@ -14,7 +14,7 @@ import {
   releaseEventWakeProbeClaim,
   writeEventWakeProbeResult,
 } from "../scripts/doctor.mjs";
-import { defaultConfig } from "../scripts/setup.mjs";
+import { defaultConfig, HOOK_MARKER } from "../scripts/setup.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -269,10 +269,23 @@ test("doctor arms and reads bounded private event-wake probe state", async () =>
       expiresAt: 301_000,
     });
     assert.deepEqual(await readEventWakeProbeResult(config, { runtimeRoot, now: () => 400_000 }), {
-      status: "expired",
+      status: "present",
       probeId: "probe-00000001",
       armedAt: 1_000,
+      claimedAt: 2_000,
+      observedAt: 2_500,
       expiresAt: 301_000,
+    });
+    assert.deepEqual(await claimEventWakeProbe(config, { runtimeRoot, now: () => 400_000 }), {
+      status: "complete",
+      result: {
+        status: "present",
+        probeId: "probe-00000001",
+        armedAt: 1_000,
+        claimedAt: 2_000,
+        observedAt: 2_500,
+        expiresAt: 301_000,
+      },
     });
 
     const next = await armEventWakeProbe(config, {
@@ -286,6 +299,58 @@ test("doctor arms and reads bounded private event-wake probe state", async () =>
     await rm(config.eventWakeProbeRequestFile);
     await writeFile(config.eventWakeProbeResultFile, "{malformed\n", { mode: 0o600 });
     assert.deepEqual(await readEventWakeProbeResult(config, { runtimeRoot }), { status: "missing" });
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("doctor CLI stays healthy after request ttl when a matching present probe result already exists", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-cli-present-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const config = defaultConfig(codexHome, "source");
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    await writeFile(path.join(codexHome, "hooks.json"), `${JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: "command", command: `${HOOK_MARKER} node /tmp/sidebar-hook.mjs` }] }],
+        Stop: [{ hooks: [{ type: "command", command: `${HOOK_MARKER} node /tmp/sidebar-hook.mjs` }] }],
+      },
+    })}\n`, { mode: 0o600 });
+    await writeFile(path.join(runtimeRoot, "config.json"), `${JSON.stringify({
+      ...config,
+      installMode: "source",
+      excludeThreadIds: ["organizer-123"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-123",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    })}\n`, { mode: 0o600 });
+    await writeFile(config.eventWakeProbeRequestFile, `${JSON.stringify({
+      protocol: "codex-sidebar-flow/event-wake-probe-v1",
+      probeId: "probe-00000001",
+      armedAt: 1_000,
+      expiresAt: 301_000,
+    })}\n`, { mode: 0o600 });
+    await writeFile(`${config.eventWakeProbeResultFile}.result.probe-00000001`, `${JSON.stringify({
+      protocol: "codex-sidebar-flow/event-wake-probe-v1",
+      status: "present",
+      probeId: "probe-00000001",
+      armedAt: 1_000,
+      claimedAt: 2_000,
+      observedAt: 2_500,
+      expiresAt: 301_000,
+    })}\n`, { mode: 0o600 });
+
+    const { stdout } = await execFileAsync(process.execPath, [
+      path.resolve("scripts/doctor.mjs"),
+      "--codex-home",
+      codexHome,
+    ]);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.mode, "source");
+    assert.equal(payload.checks.find((check) => check.name === "event-wake-capability").level, "ok");
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }

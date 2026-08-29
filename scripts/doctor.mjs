@@ -361,8 +361,8 @@ export async function readEventWakeProbeResult(
     await afterResultRead({ attempt, probeId: firstRequest.probeId });
     const secondRequest = await readCurrentProbeRequest(paths);
     if (!sameRequest(firstRequest, secondRequest)) continue;
-    if (observedAt > firstRequest.expiresAt) return { status: "expired", ...firstRequest };
     if (result != null && sameRequest(result, firstRequest)) return result;
+    if (observedAt > firstRequest.expiresAt) return { status: "expired", ...firstRequest };
     return { status: "pending", ...firstRequest };
   }
   return { status: "pending" };
@@ -387,11 +387,11 @@ export async function claimEventWakeProbe(
   const request = await readCurrentProbeRequest(paths);
   if (request == null) return { status: "none" };
   await cleanupOrphanedProbeGenerations(paths, request, observedAt).catch(() => {});
-  if (observedAt > request.expiresAt) return { status: "expired", ...request };
   const generation = generationProbePaths(paths, request.probeId);
   await validateGenerationFile(generation.resultFile);
   const result = normalizeProbeResult(await readJsonIfExists(generation.resultFile));
   if (result != null && sameRequest(result, request)) return { status: "complete", result };
+  if (observedAt > request.expiresAt) return { status: "expired", ...request };
   await afterInitialResultRead({ probeId: request.probeId });
   const claimId = createClaimId();
   if (!validProbeId(claimId)) throw new Error("Invalid event-wake probe claim identity");

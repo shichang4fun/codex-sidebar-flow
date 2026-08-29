@@ -650,18 +650,38 @@ assert.deepEqual(sendMessageCalls, [{
     prompt: "hook prompt",
   },
 }]);
-const sidebarRealtimeSource = await readFile(
-  new URL("../scripts/sidebar-realtime.mjs", import.meta.url),
-  "utf8",
+
+const reducedCapabilityHost = {
+  client: { close() {} },
+  toolMap: new Map([
+    ["list_threads", { name: "list_threads", namespace: "codex" }],
+    ["read_thread", { name: "read_thread", namespace: "codex" }],
+  ]),
+};
+assert.equal(typeof observationTools.acceptsHost, "function");
+assert.equal(observationTools.acceptsHost(reducedCapabilityHost), true);
+assert.equal(reconcilerTools.acceptsHost(reducedCapabilityHost), false);
+
+const keepAliveObserver = new sidebarRealtime.AppTools(
+  { ...config, socketKeepAliveTimeoutMs: 250, quiet: true },
+  { requiredTools: ["list_threads", "read_thread"] },
 );
-assert.match(
-  sidebarRealtimeSource,
-  /this\.host = await discoverHost\(this\.config, this\.requiredTools\);/,
-);
-assert.match(
-  sidebarRealtimeSource,
-  /await keepHostAlive\(\s*this\.host,\s*this\.config\.socketKeepAliveTimeoutMs \?\? 5000,\s*this\.requiredTools,\s*\);/s,
-);
+let keepAliveClosed = 0;
+keepAliveObserver.host = {
+  socketPath: "/tmp/reduced.sock",
+  toolMap: reducedCapabilityHost.toolMap,
+  client: {
+    close() {
+      keepAliveClosed += 1;
+    },
+    request: async () => ({
+      tools: [{ name: "list_threads" }],
+    }),
+  },
+};
+await assert.rejects(keepAliveObserver.keepAlive(), /required sidebar tools/);
+assert.equal(keepAliveClosed, 1);
+assert.equal(keepAliveObserver.host, null);
 
 assert.equal(typeof sidebarRealtime.createEventScheduler, "function");
 const scheduledReasons = [];

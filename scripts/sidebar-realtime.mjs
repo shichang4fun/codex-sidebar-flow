@@ -199,14 +199,19 @@ export function promoteClientTimeout(client, requestTimeoutMs) {
   return client;
 }
 
+export function hostHasRequiredTools(host, requiredTools = RECONCILER_TOOLS) {
+  const toolMap = host?.toolMap;
+  return requiredTools.every((name) => toolMap instanceof Map && toolMap.has(name));
+}
+
 export async function keepHostAlive(host, timeoutMs = 5000, requiredTools = RECONCILER_TOOLS) {
   const result = await host.client.request(
     "tools/list",
     { threadStartKind: "all" },
     timeoutMs,
   );
-  const names = new Set((result?.tools ?? []).map((tool) => tool.name));
-  if (!requiredTools.every((name) => names.has(name))) {
+  const toolMap = new Map((result?.tools ?? []).map((tool) => [tool.name, tool]));
+  if (!hostHasRequiredTools({ ...host, toolMap }, requiredTools)) {
     throw new Error("Codex app tools keepalive lost required sidebar tools");
   }
 }
@@ -647,10 +652,10 @@ async function discoverHost(config, requiredTools = RECONCILER_TOOLS) {
         probeTimeoutMs,
       );
       const tools = Array.isArray(result?.tools) ? result.tools : [];
-      const toolMap = new Map(tools.map((tool) => [tool.name, tool]));
-      if (requiredTools.every((name) => toolMap.has(name))) {
+      const host = { client, socketPath, toolMap: new Map(tools.map((tool) => [tool.name, tool])) };
+      if (hostHasRequiredTools(host, requiredTools)) {
         promoteClientTimeout(client, config.requestTimeoutMs ?? 15000);
-        return { client, socketPath, toolMap };
+        return host;
       }
     } catch (error) {
       if (failures.length < 8) {
@@ -733,6 +738,10 @@ export class AppTools {
   reset() {
     this.host?.client.close();
     this.host = null;
+  }
+
+  acceptsHost(host) {
+    return hostHasRequiredTools(host, this.requiredTools);
   }
 
   async keepAlive() {

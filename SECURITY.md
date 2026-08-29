@@ -16,7 +16,7 @@ Lifecycle hooks run with the local Codex process permissions. Review the scripts
 - Private tool error bodies are discarded before logging.
 - Task titles, summaries, previews, and bodies are untrusted and never drive the deterministic state machine.
 - Organizer recursion is excluded exactly by task ID; the organizer task must also be present in `excludeThreadIds`.
-- Rate limiting is at-most-once for one minute and does not retry on ambiguous timeout or unknown send outcome.
+- Rate limiting allows up to the configured `maxPerMinute` wake attempts per rolling minute, defaults to 20, and does not deduplicate identical events. At-most-once means each Hook invocation reserves budget and attempts at most one send, with no retry after an ambiguous timeout or unknown send outcome.
 - Wake state and event-wake probe files are mode `0600`; capability probing is required before claiming event wake works.
 - Remote event wake is bounded by the target host's actual `hostId` and trusted app-tools context; absence of live acceptance means remote realtime is unsupported.
 

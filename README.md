@@ -49,9 +49,9 @@ Restart Codex Desktop after setup. The installer:
 - creates `~/.codex/sidebar-flow/config.json` only when absent.
 - copies the runtime, doctor, and uninstaller into `~/.codex/sidebar-flow/scripts`, so the checkout can be moved or removed.
 
-Setup does not silently create a scheduled model task. Event wake is model-triggering and user-visible, so enable it only with explicit user authorization. Without an organizer task plus a recurring heartbeat, the installed Hooks only collect lifecycle identity.
+Setup does not silently create a scheduled model task. Event wake is model-triggering and user-visible, so enable it only with explicit user authorization. The event-wake fast path requires only the lifecycle Hook and a configured organizer task.
 
-A hook installed on one machine does not receive events from another machine's Codex app server. Hooks improve local activity identity but deliberately do not move sidebar items: [OpenAI's Hooks documentation](https://learn.chatgpt.com/docs/hooks) states that matching command Hooks run concurrently, so one Hook cannot know whether another Hook will block a prompt or continue a stopped turn. Confirmed movement is performed by the observer/self-heal path.
+A hook installed on one machine does not receive events from another machine's Codex app server. Hooks improve local activity identity but deliberately do not move sidebar items directly: [OpenAI's Hooks documentation](https://learn.chatgpt.com/docs/hooks) states that matching command Hooks run concurrently, so one Hook cannot know whether another Hook will block a prompt or continue a stopped turn. Confirmed event-path movement is performed by the organizer task after it receives the Hook envelope and reads confirmed state. The recurring heartbeat is an independent global recovery path.
 
 The repository is also a Codex plugin. Plugin installation and source installation are mutually exclusive:
 

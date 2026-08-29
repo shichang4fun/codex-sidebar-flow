@@ -15,6 +15,8 @@ import {
 import { normalizeLifecycleEnvelope, wakeOrganizer } from "./event-wake.mjs";
 import {
   claimEventWakeProbe,
+  releaseEventWakeProbeClaim,
+  writeExpiredEventWakeProbeResult,
   writeEventWakeProbeResult,
 } from "./doctor.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "./setup.mjs";
@@ -335,6 +337,8 @@ export async function handleHook(
     updateManaged = updateManagedState,
     wake = wakeOrganizer,
     claimProbe = claimEventWakeProbe,
+    releaseProbeClaim = releaseEventWakeProbeClaim,
+    writeExpiredProbeResult = writeExpiredEventWakeProbeResult,
     writeProbeResult = writeEventWakeProbeResult,
     inspectCapability = inspectEventWakeCapability,
     now = Date.now,
@@ -371,23 +375,32 @@ export async function handleHook(
 
   const startedAt = now();
   const deadlineAt = startedAt + (config.hookDeadlineMs ?? DEFAULT_HOOK_DEADLINE_MS);
-  const probeClaim = await claimProbe(config, { now });
+  const probeRuntimeRoot = path.dirname(configPath);
+  const probeClaim = await claimProbe(config, { runtimeRoot: probeRuntimeRoot, now });
   let eventWakeProbeStatus = null;
   if (probeClaim.status === "expired") {
     eventWakeProbeStatus = "expired";
-    await writeProbeResult(config, "expired", { now });
+    await writeExpiredProbeResult(config, probeClaim, {
+      runtimeRoot: probeRuntimeRoot,
+      now,
+    }).catch(() => false);
   } else if (probeClaim.status === "claimed") {
     const probeTools = createAppTools(config, { requiredTools: OBSERVATION_REQUIRED_TOOLS });
-    let present = false;
     try {
-      present = await inspectCapability(probeTools, deadlineAt, now);
+      const present = await inspectCapability(probeTools, deadlineAt, now);
+      const status = present ? "present" : "missing";
+      const committed = await writeProbeResult(config, status, {
+        runtimeRoot: probeRuntimeRoot,
+        now,
+        claim: probeClaim,
+      });
+      eventWakeProbeStatus = committed ? status : "pending";
     } catch {
-      present = false;
+      eventWakeProbeStatus = "pending";
     } finally {
       probeTools.reset?.();
+      await releaseProbeClaim(config, probeClaim, { runtimeRoot: probeRuntimeRoot }).catch(() => false);
     }
-    eventWakeProbeStatus = present ? "present" : "missing";
-    await writeProbeResult(config, eventWakeProbeStatus, { now });
   }
   const managedState = await loadState(config.stateFile);
   const result = await execute(input, config, {

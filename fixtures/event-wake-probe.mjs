@@ -10,15 +10,18 @@ if (configPath != null && barrierDirectory != null) {
   const readyFile = path.join(barrierDirectory, `ready-${process.pid}`);
   const releaseFile = path.join(barrierDirectory, "release");
   await writeFile(readyFile, "\n", { mode: 0o600 });
-  for (let attempt = 0; attempt < 500; attempt += 1) {
+  let released = false;
+  for (let attempt = 0; attempt < 400; attempt += 1) {
     try {
       await access(releaseFile);
+      released = true;
       break;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
+  if (!released) throw new Error("probe fixture release timed out");
 
   let probeConnections = 0;
   let wakeCalls = 0;

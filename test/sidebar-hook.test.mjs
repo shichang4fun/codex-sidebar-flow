@@ -11,6 +11,7 @@ import {
   managedMutationFromLifecycle,
 } from "../scripts/sidebar-hook.mjs";
 import { AppTools } from "../scripts/sidebar-realtime.mjs";
+import { armEventWakeProbe, readEventWakeProbeResult } from "../scripts/doctor.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/setup.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -987,11 +988,11 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
       },
     };
     await writeJsonAtomic(configPath, runtimeConfig);
-    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
-      protocol: "codex-sidebar-flow/event-wake-probe-v1",
-      createdAt: 1_000,
-      expiresAt: 301_000,
-    })}\n`, { mode: 0o600 });
+    await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => `probe-${expectedStatus}-0001`,
+    });
 
     await handleHook(
       { session_id: "thread-1", hook_event_name: "UserPromptSubmit", prompt: "raw secret task content" },
@@ -1037,11 +1038,169 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
 
     const probeResult = JSON.parse(await readFile(probeResultFile, "utf8"));
     assert.equal(probeResult.status, expectedStatus);
-    assert.equal(probeResult.checkedAt, 2_000);
+    assert.equal(probeResult.probeId, `probe-${expectedStatus}-0001`);
+    assert.equal(probeResult.observedAt, 2_000);
     assert.equal((await stat(probeResultFile)).mode & 0o777, 0o600);
     assert.equal(JSON.stringify(probeResult).includes("raw secret"), false);
     assert.equal(JSON.stringify(probeResult).includes(codexHome), false);
     assert.equal(sendCalls, 0);
+    assert.equal(wakeCalls, 0);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-probe-retry-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let wakeCalls = 0;
+  let connectionAttempts = 0;
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => "probe-retry-0001",
+    });
+    const dependencies = {
+      now: () => 2_000,
+      async execute() {
+        return {
+          attempts: 1,
+          managedAdds: [], managedRemoves: [], observedIdentities: [],
+          eventEnvelope: {
+            protocol: "codex-sidebar-flow/event-v1",
+            event: "UserPromptSubmit",
+            threadId: "thread-1",
+            hostId: "local",
+          },
+        };
+      },
+      createAppTools(_config, options) {
+        if ((options?.requiredTools ?? []).includes("send_message_to_thread")) return { reset() {} };
+        return {
+          async connect() {
+            connectionAttempts += 1;
+            if (connectionAttempts === 1) throw new Error("App tools pipe closed");
+            return { toolMap: new Map() };
+          },
+          reset() {},
+        };
+      },
+      async updateManaged() {},
+      async wake() {
+        wakeCalls += 1;
+        return { status: "sent" };
+      },
+    };
+
+    await handleHook({ session_id: "thread-1", hook_event_name: "UserPromptSubmit" }, configPath, dependencies);
+    assert.deepEqual(await readEventWakeProbeResult(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 2_100,
+    }), {
+      status: "pending",
+      probeId: "probe-retry-0001",
+      armedAt: 1_000,
+      expiresAt: 301_000,
+    });
+    assert.equal(wakeCalls, 0, "the Hook event claimed for an attempted probe stays suppressed");
+
+    await handleHook({ session_id: "thread-1", hook_event_name: "UserPromptSubmit" }, configPath, dependencies);
+    assert.equal((await readEventWakeProbeResult(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 2_100,
+    })).status, "missing");
+    assert.equal(connectionAttempts, 2);
+    assert.equal(wakeCalls, 0);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-probe-superseded-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let wakeCalls = 0;
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => "probe-superseded-old",
+    });
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        now: () => 2_000,
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [], managedRemoves: [], observedIdentities: [],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+            },
+          };
+        },
+        createAppTools() { return { reset() {} }; },
+        async inspectCapability() {
+          await armEventWakeProbe(runtimeConfig, {
+            runtimeRoot: runtime,
+            now: () => 2_100,
+            createProbeId: () => "probe-superseded-new",
+          });
+          return true;
+        },
+        async updateManaged() {},
+        async wake() {
+          wakeCalls += 1;
+          return { status: "sent" };
+        },
+      },
+    );
+    assert.deepEqual(await readEventWakeProbeResult(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 2_200,
+    }), {
+      status: "pending",
+      probeId: "probe-superseded-new",
+      armedAt: 2_100,
+      expiresAt: 302_100,
+    });
     assert.equal(wakeCalls, 0);
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
@@ -1070,16 +1229,16 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
       },
     };
     await writeJsonAtomic(configPath, runtimeConfig);
-    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
-      protocol: "codex-sidebar-flow/event-wake-probe-v1",
-      createdAt: 1_000,
-      expiresAt: 1_500,
-    })}\n`, { mode: 0o600 });
+    await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => "probe-expired-0001",
+    });
     await handleHook(
       { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
       configPath,
       {
-        now: () => 2_000,
+        now: () => 400_000,
         async execute() {
           return {
             attempts: 1,
@@ -1110,6 +1269,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
     assert.equal(wakeCalls, 1);
     const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
     assert.equal(result.status, "expired");
+    assert.equal(result.probeId, "probe-expired-0001");
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;
@@ -1137,11 +1297,11 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
       },
     };
     await writeJsonAtomic(configPath, runtimeConfig);
-    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
-      protocol: "codex-sidebar-flow/event-wake-probe-v1",
-      createdAt: 1_000,
-      expiresAt: 301_000,
-    })}\n`, { mode: 0o600 });
+    await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => "probe-race-0001",
+    });
     const dependencies = {
       now: () => 2_000,
       async execute() {
@@ -1195,6 +1355,8 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   const runtime = path.join(codexHome, "sidebar-flow");
   const configPath = path.join(runtime, "config.json");
   const fixture = path.resolve("fixtures/event-wake-probe.mjs");
+  const controller = new AbortController();
+  let childrenSettled = Promise.resolve([]);
   try {
     const runtimeConfig = {
       ...defaultConfig(codexHome, "source"),
@@ -1207,29 +1369,42 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
       },
     };
     await writeJsonAtomic(configPath, runtimeConfig);
-    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
-      protocol: "codex-sidebar-flow/event-wake-probe-v1",
-      createdAt: 1_000,
-      expiresAt: 301_000,
-    })}\n`, { mode: 0o600 });
+    await armEventWakeProbe(runtimeConfig, {
+      runtimeRoot: runtime,
+      now: () => 1_000,
+      createProbeId: () => "probe-process-race-0001",
+    });
 
     const children = [
-      execFileAsync(process.execPath, [fixture, configPath, runtime]),
-      execFileAsync(process.execPath, [fixture, configPath, runtime]),
+      execFileAsync(process.execPath, [fixture, configPath, runtime], {
+        signal: controller.signal,
+        timeout: 5_000,
+        killSignal: "SIGKILL",
+      }),
+      execFileAsync(process.execPath, [fixture, configPath, runtime], {
+        signal: controller.signal,
+        timeout: 5_000,
+        killSignal: "SIGKILL",
+      }),
     ];
-    for (let attempt = 0; attempt < 500; attempt += 1) {
+    childrenSettled = Promise.allSettled(children);
+    for (let attempt = 0; attempt < 200; attempt += 1) {
       const readyCount = (await readdir(runtime)).filter((name) => name.startsWith("ready-")).length;
       if (readyCount === 2) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal((await readdir(runtime)).filter((name) => name.startsWith("ready-")).length, 2);
     await writeFile(path.join(runtime, "release"), "\n", { mode: 0o600 });
-    const outcomes = (await Promise.all(children)).map(({ stdout }) => JSON.parse(stdout));
+    const settled = await childrenSettled;
+    for (const child of settled) assert.equal(child.status, "fulfilled", child.reason?.message);
+    const outcomes = settled.map(({ value }) => JSON.parse(value.stdout));
     assert.equal(outcomes.reduce((sum, result) => sum + result.probeConnections, 0), 1);
     assert.equal(outcomes.reduce((sum, result) => sum + result.wakeCalls, 0), 1);
     const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
     assert.equal(result.status, "present");
   } finally {
+    controller.abort();
+    await childrenSettled;
     await rm(codexHome, { recursive: true, force: true });
   }
 }

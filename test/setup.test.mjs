@@ -133,8 +133,22 @@ test("setup upgrades configuration and explicitly enables event wake without los
     assert.deepEqual(once.unrelated, { keep: true });
     assert.equal((await stat(path.join(runtime, "scripts", "event-wake.mjs"))).isFile(), true);
 
+    await setup({
+      codexHome,
+      enableEventWake: true,
+      organizerThreadId: "organizer-456",
+    });
+    const rerun = JSON.parse(await readFile(configPath, "utf8"));
+    assert.deepEqual(rerun.eventWake, {
+      enabled: true,
+      organizerThreadId: "organizer-456",
+      organizerHostId: "remote-control:env_123",
+      maxPerMinute: 7,
+    });
+    assert.deepEqual(rerun.excludeThreadIds, ["keep-excluded", "organizer-123", "organizer-456"]);
+
     await setup({ codexHome });
-    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), once);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), rerun);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }

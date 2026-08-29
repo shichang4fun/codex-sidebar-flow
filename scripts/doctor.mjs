@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { readFile, rename, unlink } from "node:fs/promises";
-import { existsSync, realpathSync } from "node:fs";
+import { constants, existsSync, realpathSync } from "node:fs";
+import { access, link, lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,12 +12,17 @@ import {
   findUnmarkedSidebarHookPaths,
   HOOK_MARKER,
   isSafeIdentifier,
-  writeJsonAtomic,
 } from "./setup.mjs";
 
 export const EVENT_WAKE_PROBE_PROTOCOL = "codex-sidebar-flow/event-wake-probe-v1";
 export const EVENT_WAKE_PROBE_TTL_MS = 300000;
+export const EVENT_WAKE_PROBE_CLAIM_TTL_MS = 30000;
 const PROBE_RESULT_STATUSES = new Set(["present", "missing", "expired"]);
+const PROBE_COMPLETION_STATUSES = new Set(["present", "missing"]);
+const PROBE_REQUEST_NAME = "event-wake-probe-request.json";
+const PROBE_RESULT_NAME = "event-wake-probe-result.json";
+const PROBE_CLAIM_NAME = "event-wake-probe-claim.json";
+const MAX_PROBE_FILE_BYTES = 4096;
 
 function isBoundedAbsolutePath(value) {
   return typeof value === "string"
@@ -27,99 +32,409 @@ function isBoundedAbsolutePath(value) {
     && path.isAbsolute(value);
 }
 
-function validProbeConfig(config) {
-  return isBoundedAbsolutePath(config?.eventWakeProbeRequestFile)
-    && isBoundedAbsolutePath(config?.eventWakeProbeResultFile)
+function validProbeId(value) {
+  return typeof value === "string"
+    && value.length >= 8
+    && value.length <= 128
+    && /^[A-Za-z0-9._:-]+$/.test(value);
+}
+
+function validTimestamp(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function probePaths(config, runtimeRoot) {
+  if (!isBoundedAbsolutePath(runtimeRoot) || path.normalize(runtimeRoot) !== runtimeRoot) return null;
+  const requestFile = path.join(runtimeRoot, PROBE_REQUEST_NAME);
+  const resultFile = path.join(runtimeRoot, PROBE_RESULT_NAME);
+  if (
+    config?.eventWakeProbeRequestFile !== requestFile
+    || config?.eventWakeProbeResultFile !== resultFile
+  ) return null;
+  return {
+    runtimeRoot,
+    requestFile,
+    resultFile,
+    claimFile: path.join(runtimeRoot, PROBE_CLAIM_NAME),
+  };
+}
+
+function validProbeConfig(config, runtimeRoot) {
+  return probePaths(config, runtimeRoot) != null
     && config?.eventWakeProbeTtlMs === EVENT_WAKE_PROBE_TTL_MS;
 }
 
+async function validateProbeFiles(config, runtimeRoot) {
+  const paths = probePaths(config, runtimeRoot);
+  if (paths == null || config?.eventWakeProbeTtlMs !== EVENT_WAKE_PROBE_TTL_MS) {
+    throw new Error("Invalid event-wake probe path or runtime configuration");
+  }
+  const runtimeMetadata = await lstat(runtimeRoot).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (runtimeMetadata == null || !runtimeMetadata.isDirectory() || runtimeMetadata.isSymbolicLink()) {
+    throw new Error("Event-wake probe runtime must be a real directory");
+  }
+  for (const filePath of [paths.requestFile, paths.resultFile, paths.claimFile]) {
+    const metadata = await lstat(filePath).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (metadata == null) continue;
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error("Event-wake probe path must be a regular file, not a symlink");
+    }
+    await access(filePath, constants.R_OK | constants.W_OK);
+  }
+  return paths;
+}
+
 async function readJsonIfExists(filePath) {
+  let handle;
   try {
-    return JSON.parse(await readFile(filePath, "utf8"));
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || metadata.size > MAX_PROBE_FILE_BYTES) return null;
+    return JSON.parse(await handle.readFile("utf8"));
   } catch (error) {
     if (error.code === "ENOENT") return null;
     if (error instanceof SyntaxError) return null;
     throw error;
+  } finally {
+    await handle?.close();
   }
 }
 
 function normalizeProbeRequest(value) {
   if (
     value?.protocol !== EVENT_WAKE_PROBE_PROTOCOL
-    || !Number.isFinite(value?.createdAt)
-    || !Number.isFinite(value?.expiresAt)
-    || value.createdAt < 0
-    || value.expiresAt - value.createdAt !== EVENT_WAKE_PROBE_TTL_MS
+    || !validProbeId(value?.probeId)
+    || !validTimestamp(value?.armedAt)
+    || !validTimestamp(value?.expiresAt)
+    || value.expiresAt - value.armedAt !== EVENT_WAKE_PROBE_TTL_MS
   ) return null;
-  return { createdAt: value.createdAt, expiresAt: value.expiresAt };
+  return { probeId: value.probeId, armedAt: value.armedAt, expiresAt: value.expiresAt };
 }
 
 function normalizeProbeResult(value) {
   if (
     value?.protocol !== EVENT_WAKE_PROBE_PROTOCOL
     || !PROBE_RESULT_STATUSES.has(value?.status)
-    || !Number.isFinite(value?.checkedAt)
-    || value.checkedAt < 0
+    || !validProbeId(value?.probeId)
+    || !validTimestamp(value?.armedAt)
+    || !validTimestamp(value?.observedAt)
+    || !validTimestamp(value?.expiresAt)
+    || value.expiresAt - value.armedAt !== EVENT_WAKE_PROBE_TTL_MS
   ) return null;
-  return { status: value.status, checkedAt: value.checkedAt };
-}
-
-export async function armEventWakeProbe(config, { now = Date.now } = {}) {
-  if (!validProbeConfig(config)) throw new Error("Invalid event-wake probe configuration");
-  const createdAt = now();
-  const request = {
-    protocol: EVENT_WAKE_PROBE_PROTOCOL,
-    createdAt,
-    expiresAt: createdAt + EVENT_WAKE_PROBE_TTL_MS,
+  if (value.status === "expired") {
+    if (value.claimedAt !== null || value.observedAt <= value.expiresAt) return null;
+  } else if (
+    !validTimestamp(value?.claimedAt)
+    || value.claimedAt < value.armedAt
+    || value.observedAt < value.claimedAt
+    || value.observedAt > value.expiresAt
+  ) return null;
+  return {
+    status: value.status,
+    probeId: value.probeId,
+    armedAt: value.armedAt,
+    claimedAt: value.claimedAt,
+    observedAt: value.observedAt,
+    expiresAt: value.expiresAt,
   };
-  await unlink(config.eventWakeProbeResultFile).catch((error) => {
-    if (error.code !== "ENOENT") throw error;
-  });
-  await writeJsonAtomic(config.eventWakeProbeRequestFile, request);
-  return { status: "pending", createdAt: request.createdAt, expiresAt: request.expiresAt };
 }
 
-export async function readEventWakeProbeResult(config, { now = Date.now } = {}) {
-  if (!validProbeConfig(config)) return { status: "missing" };
-  const result = normalizeProbeResult(await readJsonIfExists(config.eventWakeProbeResultFile));
-  if (result != null) return result;
-  const request = normalizeProbeRequest(await readJsonIfExists(config.eventWakeProbeRequestFile));
-  if (request == null) return { status: "missing" };
-  return now() > request.expiresAt
-    ? { status: "expired", ...request }
-    : { status: "pending", ...request };
+function normalizeProbeClaim(value) {
+  if (
+    value?.protocol !== EVENT_WAKE_PROBE_PROTOCOL
+    || !validProbeId(value?.probeId)
+    || !validProbeId(value?.claimId)
+    || !validTimestamp(value?.armedAt)
+    || !validTimestamp(value?.claimedAt)
+    || !validTimestamp(value?.claimExpiresAt)
+    || !validTimestamp(value?.expiresAt)
+    || value.expiresAt - value.armedAt !== EVENT_WAKE_PROBE_TTL_MS
+    || value.claimedAt < value.armedAt
+    || value.claimExpiresAt !== Math.min(value.expiresAt, value.claimedAt + EVENT_WAKE_PROBE_CLAIM_TTL_MS)
+  ) return null;
+  return {
+    probeId: value.probeId,
+    claimId: value.claimId,
+    armedAt: value.armedAt,
+    claimedAt: value.claimedAt,
+    claimExpiresAt: value.claimExpiresAt,
+    expiresAt: value.expiresAt,
+  };
 }
 
-export async function claimEventWakeProbe(
-  config,
-  { now = Date.now, createToken = randomUUID } = {},
-) {
-  if (!validProbeConfig(config)) return { status: "none" };
-  const claimPath = `${config.eventWakeProbeRequestFile}.${process.pid}.${createToken()}.claim`;
+async function writeProbeJsonAtomic(filePath, value) {
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let handle;
   try {
-    await rename(config.eventWakeProbeRequestFile, claimPath);
-  } catch (error) {
-    if (error.code === "ENOENT") return { status: "none" };
-    throw error;
-  }
-  try {
-    const request = normalizeProbeRequest(await readJsonIfExists(claimPath));
-    if (request == null || now() > request.expiresAt) return { status: "expired" };
-    return { status: "claimed" };
+    handle = await open(
+      temporaryPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.close();
+    handle = null;
+    await rename(temporaryPath, filePath);
   } finally {
-    await unlink(claimPath).catch((error) => {
+    await handle?.close();
+    await unlink(temporaryPath).catch((error) => {
       if (error.code !== "ENOENT") throw error;
     });
   }
 }
 
-export async function writeEventWakeProbeResult(config, status, { now = Date.now } = {}) {
-  if (!validProbeConfig(config) || !PROBE_RESULT_STATUSES.has(status)) {
+async function createClaimFile(filePath, value) {
+  const candidatePath = `${filePath}.${process.pid}.${randomUUID()}.candidate`;
+  let handle;
+  try {
+    handle = await open(
+      candidatePath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.close();
+    handle = null;
+    await link(candidatePath, filePath);
+  } finally {
+    await handle?.close();
+    await unlink(candidatePath).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+}
+
+function sameRequest(left, right) {
+  return left != null
+    && right != null
+    && left.probeId === right.probeId
+    && left.armedAt === right.armedAt
+    && left.expiresAt === right.expiresAt;
+}
+
+function sameClaim(left, right) {
+  return left != null
+    && right != null
+    && left.probeId === right.probeId
+    && left.claimId === right.claimId
+    && left.claimedAt === right.claimedAt;
+}
+
+async function retireClaim(paths, expectedClaim) {
+  const retiredPath = `${paths.claimFile}.${process.pid}.${randomUUID()}.retired`;
+  try {
+    await rename(paths.claimFile, retiredPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  const retiredClaim = normalizeProbeClaim(await readJsonIfExists(retiredPath));
+  if (!sameClaim(retiredClaim, expectedClaim)) {
+    try {
+      await link(retiredPath, paths.claimFile);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+  }
+  await unlink(retiredPath).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+  return sameClaim(retiredClaim, expectedClaim);
+}
+
+async function retireInvalidClaim(paths, request, observedAt) {
+  const retiredPath = `${paths.claimFile}.${process.pid}.${randomUUID()}.invalid`;
+  try {
+    await rename(paths.claimFile, retiredPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    throw error;
+  }
+  const retiredClaim = normalizeProbeClaim(await readJsonIfExists(retiredPath));
+  const shouldRestore = sameRequest(retiredClaim, request)
+    && retiredClaim.claimExpiresAt >= observedAt;
+  if (shouldRestore) {
+    try {
+      await link(retiredPath, paths.claimFile);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+  }
+  await unlink(retiredPath).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+  return !shouldRestore;
+}
+
+export async function armEventWakeProbe(
+  config,
+  { runtimeRoot, now = Date.now, createProbeId = randomUUID } = {},
+) {
+  const paths = await validateProbeFiles(config, runtimeRoot);
+  const armedAt = now();
+  const probeId = createProbeId();
+  if (!validTimestamp(armedAt) || !validProbeId(probeId)) {
+    throw new Error("Invalid event-wake probe identity or timestamp");
+  }
+  const request = {
+    protocol: EVENT_WAKE_PROBE_PROTOCOL,
+    probeId,
+    armedAt,
+    expiresAt: armedAt + EVENT_WAKE_PROBE_TTL_MS,
+  };
+  await writeProbeJsonAtomic(paths.requestFile, request);
+  return { status: "pending", probeId, armedAt, expiresAt: request.expiresAt };
+}
+
+export async function readEventWakeProbeResult(config, { runtimeRoot, now = Date.now } = {}) {
+  const paths = probePaths(config, runtimeRoot);
+  if (paths == null || !validProbeConfig(config, runtimeRoot)) return { status: "missing" };
+  let request;
+  let result;
+  try {
+    await validateProbeFiles(config, runtimeRoot);
+    [request, result] = await Promise.all([
+      readJsonIfExists(paths.requestFile).then(normalizeProbeRequest),
+      readJsonIfExists(paths.resultFile).then(normalizeProbeResult),
+    ]);
+  } catch {
+    return { status: "missing" };
+  }
+  if (request == null) return { status: "missing" };
+  const observedAt = now();
+  if (observedAt > request.expiresAt) {
+    return result?.status === "expired" && sameRequest(result, request)
+      ? result
+      : { status: "expired", ...request };
+  }
+  if (result != null && result.status !== "expired" && sameRequest(result, request)) return result;
+  return { status: "pending", ...request };
+}
+
+export async function claimEventWakeProbe(
+  config,
+  { runtimeRoot, now = Date.now, createClaimId = randomUUID } = {},
+) {
+  let paths;
+  try {
+    paths = await validateProbeFiles(config, runtimeRoot);
+  } catch {
+    return { status: "none" };
+  }
+  const observedAt = now();
+  const request = normalizeProbeRequest(await readJsonIfExists(paths.requestFile));
+  if (request == null) return { status: "none" };
+  if (observedAt > request.expiresAt) return { status: "expired", ...request };
+  const result = normalizeProbeResult(await readJsonIfExists(paths.resultFile));
+  if (result != null && sameRequest(result, request)) return { status: "complete", result };
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const claimId = createClaimId();
+    if (!validProbeId(claimId)) throw new Error("Invalid event-wake probe claim identity");
+    const claim = {
+      protocol: EVENT_WAKE_PROBE_PROTOCOL,
+      ...request,
+      claimId,
+      claimedAt: observedAt,
+      claimExpiresAt: Math.min(request.expiresAt, observedAt + EVENT_WAKE_PROBE_CLAIM_TTL_MS),
+    };
+    try {
+      await createClaimFile(paths.claimFile, claim);
+      return { status: "claimed", ...normalizeProbeClaim(claim) };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    const existingClaim = normalizeProbeClaim(await readJsonIfExists(paths.claimFile));
+    const freshCurrentClaim = sameRequest(existingClaim, request)
+      && existingClaim.claimExpiresAt >= observedAt;
+    if (freshCurrentClaim) return { status: "busy" };
+    if (existingClaim == null) {
+      if (!await retireInvalidClaim(paths, request, observedAt)) return { status: "busy" };
+    } else {
+      await retireClaim(paths, existingClaim);
+    }
+  }
+  return { status: "busy" };
+}
+
+export async function releaseEventWakeProbeClaim(config, claim, { runtimeRoot } = {}) {
+  let paths;
+  try {
+    paths = await validateProbeFiles(config, runtimeRoot);
+  } catch {
+    return false;
+  }
+  const currentClaim = normalizeProbeClaim(await readJsonIfExists(paths.claimFile));
+  if (!sameClaim(currentClaim, claim)) return false;
+  return retireClaim(paths, currentClaim);
+}
+
+export async function writeEventWakeProbeResult(
+  config,
+  status,
+  { runtimeRoot, now = Date.now, claim } = {},
+) {
+  if (!PROBE_COMPLETION_STATUSES.has(status)) {
     throw new Error("Invalid event-wake probe result");
   }
-  const result = { protocol: EVENT_WAKE_PROBE_PROTOCOL, status, checkedAt: now() };
-  await writeJsonAtomic(config.eventWakeProbeResultFile, result);
-  return { status, checkedAt: result.checkedAt };
+  const paths = await validateProbeFiles(config, runtimeRoot);
+  const observedAt = now();
+  const request = normalizeProbeRequest(await readJsonIfExists(paths.requestFile));
+  const currentClaim = normalizeProbeClaim(await readJsonIfExists(paths.claimFile));
+  if (
+    !sameRequest(request, claim)
+    || !sameClaim(currentClaim, claim)
+    || observedAt > request.expiresAt
+    || observedAt > currentClaim.claimExpiresAt
+  ) return false;
+  const result = {
+    protocol: EVENT_WAKE_PROBE_PROTOCOL,
+    status,
+    probeId: request.probeId,
+    armedAt: request.armedAt,
+    claimedAt: claim.claimedAt,
+    observedAt,
+    expiresAt: request.expiresAt,
+  };
+  await writeProbeJsonAtomic(paths.resultFile, result);
+  const latestRequest = normalizeProbeRequest(await readJsonIfExists(paths.requestFile));
+  if (!sameRequest(latestRequest, request) || observedAt > latestRequest.expiresAt) {
+    const latestResult = normalizeProbeResult(await readJsonIfExists(paths.resultFile));
+    if (latestResult?.probeId === result.probeId) {
+      await unlink(paths.resultFile).catch((error) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+    return false;
+  }
+  return true;
+}
+
+export async function writeExpiredEventWakeProbeResult(
+  config,
+  request,
+  { runtimeRoot, now = Date.now } = {},
+) {
+  const paths = await validateProbeFiles(config, runtimeRoot);
+  const observedAt = now();
+  const currentRequest = normalizeProbeRequest(await readJsonIfExists(paths.requestFile));
+  if (!sameRequest(currentRequest, request) || observedAt <= currentRequest.expiresAt) return false;
+  await writeProbeJsonAtomic(paths.resultFile, {
+    protocol: EVENT_WAKE_PROBE_PROTOCOL,
+    status: "expired",
+    probeId: currentRequest.probeId,
+    armedAt: currentRequest.armedAt,
+    claimedAt: null,
+    observedAt,
+    expiresAt: currentRequest.expiresAt,
+  });
+  return true;
 }
 
 export function inspectInstallation({
@@ -133,6 +448,7 @@ export function inspectInstallation({
   eventWakeProbe = null,
   pluginBundle = null,
   legacyHookConflicts = [],
+  runtimeRoot,
 } = {}) {
   const checks = [];
   checks.push({
@@ -218,7 +534,7 @@ export function inspectInstallation({
     && Array.isArray(config.excludeThreadIds)
     && config.excludeThreadIds.includes(wake.organizerThreadId)
     && isBoundedAbsolutePath(config.wakeStateFile)
-    && validProbeConfig(config)
+    && validProbeConfig(config, runtimeRoot)
   );
   checks.push({
     level: eventWakeValid ? "ok" : "error",
@@ -279,19 +595,51 @@ export function parseDoctorArgs(argv) {
   return result;
 }
 
+export async function inspectPluginBundle(pluginRoot, { enabledContext = false } = {}) {
+  const entries = {
+    manifest: ".codex-plugin/plugin.json",
+    hooks: "hooks/hooks.json",
+    launcher: "scripts/plugin-hook.sh",
+    sidebarHook: "scripts/sidebar-hook.mjs",
+    sidebarRealtime: "scripts/sidebar-realtime.mjs",
+    eventWake: "scripts/event-wake.mjs",
+  };
+  const result = { enabledContext };
+  await Promise.all(Object.entries(entries).map(async ([name, relativePath]) => {
+    if (!isBoundedAbsolutePath(pluginRoot)) {
+      result[name] = false;
+      return;
+    }
+    const filePath = path.join(pluginRoot, relativePath);
+    try {
+      const metadata = await lstat(filePath);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) {
+        result[name] = false;
+        return;
+      }
+      await access(filePath, constants.R_OK);
+      result[name] = true;
+    } catch {
+      result[name] = false;
+    }
+  }));
+  return result;
+}
+
 async function main(argv = process.argv.slice(2)) {
   const options = parseDoctorArgs(argv);
   const mode = options.mode;
   const codexHome = options.codexHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
   const pluginRoot = options.pluginRoot ?? process.env.CLAUDE_PLUGIN_ROOT;
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
   const [hooks, config] = await Promise.all([
     readJson(path.join(codexHome, "hooks.json")).catch(() => ({})),
     readJson(path.join(codexHome, "sidebar-flow", "config.json")).catch(() => ({})),
   ]);
   if (options.armEventWakeProbe || options.eventWakeProbeResult) {
     const eventWakeProbe = options.armEventWakeProbe
-      ? await armEventWakeProbe(config)
-      : await readEventWakeProbeResult(config);
+      ? await armEventWakeProbe(config, { runtimeRoot })
+      : await readEventWakeProbeResult(config, { runtimeRoot });
     process.stdout.write(`${JSON.stringify({ eventWakeProbe }, null, 2)}\n`);
     return;
   }
@@ -312,7 +660,12 @@ async function main(argv = process.argv.slice(2)) {
       appTools?.reset();
     }
   }
-  const eventWakeProbe = await readEventWakeProbeResult(config);
+  const eventWakeProbe = await readEventWakeProbeResult(config, { runtimeRoot });
+  const pluginBundle = mode === "plugin"
+    ? await inspectPluginBundle(pluginRoot, {
+        enabledContext: pluginRoot != null && process.env.CLAUDE_PLUGIN_ROOT === pluginRoot,
+      })
+    : null;
   const checks = inspectInstallation({
     hooks,
     config,
@@ -320,18 +673,9 @@ async function main(argv = process.argv.slice(2)) {
     pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH,
     runtimeProbe,
     eventWakeProbe,
+    runtimeRoot,
     legacyHookConflicts: findUnmarkedSidebarHookPaths(hooks),
-    pluginBundle: mode === "plugin"
-      ? {
-          manifest: pluginRoot != null && existsSync(path.join(pluginRoot, ".codex-plugin", "plugin.json")),
-          hooks: pluginRoot != null && existsSync(path.join(pluginRoot, "hooks", "hooks.json")),
-          launcher: pluginRoot != null && existsSync(path.join(pluginRoot, "scripts", "plugin-hook.sh")),
-          sidebarHook: pluginRoot != null && existsSync(path.join(pluginRoot, "scripts", "sidebar-hook.mjs")),
-          sidebarRealtime: pluginRoot != null && existsSync(path.join(pluginRoot, "scripts", "sidebar-realtime.mjs")),
-          eventWake: pluginRoot != null && existsSync(path.join(pluginRoot, "scripts", "event-wake.mjs")),
-          enabledContext: pluginRoot != null && process.env.CLAUDE_PLUGIN_ROOT === pluginRoot,
-        }
-      : null,
+    pluginBundle,
   });
   process.stdout.write(`${JSON.stringify({ mode, checks }, null, 2)}\n`);
   if (checks.some((check) => check.level === "error") || runtimeProbe?.ok === false) process.exitCode = 1;

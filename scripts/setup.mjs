@@ -304,8 +304,8 @@ export async function setup({
         ...config.eventWake,
         enabled: true,
         organizerThreadId,
-        organizerHostId: organizerHostId ?? "local",
-        maxPerMinute: eventWakeMaxPerMinute ?? 20,
+        organizerHostId: organizerHostId ?? config.eventWake.organizerHostId ?? "local",
+        maxPerMinute: eventWakeMaxPerMinute ?? config.eventWake.maxPerMinute ?? 20,
       };
       config.excludeThreadIds = [...new Set([
         ...(Array.isArray(config.excludeThreadIds) ? config.excludeThreadIds : []),

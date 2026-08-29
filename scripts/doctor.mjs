@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppTools } from "./sidebar-realtime.mjs";
+import { isRuntimeFingerprint } from "./runtime-integrity.mjs";
 import {
   detectNodeExecutable,
   findUnmarkedSidebarHookPaths,
@@ -44,6 +45,18 @@ function validTimestamp(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
+function hasExactKeys(value, expected) {
+  return value != null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join("\0") === [...expected].sort().join("\0");
+}
+
+function validProbeBinding(value) {
+  return new Set(["source", "plugin"]).has(value?.installMode)
+    && isRuntimeFingerprint(value?.runtimeFingerprint);
+}
+
 function probePaths(config, runtimeRoot) {
   if (!isBoundedAbsolutePath(runtimeRoot) || path.normalize(runtimeRoot) !== runtimeRoot) return null;
   const requestFile = path.join(runtimeRoot, PROBE_REQUEST_NAME);
@@ -56,6 +69,8 @@ function probePaths(config, runtimeRoot) {
     runtimeRoot,
     requestFile,
     resultBaseFile: resultFile,
+    installMode: config?.installMode,
+    runtimeFingerprint: config?.runtimeFingerprint,
   };
 }
 
@@ -82,12 +97,17 @@ function probeIdFromGenerationFilename(filename) {
 
 function validProbeConfig(config, runtimeRoot) {
   return probePaths(config, runtimeRoot) != null
-    && config?.eventWakeProbeTtlMs === EVENT_WAKE_PROBE_TTL_MS;
+    && config?.eventWakeProbeTtlMs === EVENT_WAKE_PROBE_TTL_MS
+    && validProbeBinding(config);
 }
 
 async function validateProbeFiles(config, runtimeRoot) {
   const paths = probePaths(config, runtimeRoot);
-  if (paths == null || config?.eventWakeProbeTtlMs !== EVENT_WAKE_PROBE_TTL_MS) {
+  if (
+    paths == null
+    || config?.eventWakeProbeTtlMs !== EVENT_WAKE_PROBE_TTL_MS
+    || !validProbeBinding(config)
+  ) {
     throw new Error("Invalid event-wake probe path or runtime configuration");
   }
   const runtimeMetadata = await lstat(runtimeRoot).catch((error) => {
@@ -153,23 +173,38 @@ async function readJsonIfExists(filePath) {
 
 function normalizeProbeRequest(value) {
   if (
-    value?.protocol !== EVENT_WAKE_PROBE_PROTOCOL
+    !hasExactKeys(value, [
+      "protocol", "probeId", "armedAt", "expiresAt", "installMode", "runtimeFingerprint",
+    ])
+    || value.protocol !== EVENT_WAKE_PROBE_PROTOCOL
     || !validProbeId(value?.probeId)
     || !validTimestamp(value?.armedAt)
     || !validTimestamp(value?.expiresAt)
+    || !validProbeBinding(value)
     || value.expiresAt - value.armedAt !== EVENT_WAKE_PROBE_TTL_MS
   ) return null;
-  return { probeId: value.probeId, armedAt: value.armedAt, expiresAt: value.expiresAt };
+  return {
+    probeId: value.probeId,
+    armedAt: value.armedAt,
+    expiresAt: value.expiresAt,
+    installMode: value.installMode,
+    runtimeFingerprint: value.runtimeFingerprint,
+  };
 }
 
 function normalizeProbeResult(value) {
   if (
-    value?.protocol !== EVENT_WAKE_PROBE_PROTOCOL
+    !hasExactKeys(value, [
+      "protocol", "status", "probeId", "armedAt", "claimedAt", "observedAt", "expiresAt",
+      "installMode", "runtimeFingerprint",
+    ])
+    || value.protocol !== EVENT_WAKE_PROBE_PROTOCOL
     || !PROBE_RESULT_STATUSES.has(value?.status)
     || !validProbeId(value?.probeId)
     || !validTimestamp(value?.armedAt)
     || !validTimestamp(value?.observedAt)
     || !validTimestamp(value?.expiresAt)
+    || !validProbeBinding(value)
     || value.expiresAt - value.armedAt !== EVENT_WAKE_PROBE_TTL_MS
   ) return null;
   if (
@@ -185,17 +220,24 @@ function normalizeProbeResult(value) {
     claimedAt: value.claimedAt,
     observedAt: value.observedAt,
     expiresAt: value.expiresAt,
+    installMode: value.installMode,
+    runtimeFingerprint: value.runtimeFingerprint,
   };
 }
 
 function normalizeProbeClaim(value) {
   if (
-    value?.protocol !== EVENT_WAKE_PROBE_PROTOCOL
+    !hasExactKeys(value, [
+      "protocol", "probeId", "armedAt", "expiresAt", "installMode", "runtimeFingerprint",
+      "claimId", "claimedAt",
+    ])
+    || value.protocol !== EVENT_WAKE_PROBE_PROTOCOL
     || !validProbeId(value?.probeId)
     || !validProbeId(value?.claimId)
     || !validTimestamp(value?.armedAt)
     || !validTimestamp(value?.claimedAt)
     || !validTimestamp(value?.expiresAt)
+    || !validProbeBinding(value)
     || value.expiresAt - value.armedAt !== EVENT_WAKE_PROBE_TTL_MS
     || value.claimedAt < value.armedAt
     || value.claimedAt > value.expiresAt
@@ -205,6 +247,27 @@ function normalizeProbeClaim(value) {
     claimId: value.claimId,
     armedAt: value.armedAt,
     claimedAt: value.claimedAt,
+    expiresAt: value.expiresAt,
+    installMode: value.installMode,
+    runtimeFingerprint: value.runtimeFingerprint,
+  };
+}
+
+function publicProbeRequest(value) {
+  return {
+    probeId: value.probeId,
+    armedAt: value.armedAt,
+    expiresAt: value.expiresAt,
+  };
+}
+
+function publicProbeResult(value) {
+  return {
+    status: value.status,
+    probeId: value.probeId,
+    armedAt: value.armedAt,
+    claimedAt: value.claimedAt,
+    observedAt: value.observedAt,
     expiresAt: value.expiresAt,
   };
 }
@@ -235,7 +298,9 @@ function sameRequest(left, right) {
     && right != null
     && left.probeId === right.probeId
     && left.armedAt === right.armedAt
-    && left.expiresAt === right.expiresAt;
+    && left.expiresAt === right.expiresAt
+    && left.installMode === right.installMode
+    && left.runtimeFingerprint === right.runtimeFingerprint;
 }
 
 function attachClaimOwnership(claim, fileHandle, metadata, claimFile) {
@@ -283,7 +348,12 @@ async function generationExists(paths, probeId) {
 }
 
 async function readCurrentProbeRequest(paths) {
-  return normalizeProbeRequest(await readJsonIfExists(paths.requestFile));
+  const request = normalizeProbeRequest(await readJsonIfExists(paths.requestFile));
+  if (
+    request?.installMode !== paths.installMode
+    || request?.runtimeFingerprint !== paths.runtimeFingerprint
+  ) return null;
+  return request;
 }
 
 async function cleanupOrphanedProbeGenerations(paths, currentRequest, observedAt) {
@@ -340,6 +410,8 @@ export async function armEventWakeProbe(
     probeId,
     armedAt,
     expiresAt: armedAt + EVENT_WAKE_PROBE_TTL_MS,
+    installMode: config.installMode,
+    runtimeFingerprint: config.runtimeFingerprint,
   };
   await writeProbeJsonAtomic(paths.requestFile, request);
   await cleanupOrphanedProbeGenerations(paths, request, armedAt).catch(() => {});
@@ -365,9 +437,11 @@ export async function readEventWakeProbeResult(
     await afterResultRead({ attempt, probeId: firstRequest.probeId });
     const secondRequest = await readCurrentProbeRequest(paths);
     if (!sameRequest(firstRequest, secondRequest)) continue;
-    if (result != null) return result;
-    if (observedAt > firstRequest.expiresAt) return { status: "expired", ...firstRequest };
-    return { status: "pending", ...firstRequest };
+    if (result != null) return publicProbeResult(result);
+    if (observedAt > firstRequest.expiresAt) {
+      return { status: "expired", ...publicProbeRequest(firstRequest) };
+    }
+    return { status: "pending", ...publicProbeRequest(firstRequest) };
   }
   return { status: "pending" };
 }
@@ -392,8 +466,8 @@ export async function claimEventWakeProbe(
   if (request == null) return { status: "none" };
   await cleanupOrphanedProbeGenerations(paths, request, observedAt).catch(() => {});
   const result = await readCompletedProbeResult(paths, request);
-  if (result != null) return { status: "complete", result };
-  if (observedAt > request.expiresAt) return { status: "expired", ...request };
+  if (result != null) return { status: "complete", result: publicProbeResult(result) };
+  if (observedAt > request.expiresAt) return { status: "expired", ...publicProbeRequest(request) };
   const generation = generationProbePaths(paths, request.probeId);
   await afterInitialResultRead({ probeId: request.probeId });
   const claimId = createClaimId();
@@ -409,8 +483,10 @@ export async function claimEventWakeProbe(
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     const completedResult = await readCompletedProbeResult(paths, request);
-    if (completedResult != null) return { status: "complete", result: completedResult };
-    return observedAt > request.expiresAt ? { status: "expired", ...request } : { status: "busy" };
+    if (completedResult != null) return { status: "complete", result: publicProbeResult(completedResult) };
+    return observedAt > request.expiresAt
+      ? { status: "expired", ...publicProbeRequest(request) }
+      : { status: "busy" };
   }
   const claimRecord = {
     protocol: EVENT_WAKE_PROBE_PROTOCOL,
@@ -440,7 +516,7 @@ export async function claimEventWakeProbe(
     }
     if (completedResult != null) {
       await releaseOwnedClaimPath(claim);
-      return { status: "complete", result: completedResult };
+      return { status: "complete", result: publicProbeResult(completedResult) };
     }
     return claim;
   } catch (error) {
@@ -493,6 +569,8 @@ export async function writeEventWakeProbeResult(
     claimedAt: claim.claimedAt,
     observedAt,
     expiresAt: request.expiresAt,
+    installMode: request.installMode,
+    runtimeFingerprint: request.runtimeFingerprint,
   };
   await writeProbeJsonAtomic(generation.resultFile, result);
   const requestAfterPublish = await readCurrentProbeRequest(paths);
@@ -551,6 +629,13 @@ export function inspectInstallation({
       ? `${mode} mode recorded`
       : (config?.installMode == null ? "Install mode is not recorded" : `Configuration records ${config.installMode} mode`),
   });
+  checks.push({
+    level: config?.installMode === mode && isRuntimeFingerprint(config?.runtimeFingerprint) ? "ok" : "error",
+    name: "runtime-binding",
+    message: config?.installMode === mode && isRuntimeFingerprint(config?.runtimeFingerprint)
+      ? "Configuration is bound to a runtime fingerprint"
+      : "Configuration is missing an exact install mode and runtime fingerprint binding",
+  });
   if (mode === "source") {
     for (const event of ["UserPromptSubmit", "Stop"]) {
       const installed = (hooks?.hooks?.[event] ?? []).some((matcher) =>
@@ -570,6 +655,10 @@ export function inspectInstallation({
       "sidebarHook",
       "sidebarRealtime",
       "eventWake",
+      "setup",
+      "uninstall",
+      "doctor",
+      "runtimeIntegrity",
     ].every(
       (name) => pluginBundle[name] === true,
     );
@@ -577,7 +666,7 @@ export function inspectInstallation({
       level: !bundleComplete ? "error" : (pluginBundle.enabledContext ? "ok" : "warning"),
       name: "plugin-bundle",
       message: !bundleComplete
-        ? "Plugin manifest, Hook declaration, launcher, or runtime script is missing"
+        ? "Plugin manifest, Hook declaration, launcher, runtime, or administration script is missing"
         : (pluginBundle.enabledContext
             ? "Plugin bundle is complete in an active plugin context"
             : "Plugin bundle is complete, but app enablement is unverified"),
@@ -679,6 +768,10 @@ export async function inspectPluginBundle(pluginRoot, { enabledContext = false }
     sidebarHook: "scripts/sidebar-hook.mjs",
     sidebarRealtime: "scripts/sidebar-realtime.mjs",
     eventWake: "scripts/event-wake.mjs",
+    setup: "scripts/setup.mjs",
+    uninstall: "scripts/uninstall.mjs",
+    doctor: "scripts/doctor.mjs",
+    runtimeIntegrity: "scripts/runtime-integrity.mjs",
   };
   const result = { enabledContext };
   await Promise.all(Object.entries(entries).map(async ([name, relativePath]) => {

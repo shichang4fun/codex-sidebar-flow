@@ -47,8 +47,18 @@ export async function uninstall({
   if (purge) {
     await rm(path.join(codexHome, "sidebar-flow"), { recursive: true, force: true });
   } else if (config != null) {
-    const { installMode: _installMode, ...remainingConfig } = config;
-    await writeJsonAtomic(configPath, remainingConfig);
+    const {
+      installMode: _installMode,
+      runtimeFingerprint: _runtimeFingerprint,
+      ...remainingConfig
+    } = config;
+    await writeJsonAtomic(configPath, {
+      ...remainingConfig,
+      eventWake: {
+        ...(remainingConfig.eventWake ?? {}),
+        enabled: false,
+      },
+    });
   }
   return { mode, hooksPath, purged: purge };
 }

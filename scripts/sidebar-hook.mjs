@@ -20,8 +20,9 @@ import {
   writeEventWakeProbeResult,
 } from "./doctor.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "./setup.mjs";
+import { computeRuntimeFingerprint } from "./runtime-integrity.mjs";
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const RUNTIME_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_CONFIG_PATH = process.env.CODEX_SIDEBAR_FLOW_CONFIG ?? path.join(os.homedir(), ".codex", "sidebar-flow", "config.json");
 const DEFAULT_LOG_PATH = path.join(os.homedir(), ".codex", "sidebar-flow", "hook.log");
 const DEFAULT_RETRY_DELAY_MS = 250;
@@ -378,6 +379,7 @@ export async function handleHook(
     writeExpiredProbeResult = writeExpiredEventWakeProbeResult,
     writeProbeResult = writeEventWakeProbeResult,
     inspectCapability = inspectEventWakeCapability,
+    computeRuntimeFingerprint: computeFingerprint = computeRuntimeFingerprint,
     now = Date.now,
   } = dependencies;
   if (!["UserPromptSubmit", "Stop"].includes(input?.hook_event_name)) return null;
@@ -387,13 +389,17 @@ export async function handleHook(
     error.code = "INSTALL_MODE_MISSING";
     throw error;
   }
+  const actualRuntimeFingerprint = await computeFingerprint(RUNTIME_ROOT);
   let config;
   try {
     config = await load(configPath);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     const codexHome = path.dirname(path.dirname(configPath));
-    await writeJsonAtomic(configPath, defaultConfig(codexHome, installMode));
+    await writeJsonAtomic(
+      configPath,
+      defaultConfig(codexHome, installMode, actualRuntimeFingerprint),
+    );
     config = await load(configPath);
   }
   if (config.installMode !== installMode) {
@@ -401,6 +407,11 @@ export async function handleHook(
       `Hook mode ${installMode} does not match configured mode ${config.installMode ?? "unrecorded"}`,
     );
     error.code = "INSTALL_MODE_MISMATCH";
+    throw error;
+  }
+  if (config.runtimeFingerprint !== actualRuntimeFingerprint) {
+    const error = new Error("Hook runtime does not match the configured runtime fingerprint");
+    error.code = "RUNTIME_FINGERPRINT_MISMATCH";
     throw error;
   }
   config.actorThreadId = input.session_id;

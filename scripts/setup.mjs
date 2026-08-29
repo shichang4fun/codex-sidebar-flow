@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 
-import { chmod, copyFile, link, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  computeRuntimeFingerprint,
+  isRuntimeFingerprint,
+  RUNTIME_FILES,
+} from "./runtime-integrity.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const HOOK_MARKER = "CODEX_SIDEBAR_FLOW_OWNER=codex-sidebar-flow-v1";
@@ -152,10 +157,14 @@ async function writePrivateBackup(sourcePath, backupPath) {
   }
 }
 
-export function defaultConfig(codexHome, installMode = null) {
+export function defaultConfig(codexHome, installMode = null, runtimeFingerprint = null) {
+  if (installMode != null && !isRuntimeFingerprint(runtimeFingerprint)) {
+    throw new Error("A runtime fingerprint is required for an installed configuration");
+  }
   const runtime = path.join(codexHome, "sidebar-flow");
   return {
     ...(installMode == null ? {} : { installMode }),
+    ...(runtimeFingerprint == null ? {} : { runtimeFingerprint }),
     actorThreadId: "codex-sidebar-flow",
     sections: {
       inProgress: "In Progress",
@@ -190,6 +199,69 @@ export function defaultConfig(codexHome, installMode = null) {
   };
 }
 
+async function verifyRelease(releaseRoot, expectedFingerprint) {
+  const metadata = await lstat(releaseRoot);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error("Runtime release must be a real directory");
+  }
+  const actualFingerprint = await computeRuntimeFingerprint(releaseRoot);
+  if (actualFingerprint !== expectedFingerprint) {
+    const error = new Error("Runtime release fingerprint mismatch");
+    error.code = "RUNTIME_FINGERPRINT_MISMATCH";
+    throw error;
+  }
+}
+
+async function publishSourceRelease(
+  runtimeRoot,
+  sourceRoot,
+  runtimeFingerprint,
+  { copyRuntimeFile = copyFile, renameRuntimeRelease = rename } = {},
+) {
+  const releasesRoot = path.join(runtimeRoot, "releases");
+  const releaseRoot = path.join(releasesRoot, runtimeFingerprint);
+  await mkdir(releasesRoot, { recursive: true, mode: 0o700 });
+  const releasesMetadata = await lstat(releasesRoot);
+  if (releasesMetadata.isSymbolicLink() || !releasesMetadata.isDirectory()) {
+    throw new Error("Runtime releases root must be a real directory, not a symlink");
+  }
+  await chmod(releasesRoot, 0o700);
+  const existing = await lstat(releaseRoot).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (existing != null) {
+    await verifyRelease(releaseRoot, runtimeFingerprint);
+    return releaseRoot;
+  }
+
+  const stagingRoot = path.join(releasesRoot, `.staging-${process.pid}-${randomUUID()}`);
+  try {
+    await mkdir(stagingRoot, { mode: 0o700 });
+    for (const relativePath of RUNTIME_FILES) {
+      const destination = path.join(stagingRoot, relativePath);
+      await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+      await copyRuntimeFile(path.join(sourceRoot, relativePath), destination);
+    }
+    const stagedFingerprint = await computeRuntimeFingerprint(stagingRoot);
+    if (stagedFingerprint !== runtimeFingerprint) {
+      const error = new Error("Staged runtime fingerprint mismatch");
+      error.code = "RUNTIME_FINGERPRINT_MISMATCH";
+      throw error;
+    }
+    try {
+      await renameRuntimeRelease(stagingRoot, releaseRoot);
+    } catch (error) {
+      if (!new Set(["EEXIST", "ENOTEMPTY"]).has(error.code)) throw error;
+      await verifyRelease(releaseRoot, runtimeFingerprint);
+    }
+    await verifyRelease(releaseRoot, runtimeFingerprint);
+    return releaseRoot;
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true });
+  }
+}
+
 export async function setup({
   codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
   dryRun = false,
@@ -199,7 +271,7 @@ export async function setup({
   organizerThreadId,
   organizerHostId,
   eventWakeMaxPerMinute,
-} = {}) {
+} = {}, dependencies = {}) {
   if (!new Set(["source", "plugin"]).has(mode)) throw new Error(`Unknown setup mode: ${mode}`);
   if (!isSingleLine(codexHome, 4096) || !path.isAbsolute(codexHome)) {
     const error = new Error(`CODEX_HOME must be an absolute path: ${codexHome}`);
@@ -226,6 +298,11 @@ export async function setup({
   const hooksPath = path.join(codexHome, "hooks.json");
   const backupPath = `${hooksPath}.sidebar-flow.bak`;
   const configPath = path.join(runtimeRoot, "config.json");
+  const sourceRoot = dependencies.sourceRoot ?? ROOT;
+  const runtimeFingerprint = await computeRuntimeFingerprint(sourceRoot);
+  const releaseRoot = mode === "source"
+    ? path.join(runtimeRoot, "releases", runtimeFingerprint)
+    : sourceRoot;
   const standardLegacyHookPath = path.join(runtimeScripts, "sidebar-hook.mjs");
   const authorizedLegacyHookPaths = normalizeLegacyHookPaths(migrateLegacyHookPaths);
   for (const candidate of authorizedLegacyHookPaths) {
@@ -268,51 +345,54 @@ export async function setup({
     error.code = "MIXED_INSTALLATION";
     throw error;
   }
+  const defaults = defaultConfig(codexHome, mode, runtimeFingerprint);
+  const bindingChanged = existingConfig?.installMode !== mode
+    || existingConfig?.runtimeFingerprint !== runtimeFingerprint;
+  const config = {
+    ...defaults,
+    ...(existingConfig ?? {}),
+    sections: {
+      ...defaults.sections,
+      ...(existingConfig?.sections ?? {}),
+    },
+    eventWake: {
+      ...defaults.eventWake,
+      ...(existingConfig?.eventWake ?? {}),
+      ...(bindingChanged ? { enabled: false } : {}),
+    },
+    installMode: mode,
+    runtimeFingerprint,
+  };
+  if (enableEventWake) {
+    const { readEventWakeProbeResult } = await import("./doctor.mjs");
+    const capability = await readEventWakeProbeResult(config, { runtimeRoot });
+    if (capability.status !== "present") {
+      const error = new Error("A present capability probe for this install mode and runtime is required");
+      error.code = "CAPABILITY_PROBE_REQUIRED";
+      throw error;
+    }
+    config.eventWake = {
+      ...config.eventWake,
+      enabled: true,
+      organizerThreadId,
+      organizerHostId: organizerHostId ?? config.eventWake.organizerHostId ?? "local",
+      maxPerMinute: eventWakeMaxPerMinute ?? config.eventWake.maxPerMinute ?? 20,
+    };
+    config.excludeThreadIds = [...new Set([
+      ...(Array.isArray(config.excludeThreadIds) ? config.excludeThreadIds : []),
+      organizerThreadId,
+    ])];
+  }
   const hooks = mode === "source"
-    ? installHooks(existingHooks, hookCommand(runtimeRoot), ownedLegacyHookPaths)
+    ? installHooks(existingHooks, hookCommand(releaseRoot), ownedLegacyHookPaths)
     : null;
   if (!dryRun) {
     if (mode === "source") {
-      await mkdir(runtimeScripts, { recursive: true, mode: 0o700 });
-      await Promise.all([
-        copyFile(path.join(ROOT, "scripts", "sidebar-hook.mjs"), path.join(runtimeScripts, "sidebar-hook.mjs")),
-        copyFile(path.join(ROOT, "scripts", "sidebar-realtime.mjs"), path.join(runtimeScripts, "sidebar-realtime.mjs")),
-        copyFile(path.join(ROOT, "scripts", "event-wake.mjs"), path.join(runtimeScripts, "event-wake.mjs")),
-        copyFile(path.join(ROOT, "scripts", "setup.mjs"), path.join(runtimeScripts, "setup.mjs")),
-        copyFile(path.join(ROOT, "scripts", "uninstall.mjs"), path.join(runtimeScripts, "uninstall.mjs")),
-        copyFile(path.join(ROOT, "scripts", "doctor.mjs"), path.join(runtimeScripts, "doctor.mjs")),
-      ]);
+      await publishSourceRelease(runtimeRoot, sourceRoot, runtimeFingerprint, dependencies);
       if (existsSync(hooksPath)) await writePrivateBackup(hooksPath, backupPath);
-      await writeJsonAtomic(hooksPath, hooks);
-    }
-    const defaults = defaultConfig(codexHome, mode);
-    const config = {
-      ...defaults,
-      ...(existingConfig ?? {}),
-      sections: {
-        ...defaults.sections,
-        ...(existingConfig?.sections ?? {}),
-      },
-      eventWake: {
-        ...defaults.eventWake,
-        ...(existingConfig?.eventWake ?? {}),
-      },
-      installMode: mode,
-    };
-    if (enableEventWake) {
-      config.eventWake = {
-        ...config.eventWake,
-        enabled: true,
-        organizerThreadId,
-        organizerHostId: organizerHostId ?? config.eventWake.organizerHostId ?? "local",
-        maxPerMinute: eventWakeMaxPerMinute ?? config.eventWake.maxPerMinute ?? 20,
-      };
-      config.excludeThreadIds = [...new Set([
-        ...(Array.isArray(config.excludeThreadIds) ? config.excludeThreadIds : []),
-        organizerThreadId,
-      ])];
     }
     await writeJsonAtomic(configPath, config);
+    if (mode === "source") await writeJsonAtomic(hooksPath, hooks);
     if (mode === "plugin") await rm(runtimeScripts, { recursive: true, force: true });
   }
   return {
@@ -321,6 +401,8 @@ export async function setup({
     backupPath,
     configPath,
     runtimeRoot,
+    releaseRoot,
+    runtimeFingerprint,
     dryRun,
     migratedLegacyHookPaths: authorizedLegacyHookPaths,
     nodeExecutable: detectNodeExecutable(),

@@ -35,7 +35,7 @@ Plugin mode install/configure keeps event wake disabled first:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin
 ```
 
-Existing v0.1 installations remain `eventWake.enabled=false` until you rerun setup with `--enable-event-wake` and a confirmed organizer task ID. Do not infer the organizer from the current task.
+Existing v0.1 installations remain `eventWake.enabled=false` until setup publishes the current runtime, a trusted Hook records a probe for that exact runtime, and setup is rerun with `--enable-event-wake` and a confirmed organizer task ID. Do not infer the organizer from the current task.
 
 If setup reports `LEGACY_HOOK_CONFLICT`, inspect the reported absolute path. Migrate it only when it is an older Sidebar Flow installation you recognize:
 
@@ -50,8 +50,8 @@ Restart Codex Desktop after setup. The installer:
 - preserves unrelated hooks;
 - backs up `~/.codex/hooks.json`;
 - installs only `UserPromptSubmit` and `Stop` handlers;
-- creates `~/.codex/sidebar-flow/config.json` only when absent.
-- copies the runtime, doctor, and uninstaller into `~/.codex/sidebar-flow/scripts`, so the checkout can be moved or removed.
+- creates or upgrades `~/.codex/sidebar-flow/config.json` with the exact install mode and runtime fingerprint;
+- stages the fixed runtime file set, verifies its SHA-256 fingerprint, and atomically publishes an immutable release under `~/.codex/sidebar-flow/releases/<runtimeFingerprint>` before changing Hooks. Existing releases are retained, and no `current` symlink is used.
 
 Setup does not silently create a scheduled model task. Event wake is model-triggering and user-visible, so enable it only with explicit user authorization. The event-wake fast path requires only the lifecycle Hook and a configured organizer task.
 
@@ -80,7 +80,7 @@ node scripts/render-heartbeat.mjs --exclude <organizer-task-id>
 
 Creation must fail if the placeholder remains or no exact organizer ID was supplied.
 
-Enable event wake in two phases because `doctor` treats enabled-without-successful-probe as unhealthy.
+Enable event wake in two phases because capability is bound to both `installMode` and the SHA-256 fingerprint of the exact runtime files. A setup that changes either binding succeeds with event wake forced disabled. `--enable-event-wake` fails with `CAPABILITY_PROBE_REQUIRED` before writing unless the latest strict probe result is `present` for the current binding.
 
 Source mode:
 
@@ -102,7 +102,7 @@ Plugin mode:
    `node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin --enable-event-wake --organizer-thread-id <organizer-task-id> --organizer-host-id local`
 6. Verify: `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin`
 
-If the probe is missing, pending, expired, or not `present`, keep event wake disabled and retain the 5-minute heartbeat. The probe confirms whether a real lifecycle Hook saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself.
+If the probe is missing, pending, expired, belongs to another install mode/runtime fingerprint, or is not `present`, keep event wake disabled and retain the 5-minute heartbeat. The Hook recomputes the fingerprint from its own actual files before it may record `present`. The probe confirms whether that exact runtime saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself.
 
 Keep the heartbeat at 5 minutes until live acceptance succeeds on the hosts you care about. Only after verified event-path acceptance should you consider 30-60 minutes. If remote acceptance is absent or fails, do not claim remote realtime behavior and keep the heartbeat interval short enough to cover the remote repair delay you still need.
 
@@ -132,11 +132,9 @@ Socket discovery is disabled by default. The supported path is the explicit `COD
 
 ## Uninstall
 
-```bash
-node ~/.codex/sidebar-flow/scripts/uninstall.mjs
-```
+Run `node scripts/uninstall.mjs` from the source checkout. If the checkout was removed, use the `releaseRoot` printed by setup and run `node <releaseRoot>/scripts/uninstall.mjs`.
 
-Source mode removes only Sidebar Flow entries from global hooks. Plugin users should disable the plugin and run `node scripts/uninstall.mjs --plugin --purge` from the checkout; plugin mode never edits global hooks. Add `--purge` to remove configuration, state, installed runtime files, and logs.
+Source mode removes only Sidebar Flow entries from global hooks. A normal uninstall also disables event wake and removes the install-mode/runtime-fingerprint binding while preserving configuration and state. Plugin users should disable the plugin and run `node scripts/uninstall.mjs --plugin --purge` from the checkout; plugin mode never edits global hooks. Add `--purge` to remove configuration, state, installed runtime files, releases, and logs.
 
 ## Known boundaries
 

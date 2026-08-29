@@ -17,6 +17,11 @@ import {
 import { defaultConfig, HOOK_MARKER } from "../scripts/setup.mjs";
 
 const execFileAsync = promisify(execFile);
+const TEST_RUNTIME_FINGERPRINT = "a".repeat(64);
+
+function runtimeDefaultConfig(codexHome, installMode) {
+  return defaultConfig(codexHome, installMode, TEST_RUNTIME_FINGERPRINT);
+}
 
 function generationProbePaths(config, probeId) {
   return {
@@ -27,6 +32,7 @@ function generationProbePaths(config, probeId) {
 
 const config = {
   installMode: "plugin",
+  runtimeFingerprint: TEST_RUNTIME_FINGERPRINT,
   sections: { inProgress: "In Progress", forReview: "For Review", forLater: "For Later" },
 };
 
@@ -38,7 +44,8 @@ test("plugin doctor rejects a missing bundle", () => {
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
       manifest: false, hooks: false, launcher: false, sidebarHook: false,
-      sidebarRealtime: false, eventWake: false, enabledContext: false,
+      sidebarRealtime: false, eventWake: false, setup: false, uninstall: false,
+      doctor: false, runtimeIntegrity: false, enabledContext: false,
     },
   });
   assert.equal(checks.find((check) => check.name === "plugin-bundle").level, "error");
@@ -52,7 +59,8 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
-      sidebarRealtime: true, eventWake: true, enabledContext: false,
+      sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
+      doctor: true, runtimeIntegrity: true, enabledContext: false,
     },
   });
   assert.equal(staticChecks.find((check) => check.name === "plugin-bundle").level, "warning");
@@ -64,7 +72,8 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
-      sidebarRealtime: true, eventWake: true, enabledContext: true,
+      sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
+      doctor: true, runtimeIntegrity: true, enabledContext: true,
     },
   });
   assert.equal(activeChecks.find((check) => check.name === "plugin-bundle").level, "ok");
@@ -78,7 +87,8 @@ test("doctor reports unowned legacy sidebar Hooks as an error", () => {
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
-      sidebarRealtime: true, eventWake: true, enabledContext: true,
+      sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
+      doctor: true, runtimeIntegrity: true, enabledContext: true,
     },
     legacyHookConflicts: ["/opt/old/scripts/sidebar-hook.mjs"],
   });
@@ -87,7 +97,7 @@ test("doctor reports unowned legacy sidebar Hooks as an error", () => {
   assert.match(conflict.message, /\/opt\/old\/scripts\/sidebar-hook\.mjs/);
 });
 
-test("plugin doctor requires every event-wake runtime bundle component", () => {
+test("plugin doctor requires every runtime and administration bundle component", () => {
   const complete = {
     manifest: true,
     hooks: true,
@@ -95,9 +105,16 @@ test("plugin doctor requires every event-wake runtime bundle component", () => {
     sidebarHook: true,
     sidebarRealtime: true,
     eventWake: true,
+    setup: true,
+    uninstall: true,
+    doctor: true,
+    runtimeIntegrity: true,
     enabledContext: true,
   };
-  for (const missing of ["manifest", "hooks", "launcher", "sidebarHook", "sidebarRealtime", "eventWake"]) {
+  for (const missing of [
+    "manifest", "hooks", "launcher", "sidebarHook", "sidebarRealtime", "eventWake",
+    "setup", "uninstall", "doctor", "runtimeIntegrity",
+  ]) {
     const checks = inspectInstallation({
       config,
       mode: "plugin",
@@ -118,6 +135,10 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
     ["sidebarHook", "scripts/sidebar-hook.mjs"],
     ["sidebarRealtime", "scripts/sidebar-realtime.mjs"],
     ["eventWake", "scripts/event-wake.mjs"],
+    ["setup", "scripts/setup.mjs"],
+    ["uninstall", "scripts/uninstall.mjs"],
+    ["doctor", "scripts/doctor.mjs"],
+    ["runtimeIntegrity", "scripts/runtime-integrity.mjs"],
   ];
   try {
     for (const [, relativePath] of entries) {
@@ -132,6 +153,10 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
       sidebarHook: true,
       sidebarRealtime: true,
       eventWake: true,
+      setup: true,
+      uninstall: true,
+      doctor: true,
+      runtimeIntegrity: true,
       enabledContext: true,
     });
 
@@ -152,7 +177,7 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
 
 test("doctor validates event-wake configuration and reports capability separately", () => {
   const codexHome = "/tmp/sidebar-flow-doctor";
-  const disabled = defaultConfig(codexHome, "plugin");
+  const disabled = runtimeDefaultConfig(codexHome, "plugin");
   const disabledChecks = inspectInstallation({ config: disabled, mode: "plugin" });
   assert.equal(disabledChecks.find((check) => check.name === "event-wake-config").level, "ok");
   assert.equal(disabledChecks.find((check) => check.name === "event-wake-capability").level, "ok");
@@ -225,7 +250,7 @@ test("doctor validates event-wake configuration and reports capability separatel
 
 test("doctor arms and reads bounded private event-wake probe state", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-probe-"));
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
   try {
     await mkdir(runtimeRoot, { recursive: true });
@@ -304,10 +329,65 @@ test("doctor arms and reads bounded private event-wake probe state", async () =>
   }
 });
 
+test("probe records are strictly bound to install mode and runtime fingerprint", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-binding-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const boundConfig = {
+    ...runtimeDefaultConfig(codexHome, "source"),
+    installMode: "source",
+    runtimeFingerprint: TEST_RUNTIME_FINGERPRINT,
+  };
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    const pending = await armEventWakeProbe(boundConfig, {
+      runtimeRoot,
+      now: () => 1_000,
+      createProbeId: () => "probe-runtime-bound",
+    });
+    const request = JSON.parse(await readFile(boundConfig.eventWakeProbeRequestFile, "utf8"));
+    assert.deepEqual(Object.keys(request).sort(), [
+      "armedAt", "expiresAt", "installMode", "probeId", "protocol", "runtimeFingerprint",
+    ]);
+    assert.equal(request.installMode, "source");
+    assert.equal(request.runtimeFingerprint, TEST_RUNTIME_FINGERPRINT);
+
+    const claim = await claimEventWakeProbe(boundConfig, {
+      runtimeRoot,
+      now: () => 2_000,
+      createClaimId: () => "claim-runtime-bound",
+    });
+    assert.equal(claim.status, "claimed");
+    assert.equal(await writeEventWakeProbeResult(boundConfig, "present", {
+      runtimeRoot,
+      now: () => 2_500,
+      claim,
+    }), true);
+    await releaseEventWakeProbeClaim(boundConfig, claim, { runtimeRoot });
+    const resultPath = generationProbePaths(boundConfig, pending.probeId).resultFile;
+    const result = JSON.parse(await readFile(resultPath, "utf8"));
+    assert.deepEqual(Object.keys(result).sort(), [
+      "armedAt", "claimedAt", "expiresAt", "installMode", "observedAt", "probeId",
+      "protocol", "runtimeFingerprint", "status",
+    ]);
+    assert.equal(result.installMode, "source");
+    assert.equal(result.runtimeFingerprint, TEST_RUNTIME_FINGERPRINT);
+
+    assert.deepEqual(await readEventWakeProbeResult({
+      ...boundConfig,
+      runtimeFingerprint: "b".repeat(64),
+    }, { runtimeRoot, now: () => 3_000 }), { status: "missing" });
+
+    await writeFile(resultPath, `${JSON.stringify({ ...result, unexpected: true })}\n`, { mode: 0o600 });
+    assert.equal((await readEventWakeProbeResult(boundConfig, { runtimeRoot, now: () => 3_000 })).status, "pending");
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("doctor CLI stays healthy after request ttl when a matching present probe result already exists", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-cli-present-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   try {
     await mkdir(runtimeRoot, { recursive: true });
     await writeFile(path.join(codexHome, "hooks.json"), `${JSON.stringify({
@@ -332,6 +412,8 @@ test("doctor CLI stays healthy after request ttl when a matching present probe r
       probeId: "probe-00000001",
       armedAt: 1_000,
       expiresAt: 301_000,
+      installMode: "source",
+      runtimeFingerprint: TEST_RUNTIME_FINGERPRINT,
     })}\n`, { mode: 0o600 });
     await writeFile(`${config.eventWakeProbeResultFile}.result.probe-00000001`, `${JSON.stringify({
       protocol: "codex-sidebar-flow/event-wake-probe-v1",
@@ -341,6 +423,8 @@ test("doctor CLI stays healthy after request ttl when a matching present probe r
       claimedAt: 2_000,
       observedAt: 2_500,
       expiresAt: 301_000,
+      installMode: "source",
+      runtimeFingerprint: TEST_RUNTIME_FINGERPRINT,
     })}\n`, { mode: 0o600 });
 
     const { stdout } = await execFileAsync(process.execPath, [
@@ -359,7 +443,7 @@ test("doctor CLI stays healthy after request ttl when a matching present probe r
 test("invalid generation result files never mask expiry or pending probe state", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-invalid-result-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   const unrelatedFile = path.join(codexHome, "unrelated.txt");
   try {
     await mkdir(runtimeRoot, { recursive: true });
@@ -417,9 +501,9 @@ test("probe paths are exact runtime files and unsafe targets are untouched", asy
     await writeFile(unrelatedFile, "keep\n", { mode: 0o600 });
     await writeFile(requestFile, "keep-request\n", { mode: 0o600 });
     for (const unsafe of [
-      { ...defaultConfig(codexHome, "source"), eventWakeProbeResultFile: unrelatedFile },
+      { ...runtimeDefaultConfig(codexHome, "source"), eventWakeProbeResultFile: unrelatedFile },
       {
-        ...defaultConfig(codexHome, "source"),
+        ...runtimeDefaultConfig(codexHome, "source"),
         eventWakeProbeRequestFile: `${runtimeRoot}/nested/../event-wake-probe-request.json`,
       },
     ]) {
@@ -431,7 +515,7 @@ test("probe paths are exact runtime files and unsafe targets are untouched", asy
       assert.equal(await readFile(requestFile, "utf8"), "keep-request\n");
     }
     await assert.rejects(
-      armEventWakeProbe(defaultConfig(codexHome, "source"), {
+      armEventWakeProbe(runtimeDefaultConfig(codexHome, "source"), {
         runtimeRoot: `${runtimeRoot}/nested/..`,
       }),
       /probe path|runtime/i,
@@ -439,7 +523,7 @@ test("probe paths are exact runtime files and unsafe targets are untouched", asy
     assert.equal(await readFile(unrelatedFile, "utf8"), "keep\n");
     assert.equal(await readFile(requestFile, "utf8"), "keep-request\n");
 
-    const symlinkConfig = defaultConfig(codexHome, "source");
+    const symlinkConfig = runtimeDefaultConfig(codexHome, "source");
     await symlink(unrelatedFile, symlinkConfig.eventWakeProbeResultFile);
     await assert.rejects(
       armEventWakeProbe(symlinkConfig, { runtimeRoot }),
@@ -455,7 +539,7 @@ test("probe paths are exact runtime files and unsafe targets are untouched", asy
 test("a dead old generation never blocks or deletes a newly armed generation", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-recovery-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   try {
     await mkdir(runtimeRoot, { recursive: true });
     const old = await armEventWakeProbe(config, {
@@ -518,7 +602,7 @@ test("a dead old generation never blocks or deletes a newly armed generation", a
 test("a contender rechecks the completed result after acquiring the generation claim", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-post-claim-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   let winnerClaim;
   try {
     await mkdir(runtimeRoot, { recursive: true });
@@ -563,7 +647,7 @@ test("a contender rechecks the completed result after acquiring the generation c
 test("opportunistic cleanup removes only expired orphan probe generations", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-cleanup-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   let oldClaim;
   let currentClaim;
   try {
@@ -640,7 +724,7 @@ test("opportunistic cleanup removes only expired orphan probe generations", asyn
 test("claim release verifies open-handle ownership before removing its generation path", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-owner-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   try {
     await mkdir(runtimeRoot, { recursive: true });
     const pending = await armEventWakeProbe(config, {
@@ -669,7 +753,7 @@ test("claim release verifies open-handle ownership before removing its generatio
 test("generation result publication rejects symlink targets without touching their destination", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-result-path-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   const unrelatedFile = path.join(codexHome, "unrelated.json");
   try {
     await mkdir(runtimeRoot, { recursive: true });
@@ -703,7 +787,7 @@ test("generation result publication rejects symlink targets without touching the
 test("old result publication cannot overwrite or unlink a newer generation result", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-publish-race-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   try {
     await mkdir(runtimeRoot, { recursive: true });
     const old = await armEventWakeProbe(config, {
@@ -757,7 +841,7 @@ test("old result publication cannot overwrite or unlink a newer generation resul
 test("doctor retries when request generation changes during its result snapshot", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-probe-read-race-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = runtimeDefaultConfig(codexHome, "source");
   try {
     await mkdir(runtimeRoot, { recursive: true });
     await armEventWakeProbe(config, {
@@ -813,7 +897,7 @@ test("doctor CLI arms a probe without claiming access to the Hook pipe", async (
   const doctorScript = path.resolve("scripts/doctor.mjs");
   try {
     await mkdir(runtime, { recursive: true });
-    await writeFile(path.join(runtime, "config.json"), `${JSON.stringify(defaultConfig(codexHome, "source"))}\n`);
+    await writeFile(path.join(runtime, "config.json"), `${JSON.stringify(runtimeDefaultConfig(codexHome, "source"))}\n`);
     const armed = JSON.parse((await execFileAsync(process.execPath, [
       doctorScript,
       "--codex-home", codexHome,

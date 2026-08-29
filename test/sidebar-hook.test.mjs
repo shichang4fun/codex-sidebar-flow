@@ -18,8 +18,14 @@ import {
   releaseEventWakeProbeClaim,
 } from "../scripts/doctor.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/setup.mjs";
+import { computeRuntimeFingerprint } from "../scripts/runtime-integrity.mjs";
 
 const execFileAsync = promisify(execFile);
+const TEST_RUNTIME_FINGERPRINT = await computeRuntimeFingerprint(path.resolve("."));
+
+function runtimeDefaultConfig(codexHome, installMode) {
+  return defaultConfig(codexHome, installMode, TEST_RUNTIME_FINGERPRINT);
+}
 
 async function withinTimeout(promise, timeoutMs, message) {
   let timer;
@@ -621,7 +627,7 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   const wakeCalls = [];
   try {
     await writeJsonAtomic(configPath, {
-      ...defaultConfig(codexHome, "plugin"),
+      ...runtimeDefaultConfig(codexHome, "plugin"),
       stateFile,
       hookLogFile,
       eventWake: {
@@ -680,7 +686,7 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   let released = false;
   try {
     await writeJsonAtomic(configPath, {
-      ...defaultConfig(codexHome, "plugin"),
+      ...runtimeDefaultConfig(codexHome, "plugin"),
       hookDeadlineMs: 20,
       hookLogFile,
       eventWake: {
@@ -740,7 +746,7 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   let sends = 0;
   try {
     await writeJsonAtomic(configPath, {
-      ...defaultConfig(codexHome, "plugin"),
+      ...runtimeDefaultConfig(codexHome, "plugin"),
       hookDeadlineMs: 20,
       hookLogFile,
       eventWake: {
@@ -816,7 +822,7 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   let closedHosts = 0;
   try {
     await writeJsonAtomic(configPath, {
-      ...defaultConfig(codexHome, "plugin"),
+      ...runtimeDefaultConfig(codexHome, "plugin"),
       hookDeadlineMs: 20,
       hookLogFile,
       eventWake: {
@@ -902,7 +908,7 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   process.env[INSTALL_MODE_ENV] = "plugin";
   try {
     await writeJsonAtomic(configPath, {
-      ...defaultConfig(codexHome, "plugin"),
+      ...runtimeDefaultConfig(codexHome, "plugin"),
       hookLogFile,
       eventWake: {
         ...eventWakeConfig,
@@ -956,7 +962,7 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   let wakeCalls = 0;
   try {
     await writeJsonAtomic(configPath, {
-      ...defaultConfig(codexHome, "plugin"),
+      ...runtimeDefaultConfig(codexHome, "plugin"),
       hookLogFile,
       eventWake: {
         ...eventWakeConfig,
@@ -1017,7 +1023,7 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
       {
         async loadConfig() {
           return {
-            ...defaultConfig(codexHome, "plugin"),
+            ...runtimeDefaultConfig(codexHome, "plugin"),
             installMode: "plugin",
             eventWake: {
               ...eventWakeConfig,
@@ -1108,7 +1114,7 @@ for (const [configuredMode, launcherMode] of [
   process.env[INSTALL_MODE_ENV] = launcherMode;
   let executed = false;
   try {
-    await writeJsonAtomic(configPath, defaultConfig(codexHome, configuredMode));
+    await writeJsonAtomic(configPath, runtimeDefaultConfig(codexHome, configuredMode));
     await assert.rejects(
       handleHook(
         { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
@@ -1135,6 +1141,50 @@ for (const [configuredMode, launcherMode] of [
   }
 }
 
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-runtime-binding-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let probeWrites = 0;
+  try {
+    await writeJsonAtomic(configPath, {
+      ...runtimeDefaultConfig(codexHome, "source"),
+      runtimeFingerprint: "a".repeat(64),
+    });
+    await assert.rejects(
+      handleHook(
+        { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+        configPath,
+        {
+          computeRuntimeFingerprint: async () => "b".repeat(64),
+          claimProbe: async () => ({ status: "claimed" }),
+          releaseProbeClaim: async () => true,
+          inspectCapability: async () => true,
+          writeProbeResult: async () => {
+            probeWrites += 1;
+            return true;
+          },
+          loadState: async () => ({ managedThreadIds: [] }),
+          updateManaged: async () => {},
+          execute: async () => ({
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+          }),
+        },
+      ),
+      (error) => error.code === "RUNTIME_FINGERPRINT_MISMATCH",
+    );
+    assert.equal(probeWrites, 0);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
 for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "missing"]]) {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), `sidebar-flow-hook-probe-${expectedStatus}-`));
   const runtime = path.join(codexHome, "sidebar-flow");
@@ -1145,7 +1195,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   let sendCalls = 0;
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,
@@ -1230,7 +1280,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   let connectionAttempts = 0;
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,
@@ -1312,7 +1362,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   let wakeCalls = 0;
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,
@@ -1387,7 +1437,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   let probeConnections = 0;
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,
@@ -1459,7 +1509,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   const unrelatedFile = path.join(codexHome, "unrelated.txt");
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,
@@ -1556,7 +1606,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   let wakeCalls = 0;
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,
@@ -1691,7 +1741,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   let wakeCalls = 0;
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,
@@ -1763,7 +1813,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
   let childrenSettled = Promise.resolve([]);
   try {
     const runtimeConfig = {
-      ...defaultConfig(codexHome, "source"),
+      ...runtimeDefaultConfig(codexHome, "source"),
       excludeThreadIds: ["organizer-thread"],
       eventWake: {
         enabled: true,

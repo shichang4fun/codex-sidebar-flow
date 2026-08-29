@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -15,9 +16,63 @@ import {
   setup,
 } from "../scripts/setup.mjs";
 import { parseUninstallArgs, uninstall } from "../scripts/uninstall.mjs";
+import {
+  armEventWakeProbe,
+  claimEventWakeProbe,
+  releaseEventWakeProbeClaim,
+  writeEventWakeProbeResult,
+} from "../scripts/doctor.mjs";
 
 const ownedCommand = `${HOOK_MARKER} node /repo/scripts/sidebar-hook.mjs`;
 const execFileAsync = promisify(execFile);
+const runtimeFiles = [
+  "scripts/doctor.mjs",
+  "scripts/event-wake.mjs",
+  "scripts/runtime-integrity.mjs",
+  "scripts/setup.mjs",
+  "scripts/sidebar-hook.mjs",
+  "scripts/sidebar-realtime.mjs",
+  "scripts/uninstall.mjs",
+];
+
+async function expectedRuntimeFingerprint(root) {
+  const hash = createHash("sha256");
+  for (const relativePath of runtimeFiles) {
+    hash.update(relativePath);
+    hash.update("\0");
+    hash.update(await readFile(path.join(root, relativePath)));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+async function copyRuntimeFixture(sourceRoot, targetRoot) {
+  for (const relativePath of runtimeFiles) {
+    await mkdir(path.dirname(path.join(targetRoot, relativePath)), { recursive: true });
+    await copyFile(path.join(sourceRoot, relativePath), path.join(targetRoot, relativePath));
+  }
+}
+
+async function recordPresentProbe(config, runtimeRoot) {
+  const pending = await armEventWakeProbe(config, {
+    runtimeRoot,
+    now: () => 1_000,
+    createProbeId: () => "probe-setup-present",
+  });
+  const claim = await claimEventWakeProbe(config, {
+    runtimeRoot,
+    now: () => 2_000,
+    createClaimId: () => "claim-setup-present",
+  });
+  assert.equal(claim.status, "claimed");
+  assert.equal(await writeEventWakeProbeResult(config, "present", {
+    runtimeRoot,
+    now: () => 2_500,
+    claim,
+  }), true);
+  await releaseEventWakeProbeClaim(config, claim, { runtimeRoot });
+  return pending;
+}
 
 test("setup and uninstall CLI parsers reject missing or flag-shaped path values", async () => {
   assert.throws(() => parseSetupArgs(["--codex-home"]), /requires a value/);
@@ -75,7 +130,7 @@ test("setup parses explicit event-wake configuration and rejects unsafe values",
 test("default configuration keeps event wake disabled with private runtime paths", () => {
   const codexHome = "/tmp/sidebar-flow-default-config";
   const runtime = path.join(codexHome, "sidebar-flow");
-  const config = defaultConfig(codexHome, "source");
+  const config = defaultConfig(codexHome, "source", "a".repeat(64));
   assert.deepEqual(config.eventWake, {
     enabled: false,
     organizerThreadId: null,
@@ -102,7 +157,7 @@ test("setup rejects invalid event-wake options before filesystem mutation", asyn
   }
 });
 
-test("setup upgrades configuration and explicitly enables event wake without losing unrelated values", async () => {
+test("setup requires a present probe bound to the exact mode and runtime before enabling event wake", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-event-config-"));
   const runtime = path.join(codexHome, "sidebar-flow");
   const configPath = path.join(runtime, "config.json");
@@ -112,8 +167,35 @@ test("setup upgrades configuration and explicitly enables event wake without los
       installMode: "source",
       sections: { inProgress: "Doing", forReview: "Review", forLater: "Later" },
       excludeThreadIds: ["keep-excluded"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "old-organizer",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
       unrelated: { keep: true },
     })}\n`, { mode: 0o600 });
+    const beforeRejectedEnable = await readFile(configPath, "utf8");
+
+    await assert.rejects(
+      setup({
+        codexHome,
+        enableEventWake: true,
+        organizerThreadId: "organizer-123",
+        organizerHostId: "remote-control:env_123",
+        eventWakeMaxPerMinute: 7,
+      }),
+      (error) => error.code === "CAPABILITY_PROBE_REQUIRED",
+    );
+    assert.equal(await readFile(configPath, "utf8"), beforeRejectedEnable);
+    await assert.rejects(stat(path.join(codexHome, "hooks.json")), (error) => error.code === "ENOENT");
+    await setup({ codexHome });
+    const upgraded = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(upgraded.eventWake.enabled, false);
+    assert.equal(upgraded.installMode, "source");
+    assert.match(upgraded.runtimeFingerprint, /^[a-f0-9]{64}$/);
+    assert.deepEqual(upgraded.unrelated, { keep: true });
+    await recordPresentProbe(upgraded, runtime);
 
     await setup({
       codexHome,
@@ -131,7 +213,7 @@ test("setup upgrades configuration and explicitly enables event wake without los
     });
     assert.deepEqual(once.excludeThreadIds, ["keep-excluded", "organizer-123"]);
     assert.deepEqual(once.unrelated, { keep: true });
-    assert.equal((await stat(path.join(runtime, "scripts", "event-wake.mjs"))).isFile(), true);
+    assert.equal((await stat(path.join(runtime, "releases", once.runtimeFingerprint, "scripts", "event-wake.mjs"))).isFile(), true);
 
     await setup({
       codexHome,
@@ -151,6 +233,77 @@ test("setup upgrades configuration and explicitly enables event wake without los
     assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), rerun);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("source setup publishes immutable fingerprinted releases before changing hooks", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-release-publish-"));
+  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-runtime-fixture-"));
+  const sourceRoot = path.resolve(".");
+  try {
+    await copyRuntimeFixture(sourceRoot, fixtureRoot);
+    const first = await setup({ codexHome }, { sourceRoot: fixtureRoot });
+    const firstHooks = await readFile(first.hooksPath, "utf8");
+    const firstFingerprint = await expectedRuntimeFingerprint(fixtureRoot);
+    assert.equal(first.runtimeFingerprint, firstFingerprint);
+    assert.equal(first.releaseRoot, path.join(codexHome, "sidebar-flow", "releases", firstFingerprint));
+    assert.equal((await lstat(first.releaseRoot)).isSymbolicLink(), false);
+    for (const relativePath of runtimeFiles) {
+      assert.equal((await stat(path.join(first.releaseRoot, relativePath))).isFile(), true);
+    }
+    assert.equal(firstHooks.includes(path.join(first.releaseRoot, "scripts", "sidebar-hook.mjs")), true);
+
+    await writeFile(path.join(fixtureRoot, "scripts", "sidebar-hook.mjs"), "\n// changed runtime\n", { flag: "a" });
+    let copies = 0;
+    await assert.rejects(
+      setup({ codexHome }, {
+        sourceRoot: fixtureRoot,
+        async copyRuntimeFile(source, destination) {
+          copies += 1;
+          if (copies === 3) throw new Error("injected staging failure");
+          await copyFile(source, destination);
+        },
+      }),
+      /injected staging failure/,
+    );
+    assert.equal(await readFile(first.hooksPath, "utf8"), firstHooks);
+    for (const relativePath of runtimeFiles) {
+      assert.equal((await stat(path.join(first.releaseRoot, relativePath))).isFile(), true);
+    }
+
+    const second = await setup({ codexHome }, { sourceRoot: fixtureRoot });
+    assert.notEqual(second.runtimeFingerprint, firstFingerprint);
+    assert.equal((await lstat(second.releaseRoot)).isSymbolicLink(), false);
+    assert.deepEqual(
+      (await readdir(path.join(codexHome, "sidebar-flow", "releases")))
+        .filter((name) => /^[a-f0-9]{64}$/.test(name))
+        .sort(),
+      [firstFingerprint, second.runtimeFingerprint].sort(),
+    );
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("source setup refuses a symlinked releases root", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-release-link-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-release-outside-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  try {
+    const fingerprint = await expectedRuntimeFingerprint(path.resolve("."));
+    await copyRuntimeFixture(path.resolve("."), path.join(outside, fingerprint));
+    const outsideBefore = await readdir(outside);
+    await mkdir(runtimeRoot, { recursive: true });
+    await symlink(outside, path.join(runtimeRoot, "releases"));
+    await assert.rejects(
+      setup({ codexHome }),
+      /release.*real directory|symlink/i,
+    );
+    assert.deepEqual(await readdir(outside), outsideBefore);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
@@ -228,12 +381,12 @@ test("setup preserves the original backup across reruns", async () => {
     const hooksPath = path.join(codexHome, "hooks.json");
     const original = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo original"}]}]}}\n';
     await writeFile(hooksPath, original, { mode: 0o600 });
-    await setup({ codexHome });
+    const installed = await setup({ codexHome });
     await setup({ codexHome });
     assert.equal(await readFile(`${hooksPath}.sidebar-flow.bak`, "utf8"), original);
     assert.equal((await stat(`${hooksPath}.sidebar-flow.bak`)).mode & 0o777, 0o600);
-    assert.equal((await stat(path.join(codexHome, "sidebar-flow", "scripts", "sidebar-hook.mjs"))).isFile(), true);
-    assert.equal((await stat(path.join(codexHome, "sidebar-flow", "scripts", "uninstall.mjs"))).isFile(), true);
+    assert.equal((await stat(path.join(installed.releaseRoot, "scripts", "sidebar-hook.mjs"))).isFile(), true);
+    assert.equal((await stat(path.join(installed.releaseRoot, "scripts", "uninstall.mjs"))).isFile(), true);
     assert.equal(JSON.parse(await readFile(path.join(codexHome, "sidebar-flow", "config.json"), "utf8")).installMode, "source");
   } finally {
     await rm(codexHome, { recursive: true, force: true });
@@ -384,6 +537,10 @@ test("normal uninstall keeps configuration and wake state while purge removes th
       await writeFile(path.join(runtime, name), "{}\n", { mode: 0o600 });
     }
     await uninstall({ codexHome, mode: "source" });
+    const retainedConfig = JSON.parse(await readFile(path.join(runtime, "config.json"), "utf8"));
+    assert.equal(retainedConfig.eventWake.enabled, false);
+    assert.equal(Object.hasOwn(retainedConfig, "installMode"), false);
+    assert.equal(Object.hasOwn(retainedConfig, "runtimeFingerprint"), false);
     assert.equal((await stat(path.join(runtime, "config.json"))).isFile(), true);
     assert.equal((await stat(path.join(runtime, "wake-state.json"))).isFile(), true);
     assert.equal((await stat(path.join(runtime, "event-wake-probe-request.json"))).isFile(), true);
@@ -400,8 +557,8 @@ test("normal uninstall keeps configuration and wake state while purge removes th
 test("installed uninstaller runs through the macOS /tmp symlink", async () => {
   const codexHome = await mkdtemp("/tmp/sidebar-flow-installed-cli-");
   try {
-    await setup({ codexHome, mode: "source" });
-    const installedUninstaller = path.join(codexHome, "sidebar-flow", "scripts", "uninstall.mjs");
+    const installed = await setup({ codexHome, mode: "source" });
+    const installedUninstaller = path.join(installed.releaseRoot, "scripts", "uninstall.mjs");
     await execFileAsync(process.execPath, [installedUninstaller, "--codex-home", codexHome, "--purge"]);
     await assert.rejects(stat(path.join(codexHome, "sidebar-flow")), /ENOENT/);
   } finally {

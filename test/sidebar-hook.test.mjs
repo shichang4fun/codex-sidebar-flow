@@ -558,6 +558,81 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
 }
 
 {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-wake-candispatch-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "plugin";
+  let currentTime = 0;
+  let sends = 0;
+  try {
+    await writeJsonAtomic(configPath, {
+      ...defaultConfig(codexHome, "plugin"),
+      hookDeadlineMs: 20,
+      hookLogFile,
+      eventWake: {
+        ...eventWakeConfig,
+        wakeStateFile: path.join(codexHome, "sidebar-flow", "wake.json"),
+      },
+    });
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        now: () => currentTime,
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+            },
+          };
+        },
+        async wake(_envelope, _wakeConfig, wakeTools, wakeDependencies = {}) {
+          currentTime = 25;
+          assert.equal(typeof wakeDependencies.signal?.aborted, "boolean");
+          assert.equal(wakeDependencies.canDispatch(), false);
+          assert.equal(typeof wakeTools.sendMessageToThread, "function");
+          return { status: "failed", errorCode: "wake_deadline" };
+        },
+        createAppTools(_configArg, options) {
+          const requiredTools = options?.requiredTools ?? [];
+          if (requiredTools.includes("send_message_to_thread")) {
+            return {
+              async sendMessageToThread() {
+                sends += 1;
+              },
+              reset() {},
+            };
+          }
+          return {
+            async listThreads() {
+              return snapshot();
+            },
+            reset() {},
+          };
+        },
+        async updateManaged() {},
+      },
+    );
+    const record = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
+    assert.equal(record.wakeStatus, "failed");
+    assert.equal(record.wakeErrorCode, "wake_deadline");
+    assert.equal(sends, 0);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-wake-failure-"));
   const configPath = path.join(codexHome, "sidebar-flow", "config.json");
   const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");

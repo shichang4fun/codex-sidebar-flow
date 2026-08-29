@@ -369,7 +369,10 @@ export async function handleHook(
     try {
       wakeOutcome = boundedWakeResult(
         await wakeBeforeDeadline(
-          (signal) => wake(result.eventEnvelope, config.eventWake, wakeTools, { signal }),
+          (signal) => wake(result.eventEnvelope, config.eventWake, wakeTools, {
+            signal,
+            canDispatch: () => now() < deadlineAt,
+          }),
           deadlineAt,
           now,
         ),

@@ -628,8 +628,10 @@ export function inspectInstallation({
     capabilityLevel = "error";
     capabilityMessage = "Lifecycle Hook tools/list is missing send_message_to_thread or no result exists";
   } else if (eventWakeProbe?.status === "pending") {
+    capabilityLevel = "error";
     capabilityMessage = "Capability probe is armed and pending the next lifecycle Hook";
   } else if (eventWakeProbe?.status === "expired") {
+    capabilityLevel = "error";
     capabilityMessage = "Capability probe expired before a lifecycle Hook consumed it";
   }
   checks.push({

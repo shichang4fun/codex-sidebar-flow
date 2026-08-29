@@ -205,6 +205,22 @@ test("doctor validates event-wake configuration and reports capability separatel
     eventWakeProbe: { status: "missing", checkedAt: 100 },
   });
   assert.equal(missing.find((check) => check.name === "event-wake-capability").level, "error");
+
+  const pending = inspectInstallation({
+    config: enabled,
+    mode: "plugin",
+    runtimeRoot: path.join(codexHome, "sidebar-flow"),
+    eventWakeProbe: { status: "pending", checkedAt: 100 },
+  });
+  assert.equal(pending.find((check) => check.name === "event-wake-capability").level, "error");
+
+  const expired = inspectInstallation({
+    config: enabled,
+    mode: "plugin",
+    runtimeRoot: path.join(codexHome, "sidebar-flow"),
+    eventWakeProbe: { status: "expired", checkedAt: 100 },
+  });
+  assert.equal(expired.find((check) => check.name === "event-wake-capability").level, "error");
 });
 
 test("doctor arms and reads bounded private event-wake probe state", async () => {

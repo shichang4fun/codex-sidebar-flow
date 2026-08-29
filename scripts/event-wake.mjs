@@ -1,4 +1,5 @@
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -9,6 +10,11 @@ const SAFE_ID_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
 const ONE_MINUTE_MS = 60_000;
 const LOCK_ATTEMPTS = 40;
 const LOCK_DELAY_MS = 10;
+const LOCK_DEAD_OWNER_GRACE_MS = 5_000;
+const LOCK_HARD_LEASE_MS = 60_000;
+const MAX_LOCK_OWNER_BYTES = 4_096;
+const LOCK_OWNER_KEYS = new Set(["pid", "createdAt", "expiresAt", "token"]);
+const LOCK_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function isRecord(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
@@ -111,18 +117,98 @@ function sameFileIdentity(left, right) {
 }
 
 async function unlinkOwnedLock(lockPath, handle) {
-  if (handle == null) return;
+  if (handle == null) return false;
   const [ownedStat, currentStat] = await Promise.all([
     handle.stat().catch(() => null),
-    stat(lockPath).catch((error) => {
+    lstat(lockPath).catch((error) => {
       if (error.code === "ENOENT") return null;
       throw error;
     }),
   ]);
-  if (!sameFileIdentity(ownedStat, currentStat)) return;
+  if (!sameFileIdentity(ownedStat, currentStat)) return false;
   await unlink(lockPath).catch((error) => {
     if (error.code !== "ENOENT") throw error;
   });
+  return true;
+}
+
+function normalizeLockOwner(value) {
+  if (!isRecord(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== LOCK_OWNER_KEYS.size || keys.some((key) => !LOCK_OWNER_KEYS.has(key))) {
+    return null;
+  }
+  if (!Number.isSafeInteger(value.pid) || value.pid <= 0) return null;
+  if (!Number.isSafeInteger(value.createdAt) || value.createdAt < 0) return null;
+  if (!Number.isSafeInteger(value.expiresAt)) return null;
+  if (value.expiresAt !== value.createdAt + LOCK_HARD_LEASE_MS) return null;
+  if (typeof value.token !== "string" || !LOCK_TOKEN_PATTERN.test(value.token)) return null;
+  return value;
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function readBoundedLockOwner(handle, fileStat) {
+  if (!fileStat.isFile() || fileStat.size > MAX_LOCK_OWNER_BYTES) return null;
+  const buffer = Buffer.alloc(MAX_LOCK_OWNER_BYTES + 1);
+  const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+  if (bytesRead > MAX_LOCK_OWNER_BYTES) return null;
+  try {
+    return normalizeLockOwner(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
+  } catch {
+    return null;
+  }
+}
+
+async function reclaimStaleLock(
+  lockPath,
+  {
+    now,
+    isProcessAlive,
+    onBeforeReclaim,
+  },
+) {
+  let handle;
+  try {
+    handle = await open(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    return false;
+  }
+
+  try {
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile()) return false;
+    const currentTime = now();
+    const owner = await readBoundedLockOwner(handle, fileStat);
+    let stale = currentTime - fileStat.mtimeMs >= LOCK_HARD_LEASE_MS;
+    if (owner != null) {
+      stale = currentTime >= owner.expiresAt;
+      if (!stale && currentTime - owner.createdAt >= LOCK_DEAD_OWNER_GRACE_MS) {
+        try {
+          stale = isProcessAlive(owner.pid) === false;
+        } catch {
+          stale = false;
+        }
+      }
+    }
+    if (!stale) return false;
+    if (typeof onBeforeReclaim === "function") {
+      await onBeforeReclaim({ lockPath, owner });
+    }
+    return await unlinkOwnedLock(lockPath, handle);
+  } catch {
+    return false;
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 async function withFileLock(
@@ -134,17 +220,27 @@ async function withFileLock(
     now = Date.now,
     createToken = randomUUID,
     writeOwnerRecord = null,
+    isProcessAlive = processIsAlive,
+    onBeforeReclaim = null,
     onBeforeRelease = null,
   } = {},
 ) {
   await mkdir(path.dirname(lockPath), { recursive: true });
   let handle = null;
   let owner = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  let blockedAttempts = 0;
+  let recoveryAttempts = 0;
+  while (handle == null) {
     try {
       handle = await open(lockPath, "wx", 0o600);
       try {
-        owner = { pid: process.pid, createdAt: now(), token: createToken() };
+        const createdAt = now();
+        owner = {
+          pid: process.pid,
+          createdAt,
+          expiresAt: createdAt + LOCK_HARD_LEASE_MS,
+          token: createToken(),
+        };
         const ownerRecord = `${JSON.stringify(owner)}\n`;
         if (typeof writeOwnerRecord === "function") {
           await writeOwnerRecord({ handle, owner, ownerRecord, lockPath });
@@ -161,7 +257,17 @@ async function withFileLock(
       break;
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
-      if (attempt + 1 >= attempts) throw codedError("LOCK_UNAVAILABLE");
+      if (recoveryAttempts < attempts) {
+        recoveryAttempts += 1;
+        const reclaimed = await reclaimStaleLock(lockPath, {
+          now,
+          isProcessAlive,
+          onBeforeReclaim,
+        });
+        if (reclaimed) continue;
+      }
+      blockedAttempts += 1;
+      if (blockedAttempts >= attempts) throw codedError("LOCK_UNAVAILABLE");
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }

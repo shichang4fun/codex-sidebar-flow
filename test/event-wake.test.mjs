@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -215,6 +227,267 @@ test("acquireWakePermit fails closed on malformed timestamp entries", async () =
   }
 });
 
+test("acquireWakePermit writes a bounded lease into the lock owner record", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-lock-lease-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  let observedOwner = null;
+
+  try {
+    const result = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        writeOwnerRecord: async ({ handle, owner, ownerRecord }) => {
+          observedOwner = owner;
+          await handle.writeFile(ownerRecord);
+        },
+      },
+    );
+
+    assert.deepEqual(result, { ok: true });
+    assert.equal(observedOwner.expiresAt, 160_000);
+    assert.deepEqual(Object.keys(observedOwner).sort(), ["createdAt", "expiresAt", "pid", "token"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit reclaims a dead owner only after the grace period", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-dead-lock-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+  const owner = {
+    pid: 4242,
+    createdAt: 100_000,
+    expiresAt: 160_000,
+    token: "00000000-0000-4000-8000-000000000001",
+  };
+
+  try {
+    await writeFile(lockFile, `${JSON.stringify(owner)}\n`, { encoding: "utf8", mode: 0o600 });
+    const fresh = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 2 },
+      { now: () => 104_999, attempts: 1, delayMs: 0, isProcessAlive: () => false },
+    );
+    assert.deepEqual(fresh, { ok: false, errorCode: "lock_unavailable" });
+    assert.deepEqual(JSON.parse(await readFile(lockFile, "utf8")), owner);
+
+    const recovered = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 2 },
+      { now: () => 105_000, attempts: 1, delayMs: 0, isProcessAlive: () => false },
+    );
+    assert.deepEqual(recovered, { ok: true });
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), { timestamps: [105_000] });
+    await assert.rejects(access(lockFile), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit reclaims an owner after the hard lease even if its pid is alive", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-expired-lock-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+
+  try {
+    await writeFile(
+      lockFile,
+      `${JSON.stringify({
+        pid: process.pid,
+        createdAt: 100_000,
+        expiresAt: 160_000,
+        token: "00000000-0000-4000-8000-000000000002",
+      })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    const recovered = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      { now: () => 160_000, attempts: 1, delayMs: 0, isProcessAlive: () => true },
+    );
+
+    assert.deepEqual(recovered, { ok: true });
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), { timestamps: [160_000] });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit reclaims malformed owner records only after the hard lease", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-malformed-lock-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+  const currentTime = Date.now();
+
+  try {
+    await writeFile(lockFile, "{\n", { encoding: "utf8", mode: 0o600 });
+    const fresh = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 2 },
+      { now: () => currentTime, attempts: 1, delayMs: 0 },
+    );
+    assert.deepEqual(fresh, { ok: false, errorCode: "lock_unavailable" });
+
+    const oldTime = new Date(currentTime - 60_001);
+    await utimes(lockFile, oldTime, oldTime);
+    const recovered = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 2 },
+      { now: () => currentTime, attempts: 1, delayMs: 0 },
+    );
+    assert.deepEqual(recovered, { ok: true });
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), { timestamps: [currentTime] });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit treats oversized and extra-field owner records as malformed", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-invalid-lock-schema-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+  const currentTime = Date.now();
+
+  try {
+    await writeFile(
+      lockFile,
+      `${JSON.stringify({
+        pid: 4242,
+        createdAt: currentTime - 5_000,
+        expiresAt: currentTime + 55_000,
+        token: "00000000-0000-4000-8000-000000000003",
+        extra: true,
+      })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    const strictSchema = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 2 },
+      { now: () => currentTime, attempts: 1, delayMs: 0, isProcessAlive: () => false },
+    );
+    assert.deepEqual(strictSchema, { ok: false, errorCode: "lock_unavailable" });
+
+    await writeFile(lockFile, "x".repeat(4_097), { encoding: "utf8", mode: 0o600 });
+    const oldTime = new Date(currentTime - 60_001);
+    await utimes(lockFile, oldTime, oldTime);
+    const recovered = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 2 },
+      { now: () => currentTime, attempts: 1, delayMs: 0 },
+    );
+    assert.deepEqual(recovered, { ok: true });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit never follows or removes a stale lock symlink", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-lock-symlink-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+  const targetFile = path.join(directory, "target.json");
+  const currentTime = Date.now();
+
+  try {
+    await writeFile(targetFile, "stale target\n", { encoding: "utf8", mode: 0o600 });
+    const oldTime = new Date(currentTime - 60_001);
+    await utimes(targetFile, oldTime, oldTime);
+    await symlink(targetFile, lockFile);
+
+    const result = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      { now: () => currentTime, attempts: 1, delayMs: 0 },
+    );
+    assert.deepEqual(result, { ok: false, errorCode: "lock_unavailable" });
+    assert.equal((await lstat(lockFile)).isSymbolicLink(), true);
+    assert.equal(await readFile(targetFile, "utf8"), "stale target\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit never removes a replacement inode during stale-lock recovery", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-stale-lock-replacement-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+
+  try {
+    await writeFile(
+      lockFile,
+      `${JSON.stringify({
+        pid: process.pid,
+        createdAt: 100_000,
+        expiresAt: 160_000,
+        token: "00000000-0000-4000-8000-000000000004",
+      })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    const result = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 160_000,
+        attempts: 1,
+        delayMs: 0,
+        isProcessAlive: () => true,
+        onBeforeReclaim: async () => {
+          await rm(lockFile, { force: true });
+          await writeFile(lockFile, "replacement\n", { encoding: "utf8", mode: 0o600 });
+        },
+      },
+    );
+
+    assert.deepEqual(result, { ok: false, errorCode: "lock_unavailable" });
+    assert.equal(await readFile(lockFile, "utf8"), "replacement\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit never removes a replacement symlink to the stale lock inode", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-stale-lock-link-replacement-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+  const movedLockFile = path.join(directory, "moved.lock");
+
+  try {
+    await writeFile(
+      lockFile,
+      `${JSON.stringify({
+        pid: process.pid,
+        createdAt: 100_000,
+        expiresAt: 160_000,
+        token: "00000000-0000-4000-8000-000000000005",
+      })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    const result = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 160_000,
+        attempts: 1,
+        delayMs: 0,
+        isProcessAlive: () => true,
+        onBeforeReclaim: async () => {
+          await rename(lockFile, movedLockFile);
+          await symlink(movedLockFile, lockFile);
+        },
+      },
+    );
+
+    assert.deepEqual(result, { ok: false, errorCode: "lock_unavailable" });
+    assert.equal((await lstat(lockFile)).isSymbolicLink(), true);
+    assert.match(await readFile(movedLockFile, "utf8"), /00000000-0000-4000-8000-000000000005/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("acquireWakePermit never removes a replacement lock during release", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-lock-replacement-"));
   const stateFile = path.join(directory, "wake-state.json");
@@ -419,6 +692,38 @@ test("acquireWakePermit enforces the cap under concurrent callers", async () => 
       [{ ok: false, errorCode: "rate_limited" }, { ok: true }],
     );
     assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).timestamps, [123456]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("wakeOrganizer sends repeated identical envelopes when the rate limit allows both", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-no-semantic-dedupe-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const sent = [];
+  const config = makeConfig({ wakeStateFile: stateFile, maxPerMinute: 2 });
+  const envelope = makeEnvelope({ event: "Stop" });
+
+  try {
+    const first = await wakeOrganizer(
+      envelope,
+      config,
+      { sendMessageToThread: async (args) => sent.push(args) },
+      { now: () => 100_000 },
+    );
+    const second = await wakeOrganizer(
+      envelope,
+      config,
+      { sendMessageToThread: async (args) => sent.push(args) },
+      { now: () => 100_100 },
+    );
+
+    assert.deepEqual(first, { status: "sent" });
+    assert.deepEqual(second, { status: "sent" });
+    assert.equal(sent.length, 2);
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), {
+      timestamps: [100_000, 100_100],
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

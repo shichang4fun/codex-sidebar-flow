@@ -8,7 +8,7 @@ import {
   isRetryableHookError,
   managedMutationFromLifecycle,
 } from "../scripts/sidebar-hook.mjs";
-import { INSTALL_MODE_ENV } from "../scripts/setup.mjs";
+import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/setup.mjs";
 
 const config = { excludeThreadIds: ["automation"] };
 
@@ -204,6 +204,43 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     );
     const bootstrapped = JSON.parse(await readFile(configPath, "utf8"));
     assert.equal(bootstrapped.installMode, "plugin");
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+for (const [configuredMode, launcherMode] of [
+  ["source", "plugin"],
+  ["plugin", "source"],
+]) {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-mode-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = launcherMode;
+  let executed = false;
+  try {
+    await writeJsonAtomic(configPath, defaultConfig(codexHome, configuredMode));
+    await assert.rejects(
+      handleHook(
+        { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+        configPath,
+        {
+          async execute() {
+            executed = true;
+            return {
+              attempts: 1,
+              managedAdds: [],
+              managedRemoves: [],
+              observedIdentities: [],
+            };
+          },
+        },
+      ),
+      (error) => error.code === "INSTALL_MODE_MISMATCH",
+    );
+    assert.equal(executed, false, `${configuredMode} config must reject ${launcherMode} Hook`);
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;

@@ -13,6 +13,11 @@ export async function uninstall({
   mode = "source",
 } = {}) {
   if (!new Set(["source", "plugin"]).has(mode)) throw new Error(`Unknown uninstall mode: ${mode}`);
+  if (!path.isAbsolute(codexHome)) {
+    const error = new Error(`CODEX_HOME must be an absolute path: ${codexHome}`);
+    error.code = "INVALID_CODEX_HOME";
+    throw error;
+  }
   const hooksPath = path.join(codexHome, "hooks.json");
   const configPath = path.join(codexHome, "sidebar-flow", "config.json");
   const legacyHookPath = path.join(codexHome, "sidebar-flow", "scripts", "sidebar-hook.mjs");
@@ -48,12 +53,38 @@ export async function uninstall({
   return { mode, hooksPath, purged: purge };
 }
 
+function optionValue(argv, index, option) {
+  const value = argv[index + 1];
+  if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
+    const error = new Error(`${option} requires a value`);
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
+  return value;
+}
+
+export function parseUninstallArgs(argv) {
+  const result = { purge: false, mode: "source" };
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--purge") result.purge = true;
+    else if (argv[index] === "--plugin") result.mode = "plugin";
+    else if (argv[index] === "--codex-home") {
+      result.codexHome = optionValue(argv, index, "--codex-home");
+      index += 1;
+    } else throw new Error(`Unknown argument: ${argv[index]}`);
+  }
+  return result;
+}
+
 if (process.argv[1] != null && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
-  const purge = process.argv.includes("--purge");
-  const mode = process.argv.includes("--plugin") ? "plugin" : "source";
-  const homeIndex = process.argv.indexOf("--codex-home");
-  const codexHome = homeIndex === -1 ? undefined : process.argv[homeIndex + 1];
-  uninstall({ codexHome, purge, mode })
+  let options;
+  try {
+    options = parseUninstallArgs(process.argv.slice(2));
+  } catch (error) {
+    process.stderr.write(`uninstall failed: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+  if (options != null) uninstall(options)
     .then((result) => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .catch((error) => {
       process.stderr.write(`uninstall failed: ${error.message}\n`);

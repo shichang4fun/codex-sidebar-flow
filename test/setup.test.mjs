@@ -9,13 +9,41 @@ import {
   findUnmarkedSidebarHookPaths,
   HOOK_MARKER,
   installHooks,
+  parseSetupArgs,
   removeHooks,
   setup,
 } from "../scripts/setup.mjs";
-import { uninstall } from "../scripts/uninstall.mjs";
+import { parseUninstallArgs, uninstall } from "../scripts/uninstall.mjs";
 
 const ownedCommand = `${HOOK_MARKER} node /repo/scripts/sidebar-hook.mjs`;
 const execFileAsync = promisify(execFile);
+
+test("setup and uninstall CLI parsers reject missing or flag-shaped path values", async () => {
+  assert.throws(() => parseSetupArgs(["--codex-home"]), /requires a value/);
+  assert.throws(() => parseSetupArgs(["--codex-home", "--dry-run"]), /requires a value/);
+  assert.throws(() => parseSetupArgs(["--migrate-legacy-hook"]), /requires a value/);
+  assert.throws(() => parseUninstallArgs(["--codex-home"]), /requires a value/);
+  assert.throws(() => parseUninstallArgs(["--codex-home", "--purge"]), /requires a value/);
+  await assert.rejects(
+    setup({ codexHome: "relative-home", dryRun: true }),
+    (error) => error.code === "INVALID_CODEX_HOME",
+  );
+  await assert.rejects(
+    uninstall({ codexHome: "relative-home" }),
+    (error) => error.code === "INVALID_CODEX_HOME",
+  );
+
+  const setupScript = path.resolve("scripts/setup.mjs");
+  const uninstallScript = path.resolve("scripts/uninstall.mjs");
+  await assert.rejects(
+    execFileAsync(process.execPath, [setupScript, "--dry-run", "--codex-home"]),
+    (error) => error.code === 1 && /requires a value/.test(error.stderr),
+  );
+  await assert.rejects(
+    execFileAsync(process.execPath, [uninstallScript, "--codex-home"]),
+    (error) => error.code === 1 && /requires a value/.test(error.stderr),
+  );
+});
 
 test("setup is idempotent and preserves unrelated hooks", () => {
   const existing = {

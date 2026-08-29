@@ -17,4 +17,6 @@ All notable changes to this project are documented here.
 - Split source and plugin installation modes so only one Hook set is active.
 - Fail closed on unowned legacy sidebar Hooks and support exact-path source migration.
 - Preserve plugin install mode during first-event configuration bootstrap.
+- Reject source/plugin mode mismatches again at Hook runtime.
+- Reject missing, flag-shaped, or relative `--codex-home` values before any filesystem access.
 - Serialize managed-state writes so completed-task removals cannot be revived by stale disk state.

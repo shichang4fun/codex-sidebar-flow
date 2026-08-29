@@ -199,18 +199,27 @@ export async function handleHook(
   { execute = executeHookEvent } = {},
 ) {
   if (!["UserPromptSubmit", "Stop"].includes(input?.hook_event_name)) return null;
+  const installMode = process.env[INSTALL_MODE_ENV];
+  if (!new Set(["source", "plugin"]).has(installMode)) {
+    const error = new Error(`Missing or invalid ${INSTALL_MODE_ENV}`);
+    error.code = "INSTALL_MODE_MISSING";
+    throw error;
+  }
   let config;
   try {
     config = await loadConfig(configPath);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     const codexHome = path.dirname(path.dirname(configPath));
-    const installMode = process.env[INSTALL_MODE_ENV];
-    if (!new Set(["source", "plugin"]).has(installMode)) {
-      throw new Error(`Missing ${INSTALL_MODE_ENV} for configuration bootstrap`);
-    }
     await writeJsonAtomic(configPath, defaultConfig(codexHome, installMode));
     config = await loadConfig(configPath);
+  }
+  if (config.installMode !== installMode) {
+    const error = new Error(
+      `Hook mode ${installMode} does not match configured mode ${config.installMode ?? "unrecorded"}`,
+    );
+    error.code = "INSTALL_MODE_MISMATCH";
+    throw error;
   }
   config.actorThreadId = input.session_id;
   config.quiet = true;

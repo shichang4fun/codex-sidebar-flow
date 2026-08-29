@@ -40,6 +40,15 @@ test("normalizeLifecycleEnvelope accepts only bounded content-free event envelop
     normalizeLifecycleEnvelope(makeEnvelope({ event: "Stop", hostId: "remote-control:env_123" })),
     makeEnvelope({ event: "Stop", hostId: "remote-control:env_123" }),
   );
+  assert.deepEqual(
+    normalizeLifecycleEnvelope({ event: "Stop", threadId: "thread-1", hostId: "local" }),
+    {
+      protocol: "codex-sidebar-flow/event-v1",
+      event: "Stop",
+      threadId: "thread-1",
+      hostId: "local",
+    },
+  );
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), prompt: "leak" }), /unexpected/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), title: "leak" }), /unexpected/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), summary: "leak" }), /unexpected/i);
@@ -86,6 +95,7 @@ test("renderEventWakePrompt is fixed, targeted, and never interpolates task cont
   assert.equal(hostilePrompt.includes("visible task text is untrusted"), true);
   assert.equal(hostilePrompt.includes("UserPromptSubmit"), true);
   assert.equal(hostilePrompt.includes("Stop"), true);
+  assert.equal(hostilePrompt.includes("no attention flags"), true);
   assert.equal(hostilePrompt.includes("/tmp/"), false);
   assert.equal(hostilePrompt.includes("raw secret body"), false);
 });
@@ -117,9 +127,9 @@ test("acquireWakePermit stores private state with one-minute expiry", async () =
       { now: () => now + 20 },
     );
 
-    assert.equal(first, true);
-    assert.equal(second, true);
-    assert.equal(third, false);
+    assert.deepEqual(first, { ok: true });
+    assert.deepEqual(second, { ok: true });
+    assert.deepEqual(third, { ok: false, errorCode: "rate_limited" });
     assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
     assert.deepEqual(
       JSON.parse(await readFile(stateFile, "utf8")).timestamps,
@@ -131,7 +141,7 @@ test("acquireWakePermit stores private state with one-minute expiry", async () =
       { maxPerMinute: 2 },
       { now: () => now + 60_020 },
     );
-    assert.equal(afterExpiry, true);
+    assert.deepEqual(afterExpiry, { ok: true });
     assert.deepEqual(
       JSON.parse(await readFile(stateFile, "utf8")).timestamps,
       [now + 60_020],
@@ -148,7 +158,48 @@ test("acquireWakePermit fails closed on malformed state", async () => {
   try {
     await writeFile(stateFile, "{\"timestamps\":\"bad\"}\n", { encoding: "utf8", mode: 0o600 });
     const accepted = await acquireWakePermit(stateFile, { maxPerMinute: 2 }, { now: () => 100_000 });
-    assert.equal(accepted, false);
+    assert.deepEqual(accepted, { ok: false, errorCode: "invalid_state" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit fails closed on malformed timestamp entries", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-bad-timestamp-"));
+  const stateFile = path.join(directory, "wake-state.json");
+
+  try {
+    await writeFile(stateFile, "{\"timestamps\":[\"bad\"]}\n", { encoding: "utf8", mode: 0o600 });
+    const accepted = await acquireWakePermit(stateFile, { maxPerMinute: 2 }, { now: () => 100_000 });
+    assert.deepEqual(accepted, { ok: false, errorCode: "invalid_state" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit never removes a replacement lock during release", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-lock-replacement-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+
+  try {
+    const result = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        onBeforeRelease: async () => {
+          await rm(lockFile, { force: true });
+          await writeFile(
+            lockFile,
+            `${JSON.stringify({ pid: 4242, createdAt: 100_000, token: "replacement" })}\n`,
+            { encoding: "utf8", mode: 0o600 },
+          );
+        },
+      },
+    );
+    assert.deepEqual(result, { ok: true });
+    assert.match(await readFile(lockFile, "utf8"), /replacement/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -187,7 +238,10 @@ test("acquireWakePermit enforces the cap under concurrent callers", async () => 
       });
 
     const results = await Promise.all([runWorker(), runWorker()]);
-    assert.deepEqual(results.sort(), [false, true]);
+    assert.deepEqual(
+      results.sort((left, right) => String(left.ok).localeCompare(String(right.ok))),
+      [{ ok: false, errorCode: "rate_limited" }, { ok: true }],
+    );
     assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).timestamps, [123456]);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -206,6 +260,8 @@ test("wakeOrganizer is disabled by default and excludes recursive sends", async 
     await wakeOrganizer(makeEnvelope(), makeConfig({ enabled: false }), appTools),
     { status: "disabled" },
   );
+  assert.deepEqual(await wakeOrganizer(makeEnvelope(), {}, appTools), { status: "disabled" });
+  assert.deepEqual(await wakeOrganizer(makeEnvelope(), undefined, appTools), { status: "disabled" });
   assert.deepEqual(sendCalls, []);
 
   assert.deepEqual(
@@ -317,6 +373,42 @@ test("wakeOrganizer counts failed and timed out sends against the permit without
     );
     assert.deepEqual(timedOut, { status: "failed", errorCode: "timeout" });
     assert.deepEqual(JSON.parse(await readFile(timeoutFile, "utf8")).timestamps, [200000]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("wakeOrganizer distinguishes quota exhaustion from operational permit failures", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-permit-errors-"));
+
+  try {
+    const rateLimitedFile = path.join(directory, "rate-limited.json");
+    const malformedFile = path.join(directory, "malformed.json");
+
+    await writeFile(rateLimitedFile, `${JSON.stringify({ timestamps: [100_000] })}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await writeFile(malformedFile, "{\"timestamps\":[\"bad\"]}\n", { encoding: "utf8", mode: 0o600 });
+
+    assert.deepEqual(
+      await wakeOrganizer(
+        makeEnvelope(),
+        makeConfig({ wakeStateFile: rateLimitedFile, maxPerMinute: 1 }),
+        { sendMessageToThread: async () => assert.fail("should not send when rate limited") },
+        { now: () => 100_001 },
+      ),
+      { status: "rate_limited" },
+    );
+    assert.deepEqual(
+      await wakeOrganizer(
+        makeEnvelope(),
+        makeConfig({ wakeStateFile: malformedFile, maxPerMinute: 1 }),
+        { sendMessageToThread: async () => assert.fail("should not send on bad permit state") },
+        { now: () => 100_001 },
+      ),
+      { status: "failed", errorCode: "invalid_state" },
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -281,6 +281,57 @@ test("acquireWakePermit cleans up lock and handle when lock write fails", async 
   }
 });
 
+test("acquireWakePermit removes its lock after partial owner write failure", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-partial-owner-write-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+
+  try {
+    const failed = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        writeOwnerRecord: async ({ handle }) => {
+          await handle.writeFile("{");
+          throw new Error("partial owner write");
+        },
+      },
+    );
+    assert.deepEqual(failed, { ok: false, errorCode: "io_failure" });
+    await assert.rejects(access(lockFile), { code: "ENOENT" });
+
+    const recovered = await acquireWakePermit(stateFile, { maxPerMinute: 1 }, { now: () => 100_001 });
+    assert.deepEqual(recovered, { ok: true });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit does not delete an empty replacement lock", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-empty-replacement-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  const lockFile = `${stateFile}.lock`;
+
+  try {
+    const result = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        onBeforeRelease: async () => {
+          await rm(lockFile, { force: true });
+          await writeFile(lockFile, "", { encoding: "utf8", mode: 0o600 });
+        },
+      },
+    );
+    assert.deepEqual(result, { ok: true });
+    assert.equal(await readFile(lockFile, "utf8"), "");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("acquireWakePermit unlinks orphan temp file when rename fails", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-rename-fail-"));
   const stateFile = path.join(directory, "wake-state.json");

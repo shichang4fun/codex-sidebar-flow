@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -102,6 +102,25 @@ function codedError(code) {
   return error;
 }
 
+function sameFileIdentity(left, right) {
+  return left != null && right != null && left.dev === right.dev && left.ino === right.ino;
+}
+
+async function unlinkOwnedLock(lockPath, handle) {
+  if (handle == null) return;
+  const [ownedStat, currentStat] = await Promise.all([
+    handle.stat().catch(() => null),
+    stat(lockPath).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }),
+  ]);
+  if (!sameFileIdentity(ownedStat, currentStat)) return;
+  await unlink(lockPath).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+}
+
 async function withFileLock(
   lockPath,
   task,
@@ -129,18 +148,9 @@ async function withFileLock(
           await handle.writeFile(ownerRecord);
         }
       } catch (error) {
-        const ownedRecord = owner == null ? null : `${JSON.stringify(owner)}\n`;
+        await unlinkOwnedLock(lockPath, handle);
         await handle.close().catch(() => {});
         handle = null;
-        const current = await readFile(lockPath, "utf8").catch((readError) => {
-          if (readError.code === "ENOENT") return null;
-          throw readError;
-        });
-        if (current == null || current === "" || current === ownedRecord) {
-          await unlink(lockPath).catch((unlinkError) => {
-            if (unlinkError.code !== "ENOENT") throw unlinkError;
-          });
-        }
         owner = null;
         throw error;
       }
@@ -157,18 +167,8 @@ async function withFileLock(
     if (typeof onBeforeRelease === "function") {
       await onBeforeRelease({ lockPath, owner });
     }
+    await unlinkOwnedLock(lockPath, handle);
     await handle?.close().catch(() => {});
-    if (owner != null) {
-      const current = await readFile(lockPath, "utf8").catch((error) => {
-        if (error.code === "ENOENT") return null;
-        throw error;
-      });
-      if (current === `${JSON.stringify(owner)}\n`) {
-        await unlink(lockPath).catch((error) => {
-          if (error.code !== "ENOENT") throw error;
-        });
-      }
-    }
   }
 }
 

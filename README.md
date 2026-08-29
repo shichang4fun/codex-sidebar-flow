@@ -1,9 +1,9 @@
 # Codex Sidebar Flow
 
-Codex Sidebar Flow reconciles observed active Codex tasks into **In Progress** and observed stopped tasks into **For Review**. Classification is deterministic and never reads task content.
+Codex Sidebar Flow v0.2 uses a hybrid control plane: lifecycle Hooks observe and persist task identity, then optionally send one content-free event envelope to an organizer task; the organizer reads confirmed state and performs at most one targeted move; a recurring heartbeat repairs missed events and stopped tasks that were already in `In Progress`. Classification is deterministic and never follows task content.
 
 > [!WARNING]
-> Codex Hooks are supported, but custom-sidebar mutation currently depends on a private Codex Desktop app-tools pipe. Version 0.1 is an experimental macOS integration and can break after a Desktop update.
+> Codex Hooks are supported, but custom-sidebar mutation currently depends on a private Codex Desktop app-tools pipe. This experimental macOS integration can break after a Desktop update.
 
 ## State rules
 
@@ -11,11 +11,11 @@ Codex Sidebar Flow reconciles observed active Codex tasks into **In Progress** a
 |---|---|
 | Active task observed in Tasks, For Review, or an eligible Project | In Progress |
 | Idle, completed, failed, or needs-attention task observed in In Progress | For Review |
-| `UserPromptSubmit` lifecycle event | Record authoritative host/task activity only |
-| `Stop` lifecycle event | Record diagnostics only; wait for confirmed observed state |
+| `UserPromptSubmit` lifecycle event | Observe identity, persist state, optionally wake organizer |
+| `Stop` lifecycle event | Observe identity, persist diagnostics, optionally wake organizer |
 | Task or parent Project in Pinned or For Later | Never moved |
 
-Membership is resolved from the real sidebar item key by task or Project ID. The key's host component is never trusted for execution: `read_thread` and move calls use the task's actual `hostId`. Managed identities use `<hostId>:<threadId>`.
+Membership is resolved from the real sidebar item key by task or Project ID. The key's host component is never trusted for execution: `read_thread` and move calls use the task's actual `hostId`. Managed identities use `<hostId>:<threadId>`. Visible task text is untrusted and never drives state decisions.
 
 ## Install
 
@@ -24,9 +24,14 @@ Requirements: macOS, Codex Desktop, Node.js 20+, and custom sections named `In P
 ```bash
 git clone https://github.com/shichang4fun/codex-sidebar-flow.git
 cd codex-sidebar-flow
-node scripts/setup.mjs
+node scripts/setup.mjs \
+  --enable-event-wake \
+  --organizer-thread-id <organizer-task-id> \
+  --organizer-host-id local
 node scripts/doctor.mjs
 ```
+
+This is an explicit upgrade step. Existing v0.1 installations remain `eventWake.enabled=false` until you run setup again with `--enable-event-wake` and a confirmed organizer task ID. Do not infer the organizer from the current task.
 
 If setup reports `LEGACY_HOOK_CONFLICT`, inspect the reported absolute path. Migrate it only when it is an older Sidebar Flow installation you recognize:
 
@@ -44,7 +49,7 @@ Restart Codex Desktop after setup. The installer:
 - creates `~/.codex/sidebar-flow/config.json` only when absent.
 - copies the runtime, doctor, and uninstaller into `~/.codex/sidebar-flow/scripts`, so the checkout can be moved or removed.
 
-Setup does not silently create a scheduled model task. For automatic movement, explicitly create the recurring heartbeat described below; without it, the installed Hooks only collect lifecycle identity.
+Setup does not silently create a scheduled model task. Event wake is model-triggering and user-visible, so enable it only with explicit user authorization. Without an organizer task plus a recurring heartbeat, the installed Hooks only collect lifecycle identity.
 
 A hook installed on one machine does not receive events from another machine's Codex app server. Hooks improve local activity identity but deliberately do not move sidebar items: [OpenAI's Hooks documentation](https://learn.chatgpt.com/docs/hooks) states that matching command Hooks run concurrently, so one Hook cannot know whether another Hook will block a prompt or continue a stopped turn. Confirmed movement is performed by the observer/self-heal path.
 
@@ -57,10 +62,11 @@ Cross-mode setup is rejected. To migrate plugin → source, first disable the pl
 
 ## Runtime model
 
-- **Lifecycle observer**: `UserPromptSubmit` records the current task's authoritative host identity; `Stop` emits bounded private diagnostics. Neither event mutates the sidebar before sibling Hook outcomes are known.
-- **Deterministic reconciler**: the optional foreground observer or recurring heartbeat reads confirmed task status and performs all sidebar movement.
+- **Lifecycle observer**: `UserPromptSubmit` and `Stop` record the current task's authoritative identity and bounded diagnostics. Neither event mutates the sidebar before sibling Hook outcomes are known.
+- **Event wake**: when `eventWake.enabled=true` and a real Hook-context probe has confirmed `send_message_to_thread`, the Hook sends one content-free envelope containing only `threadId` and `hostId` to the configured organizer task. The organizer reads confirmed state and performs at most one targeted move.
+- **Deterministic reconciler**: the organizer turn or recurring heartbeat reads confirmed task status and performs all sidebar movement.
 - **Project tasks**: a task without direct membership uses its Project only as a source and protection signal. Moving the task creates explicit task membership in the destination section; the Project itself is not moved.
-- **Self-heal heartbeat**: the supported automatic-movement path unless a trusted foreground observer is already running. It performs global cross-host reconciliation and must call Codex task-management tools directly. A sandboxed heartbeat must not launch the native-pipe script because it lacks the trusted Desktop process context. Use the [audited prompt template](docs/heartbeat-prompt.md).
+- **Heartbeat recovery**: the recurring heartbeat performs global cross-host reconciliation and must call Codex task-management tools directly. It is the deterministic recovery path for missed events, unavailable remote event wake, and stopped tasks already in `In Progress`. A sandboxed heartbeat must not launch the native-pipe script because it lacks the trusted Desktop process context. Use the [audited prompt template](docs/heartbeat-prompt.md).
 
 Render the heartbeat prompt with the exact organizer task ID before creating the automation:
 
@@ -70,9 +76,19 @@ node scripts/render-heartbeat.mjs --exclude <organizer-task-id>
 
 Creation must fail if the placeholder remains or no exact organizer ID was supplied.
 
-With a five-minute self-heal interval, an active task or an idle task already in In Progress normally converges within five minutes. A task that starts and finishes entirely between polls is not observable without a supported post-outcome event bridge. This is a platform boundary, not a real-time guarantee.
+Use the doctor probe as a one-shot sequence, not as synthetic acceptance:
 
-Hook observation uses zero model tokens. A heartbeat is a scheduled model turn: 5 minutes is 288 runs/day, 1 hour is 24, and 4 hours is 6. Actual token usage varies with the selected model and visible task count. Its task-tool result can expose visible titles and summaries to the selected model even though the audited prompt prohibits using them for decisions; do not enable the heartbeat if that metadata boundary is unacceptable.
+1. `node scripts/doctor.mjs --arm-event-wake-probe`
+2. Submit one real disposable Codex prompt on the target host.
+3. `node scripts/doctor.mjs --event-wake-probe-result`
+
+The probe confirms whether a real lifecycle Hook saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself.
+
+Keep the heartbeat at 5 minutes until live acceptance succeeds on the hosts you care about. Only after verified event-path acceptance should you consider 30-60 minutes. If remote acceptance is absent or fails, do not claim remote realtime behavior and keep the heartbeat interval short enough to cover the remote repair delay you still need.
+
+With a five-minute heartbeat, an active task or a stopped task already in `In Progress` normally converges within five minutes even when event wake is unavailable. A task that starts and finishes entirely between polls is not observable without a supported post-outcome event bridge. This is a platform boundary, not a real-time guarantee.
+
+Hook observation uses zero model tokens. Event wake and heartbeat are model turns. The Hook sends one content-free envelope per lifecycle event, but the organizer message is still user-visible, model-triggering, and incurs model/token cost for each event. A heartbeat is a scheduled model turn: 5 minutes is 288 runs/day, 1 hour is 24, and 4 hours is 6. Actual token usage varies with the selected model and visible task count. Task-tool results can expose visible titles and summaries to the selected model even though the audited prompts prohibit using them for decisions; do not enable event wake or heartbeat if that metadata boundary is unacceptable.
 
 ## Verify
 
@@ -84,13 +100,13 @@ node scripts/doctor.mjs
 
 Plugin mode uses `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin`. Without an active `CLAUDE_PLUGIN_ROOT`, `--plugin-root <path>` can validate package completeness but reports app enablement as unverified.
 
-`doctor` validates static installation. Outside a trusted Hook it deliberately reports runtime capability as unverified; an observed-state acceptance test is still required. `doctor --probe` performs read-only `tools/list` and section checks when run in a trusted app-tools context.
+`doctor` validates static installation. Outside a trusted Hook it deliberately reports runtime capability as unverified; an observed-state acceptance test is still required. `doctor --probe` performs read-only `tools/list` and section checks when run in a trusted app-tools context. `doctor --arm-event-wake-probe` and `doctor --event-wake-probe-result` are the supported capability-gating path before claiming event wake works.
 
 Hook diagnostics are written to `~/.codex/sidebar-flow/hook.log` with mode `0600` and one bounded rotation. Logs omit prompts, outputs, task titles, full task bodies, and private tool error bodies.
 
 ## Configuration
 
-Edit `~/.codex/sidebar-flow/config.json`. Section names must be unique. Add organizer task IDs to `excludeThreadIds`; content and summary substrings never control exclusion.
+Edit `~/.codex/sidebar-flow/config.json`. Section names must be unique. Add organizer task IDs to `excludeThreadIds`; content and summary substrings never control exclusion. Event wake remains disabled until `eventWake.enabled` is explicitly set through setup.
 
 Socket discovery is disabled by default. The supported path is the explicit `CODEX_APP_TOOLS_PIPE_PATH` inherited by a trusted Codex Hook. Enabling `allowSocketDiscovery` is for local debugging only.
 
@@ -106,11 +122,11 @@ Source mode removes only Sidebar Flow entries from global hooks. Plugin users sh
 
 - The private Desktop sidebar protocol may change without notice.
 - A local Hook cannot receive a remote app server's lifecycle event.
-- Codex launches matching command Hooks concurrently. Without a post-outcome event, a lifecycle Hook cannot safely commit the final sidebar state; v0.1 uses observed-state reconciliation.
-- Current public remote Hook/MCP capabilities do not expose the multi-step custom-sidebar workflow required by a cross-host event bridge; remote Hook installation is therefore capability-gated, not assumed.
-- Periodic self-heal has a bounded delay but cannot reconstruct an event that occurred entirely between snapshots.
+- Codex launches matching command Hooks concurrently. The Hook therefore observes and persists first, then may send one envelope to the organizer; it does not mutate the sidebar directly.
+- Current public remote Hook/MCP capabilities do not expose the multi-step custom-sidebar workflow required by a cross-host event bridge; remote Hook installation is therefore capability-gated, not assumed, and remote realtime must not be claimed without live acceptance.
+- Heartbeat recovery has a bounded delay but cannot reconstruct an event that occurred entirely between snapshots.
 - `list_threads` is limited to 50 summaries. In Progress items outside that window require successful `read_thread` discovery or an authoritative managed host identity; otherwise the tool fails closed.
-- Detached daemons cannot reliably regain the trusted Desktop process ancestry after reconnecting; v0.1 uses observation Hooks plus task-tool heartbeat reconciliation.
+- There is no external backend or detached daemon. v0.2 remains a local Hook-plus-organizer-plus-heartbeat system.
 
 ## License
 

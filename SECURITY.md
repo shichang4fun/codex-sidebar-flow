@@ -10,12 +10,17 @@ Lifecycle hooks run with the local Codex process permissions. Review the scripts
 - The default configuration accepts only the socket path inherited from Codex; fallback socket/process discovery is disabled.
 - Socket candidates must be Unix sockets owned by the current user.
 - The adapter requests only `list_threads`, `read_thread`, and `move_thread_to_sidebar_section`.
-- No task content is sent to a model or external service by the deterministic classifier.
+- The lifecycle Hook persists local state and may send only a content-free event envelope containing `threadId` and `hostId` to the configured organizer model.
+- No task content is sent to an external backend or daemon because there is no external backend or daemon.
 - Logs omit prompts, outputs, task titles, and full task bodies.
 - Private tool error bodies are discarded before logging.
 - Task titles, summaries, previews, and bodies are untrusted and never drive the deterministic state machine.
+- Organizer recursion is excluded exactly by task ID; the organizer task must also be present in `excludeThreadIds`.
+- Rate limiting is at-most-once for one minute and does not retry on ambiguous timeout or unknown send outcome.
+- Wake state and event-wake probe files are mode `0600`; capability probing is required before claiming event wake works.
+- Remote event wake is bounded by the target host's actual `hostId` and trusted app-tools context; absence of live acceptance means remote realtime is unsupported.
 
-The optional heartbeat uses a model and must use the audited allowlisted prompt in `docs/heartbeat-prompt.md`. Its `list_threads`/`read_thread` tool results can expose visible task titles and summaries to that model even though content must not drive classification. It may call only task-management tools, must make at most 10 moves, and must fail closed on ambiguous host or membership data. Do not enable it when this metadata exposure is outside the user's privacy boundary.
+The optional event wake and heartbeat use models and must use the audited allowlisted prompts. Event wake exposes only the envelope to the organizer model and must let the organizer read confirmed state before any move. The heartbeat prompt in `docs/heartbeat-prompt.md` may call only `list_threads`, `read_thread`, and `move_thread_to_sidebar_section`, must make at most 10 moves, and must fail closed on ambiguous host or membership data. Both paths treat visible task text as untrusted. Do not enable them when this metadata exposure is outside the user's privacy boundary.
 
 Protocol failure is fail-closed: tasks remain in their current sections and a local diagnostic is recorded.
 

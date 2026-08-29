@@ -9,6 +9,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -220,6 +221,82 @@ assert.deepEqual(
   new Set((await sidebarRealtime.loadManagedState(statePath)).managedThreadIds),
   new Set(["local:task-a", "local:task-b", "local:task-c"]),
 );
+
+const malformedOwnerStatePath = path.join(stateDirectory, "malformed-owner-state.json");
+const malformedOwnerLockPath = `${malformedOwnerStatePath}.lock`;
+const malformedOwnerNow = Date.now();
+await writeFile(
+  malformedOwnerLockPath,
+  `${JSON.stringify({ pid: "not-a-pid", createdAt: malformedOwnerNow + 60_000 })}\n`,
+  { mode: 0o600 },
+);
+const malformedOwnerOldTime = new Date(malformedOwnerNow - 30_001);
+await utimes(malformedOwnerLockPath, malformedOwnerOldTime, malformedOwnerOldTime);
+await sidebarRealtime.updateManagedState(
+  malformedOwnerStatePath,
+  { add: ["local:recovered-malformed-owner"] },
+  { now: () => malformedOwnerNow, attempts: 1, delayMs: 0, staleAfterMs: 30_000 },
+);
+assert.deepEqual(
+  (await sidebarRealtime.loadManagedState(malformedOwnerStatePath)).managedThreadIds,
+  ["local:recovered-malformed-owner"],
+);
+
+const slowStatePath = path.join(stateDirectory, "slow-state.json");
+await sidebarRealtime.saveManagedState(slowStatePath, managedState);
+let releaseSlowOwner;
+let slowOwnerReleased = false;
+let signalSlowOwnerReady;
+const slowOwnerReady = new Promise((resolve) => {
+  signalSlowOwnerReady = resolve;
+});
+const slowOwnerRelease = new Promise((resolve) => {
+  releaseSlowOwner = () => {
+    if (slowOwnerReleased) return;
+    slowOwnerReleased = true;
+    resolve();
+  };
+});
+let firstSlowUpdate = null;
+try {
+  firstSlowUpdate = sidebarRealtime.updateManagedState(
+    slowStatePath,
+    { add: ["local:slow-first"] },
+    {
+      now: () => 100_000,
+      onBeforeRelease: async () => {
+        const firstSnapshot = await readFile(slowStatePath, "utf8");
+        signalSlowOwnerReady();
+        await slowOwnerRelease;
+        await writeFile(slowStatePath, firstSnapshot, { mode: 0o600 });
+      },
+    },
+  );
+  await slowOwnerReady;
+
+  let secondError = null;
+  try {
+    await sidebarRealtime.updateManagedState(
+      slowStatePath,
+      { add: ["local:slow-second"] },
+      { now: () => 130_001, attempts: 1, delayMs: 0, isProcessAlive: () => true },
+    );
+  } catch (error) {
+    secondError = error;
+  }
+
+  releaseSlowOwner();
+  await firstSlowUpdate;
+  assert.equal(secondError?.code, "EEXIST");
+  assert.deepEqual(
+    new Set((await sidebarRealtime.loadManagedState(slowStatePath)).managedThreadIds),
+    new Set(["local:task-a", "local:slow-first"]),
+  );
+} finally {
+  releaseSlowOwner?.();
+  await firstSlowUpdate?.catch(() => {});
+}
+
 const staleForegroundSnapshot = { ...managedState, managedThreadIds: ["local:task-a"] };
 await sidebarRealtime.updateManagedState(statePath, { add: ["local:hook-task"] });
 await sidebarRealtime.saveManagedState(statePath, staleForegroundSnapshot);

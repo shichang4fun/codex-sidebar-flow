@@ -379,6 +379,15 @@ async function unlinkOwnedLock(lockPath, handle) {
   return true;
 }
 
+function normalizeLockOwner(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes("pid") || !keys.includes("createdAt")) return null;
+  if (!Number.isSafeInteger(value.pid) || value.pid <= 0) return null;
+  if (!Number.isSafeInteger(value.createdAt) || value.createdAt < 0) return null;
+  return value;
+}
+
 async function readLockOwner(handle, metadata) {
   if (!metadata.isFile() || metadata.size > MAX_MANAGED_LOCK_OWNER_BYTES) return null;
   const buffer = Buffer.alloc(MAX_MANAGED_LOCK_OWNER_BYTES + 1);
@@ -386,7 +395,7 @@ async function readLockOwner(handle, metadata) {
   if (bytesRead > MAX_MANAGED_LOCK_OWNER_BYTES) return null;
   let owner = null;
   try {
-    owner = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+    owner = normalizeLockOwner(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
   } catch {}
   return owner;
 }
@@ -407,17 +416,17 @@ async function clearStaleLock(
     const metadata = await handle.stat();
     if (!metadata.isFile()) return false;
     const owner = await readLockOwner(handle, metadata);
-    const createdAt = Number.isFinite(owner?.createdAt) ? owner.createdAt : metadata.mtimeMs;
-    const staleByAge = now() - createdAt > staleAfterMs;
-    let ownerGone = false;
-    if (Number.isInteger(owner?.pid)) {
+    let stale = now() - metadata.mtimeMs > staleAfterMs;
+    if (owner != null) {
+      let ownerAlive = true;
       try {
-        ownerGone = isProcessAlive(owner.pid) === false;
+        ownerAlive = isProcessAlive(owner.pid) !== false;
       } catch {
-        ownerGone = false;
+        ownerAlive = true;
       }
+      stale = !ownerAlive;
     }
-    if (!staleByAge && !ownerGone) return false;
+    if (!stale) return false;
     if (typeof onBeforeReclaim === "function") {
       await onBeforeReclaim({ lockPath, owner });
     }

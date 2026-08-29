@@ -13,7 +13,7 @@ export async function uninstall({
   mode = "source",
 } = {}) {
   if (!new Set(["source", "plugin"]).has(mode)) throw new Error(`Unknown uninstall mode: ${mode}`);
-  if (!path.isAbsolute(codexHome)) {
+  if (typeof codexHome !== "string" || /[\r\n]/.test(codexHome) || !path.isAbsolute(codexHome)) {
     const error = new Error(`CODEX_HOME must be an absolute path: ${codexHome}`);
     error.code = "INVALID_CODEX_HOME";
     throw error;
@@ -55,7 +55,13 @@ export async function uninstall({
 
 function optionValue(argv, index, option) {
   const value = argv[index + 1];
-  if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || value.length > 4096
+    || /[\r\n]/.test(value)
+    || value.startsWith("-")
+  ) {
     const error = new Error(`${option} requires a value`);
     error.code = "INVALID_ARGUMENT";
     throw error;

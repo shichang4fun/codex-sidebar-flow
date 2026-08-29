@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const HOOK_MARKER = "CODEX_SIDEBAR_FLOW_OWNER=codex-sidebar-flow-v1";
 export const INSTALL_MODE_ENV = "CODEX_SIDEBAR_FLOW_INSTALL_MODE";
+const SAFE_IDENTIFIER_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
 
 function quote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
@@ -162,6 +163,16 @@ export function defaultConfig(codexHome, installMode = null) {
       forLater: "For Later",
     },
     excludeThreadIds: [],
+    eventWake: {
+      enabled: false,
+      organizerThreadId: null,
+      organizerHostId: "local",
+      maxPerMinute: 20,
+    },
+    wakeStateFile: path.join(runtime, "wake-state.json"),
+    eventWakeProbeRequestFile: path.join(runtime, "event-wake-probe-request.json"),
+    eventWakeProbeResultFile: path.join(runtime, "event-wake-probe-result.json"),
+    eventWakeProbeTtlMs: 300000,
     healthFile: path.join(runtime, "health.json"),
     hookLogFile: path.join(runtime, "hook.log"),
     stateFile: path.join(runtime, "state.json"),
@@ -184,12 +195,31 @@ export async function setup({
   dryRun = false,
   mode = "source",
   migrateLegacyHookPaths = [],
+  enableEventWake = false,
+  organizerThreadId,
+  organizerHostId,
+  eventWakeMaxPerMinute,
 } = {}) {
   if (!new Set(["source", "plugin"]).has(mode)) throw new Error(`Unknown setup mode: ${mode}`);
-  if (!path.isAbsolute(codexHome)) {
+  if (!isSingleLine(codexHome, 4096) || !path.isAbsolute(codexHome)) {
     const error = new Error(`CODEX_HOME must be an absolute path: ${codexHome}`);
     error.code = "INVALID_CODEX_HOME";
     throw error;
+  }
+  if (enableEventWake && organizerThreadId == null) {
+    throw invalidArgument("--enable-event-wake requires --organizer-thread-id");
+  }
+  if (organizerThreadId != null && !isSafeIdentifier(organizerThreadId)) {
+    throw invalidArgument("Invalid organizerThreadId");
+  }
+  if (organizerHostId != null && !isSafeIdentifier(organizerHostId)) {
+    throw invalidArgument("Invalid organizerHostId");
+  }
+  if (
+    eventWakeMaxPerMinute != null
+    && (!Number.isInteger(eventWakeMaxPerMinute) || eventWakeMaxPerMinute <= 0)
+  ) {
+    throw invalidArgument("event-wake max per minute must be a positive integer");
   }
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
   const runtimeScripts = path.join(runtimeRoot, "scripts");
@@ -247,6 +277,7 @@ export async function setup({
       await Promise.all([
         copyFile(path.join(ROOT, "scripts", "sidebar-hook.mjs"), path.join(runtimeScripts, "sidebar-hook.mjs")),
         copyFile(path.join(ROOT, "scripts", "sidebar-realtime.mjs"), path.join(runtimeScripts, "sidebar-realtime.mjs")),
+        copyFile(path.join(ROOT, "scripts", "event-wake.mjs"), path.join(runtimeScripts, "event-wake.mjs")),
         copyFile(path.join(ROOT, "scripts", "setup.mjs"), path.join(runtimeScripts, "setup.mjs")),
         copyFile(path.join(ROOT, "scripts", "uninstall.mjs"), path.join(runtimeScripts, "uninstall.mjs")),
         copyFile(path.join(ROOT, "scripts", "doctor.mjs"), path.join(runtimeScripts, "doctor.mjs")),
@@ -254,10 +285,34 @@ export async function setup({
       if (existsSync(hooksPath)) await writePrivateBackup(hooksPath, backupPath);
       await writeJsonAtomic(hooksPath, hooks);
     }
-    await writeJsonAtomic(configPath, {
-      ...(existingConfig ?? defaultConfig(codexHome, mode)),
+    const defaults = defaultConfig(codexHome, mode);
+    const config = {
+      ...defaults,
+      ...(existingConfig ?? {}),
+      sections: {
+        ...defaults.sections,
+        ...(existingConfig?.sections ?? {}),
+      },
+      eventWake: {
+        ...defaults.eventWake,
+        ...(existingConfig?.eventWake ?? {}),
+      },
       installMode: mode,
-    });
+    };
+    if (enableEventWake) {
+      config.eventWake = {
+        ...config.eventWake,
+        enabled: true,
+        organizerThreadId,
+        organizerHostId: organizerHostId ?? "local",
+        maxPerMinute: eventWakeMaxPerMinute ?? 20,
+      };
+      config.excludeThreadIds = [...new Set([
+        ...(Array.isArray(config.excludeThreadIds) ? config.excludeThreadIds : []),
+        organizerThreadId,
+      ])];
+    }
+    await writeJsonAtomic(configPath, config);
     if (mode === "plugin") await rm(runtimeScripts, { recursive: true, force: true });
   }
   return {
@@ -272,13 +327,37 @@ export async function setup({
   };
 }
 
+function invalidArgument(message) {
+  const error = new Error(message);
+  error.code = "INVALID_ARGUMENT";
+  return error;
+}
+
+function isSingleLine(value, maxLength) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= maxLength
+    && !/[\r\n]/.test(value);
+}
+
+export function isSafeIdentifier(value) {
+  return isSingleLine(value, 256)
+    && value.trim() === value
+    && !value.startsWith("-")
+    && SAFE_IDENTIFIER_PATTERN.test(value);
+}
+
 function optionValue(argv, index, option) {
   const value = argv[index + 1];
-  if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
-    const error = new Error(`${option} requires a value`);
-    error.code = "INVALID_ARGUMENT";
-    throw error;
+  if (!isSingleLine(value, 4096) || value.startsWith("-")) {
+    throw invalidArgument(`${option} requires a value on one line`);
   }
+  return value;
+}
+
+function identifierOptionValue(argv, index, option) {
+  const value = optionValue(argv, index, option);
+  if (!isSafeIdentifier(value)) throw invalidArgument(`Invalid value for ${option}`);
   return value;
 }
 
@@ -287,14 +366,31 @@ export function parseSetupArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--dry-run") result.dryRun = true;
     else if (argv[index] === "--plugin") result.mode = "plugin";
+    else if (argv[index] === "--enable-event-wake") result.enableEventWake = true;
     else if (argv[index] === "--codex-home") {
       result.codexHome = optionValue(argv, index, "--codex-home");
       index += 1;
     } else if (argv[index] === "--migrate-legacy-hook") {
       result.migrateLegacyHookPaths.push(optionValue(argv, index, "--migrate-legacy-hook"));
       index += 1;
+    } else if (argv[index] === "--organizer-thread-id") {
+      result.organizerThreadId = identifierOptionValue(argv, index, "--organizer-thread-id");
+      index += 1;
+    } else if (argv[index] === "--organizer-host-id") {
+      result.organizerHostId = identifierOptionValue(argv, index, "--organizer-host-id");
+      index += 1;
+    } else if (argv[index] === "--event-wake-max-per-minute") {
+      const value = optionValue(argv, index, "--event-wake-max-per-minute");
+      if (!/^\d+$/.test(value) || Number(value) <= 0 || !Number.isSafeInteger(Number(value))) {
+        throw invalidArgument("--event-wake-max-per-minute requires a positive integer");
+      }
+      result.eventWakeMaxPerMinute = Number(value);
+      index += 1;
     }
     else throw new Error(`Unknown argument: ${argv[index]}`);
+  }
+  if (result.enableEventWake && result.organizerThreadId == null) {
+    throw invalidArgument("--enable-event-wake requires --organizer-thread-id");
   }
   return result;
 }

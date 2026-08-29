@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
+  defaultConfig,
   findUnmarkedSidebarHookPaths,
   HOOK_MARKER,
   installHooks,
@@ -43,6 +44,122 @@ test("setup and uninstall CLI parsers reject missing or flag-shaped path values"
     execFileAsync(process.execPath, [uninstallScript, "--codex-home"]),
     (error) => error.code === 1 && /requires a value/.test(error.stderr),
   );
+});
+
+test("setup parses explicit event-wake configuration and rejects unsafe values", () => {
+  assert.deepEqual(parseSetupArgs([
+    "--enable-event-wake",
+    "--organizer-thread-id", "organizer-123",
+    "--organizer-host-id", "remote-control:env_123",
+    "--event-wake-max-per-minute", "7",
+  ]), {
+    dryRun: false,
+    migrateLegacyHookPaths: [],
+    enableEventWake: true,
+    organizerThreadId: "organizer-123",
+    organizerHostId: "remote-control:env_123",
+    eventWakeMaxPerMinute: 7,
+  });
+  for (const argv of [
+    ["--enable-event-wake"],
+    ["--enable-event-wake", "--organizer-thread-id", "--plugin"],
+    ["--enable-event-wake", "--organizer-thread-id", "bad\nid"],
+    ["--enable-event-wake", "--organizer-thread-id", "organizer", "--organizer-host-id", "bad host"],
+    ["--enable-event-wake", "--organizer-thread-id", "organizer", "--event-wake-max-per-minute", "0"],
+    ["--enable-event-wake", "--organizer-thread-id", "organizer", "--event-wake-max-per-minute", "1.5"],
+  ]) {
+    assert.throws(() => parseSetupArgs(argv), /organizer|requires|invalid|positive integer/i);
+  }
+});
+
+test("default configuration keeps event wake disabled with private runtime paths", () => {
+  const codexHome = "/tmp/sidebar-flow-default-config";
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const config = defaultConfig(codexHome, "source");
+  assert.deepEqual(config.eventWake, {
+    enabled: false,
+    organizerThreadId: null,
+    organizerHostId: "local",
+    maxPerMinute: 20,
+  });
+  assert.equal(config.wakeStateFile, path.join(runtime, "wake-state.json"));
+  assert.equal(config.eventWakeProbeRequestFile, path.join(runtime, "event-wake-probe-request.json"));
+  assert.equal(config.eventWakeProbeResultFile, path.join(runtime, "event-wake-probe-result.json"));
+  assert.equal(config.eventWakeProbeTtlMs, 300000);
+});
+
+test("setup rejects invalid event-wake options before filesystem mutation", async () => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-invalid-options-"));
+  const codexHome = path.join(parent, "not-created");
+  try {
+    await assert.rejects(
+      setup({ codexHome, enableEventWake: true, organizerThreadId: "bad\nid" }),
+      /organizerThreadId/i,
+    );
+    await assert.rejects(stat(codexHome), /ENOENT/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("setup upgrades configuration and explicitly enables event wake without losing unrelated values", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-event-config-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  try {
+    await mkdir(runtime, { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      installMode: "source",
+      sections: { inProgress: "Doing", forReview: "Review", forLater: "Later" },
+      excludeThreadIds: ["keep-excluded"],
+      unrelated: { keep: true },
+    })}\n`, { mode: 0o600 });
+
+    await setup({
+      codexHome,
+      enableEventWake: true,
+      organizerThreadId: "organizer-123",
+      organizerHostId: "remote-control:env_123",
+      eventWakeMaxPerMinute: 7,
+    });
+    const once = JSON.parse(await readFile(configPath, "utf8"));
+    assert.deepEqual(once.eventWake, {
+      enabled: true,
+      organizerThreadId: "organizer-123",
+      organizerHostId: "remote-control:env_123",
+      maxPerMinute: 7,
+    });
+    assert.deepEqual(once.excludeThreadIds, ["keep-excluded", "organizer-123"]);
+    assert.deepEqual(once.unrelated, { keep: true });
+    assert.equal((await stat(path.join(runtime, "scripts", "event-wake.mjs"))).isFile(), true);
+
+    await setup({ codexHome });
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), once);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("upgrading a v0.1 configuration adds disabled event wake defaults", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-v01-upgrade-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  try {
+    await mkdir(runtime, { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      installMode: "plugin",
+      sections: { inProgress: "In Progress", forReview: "For Review", forLater: "For Later" },
+      excludeThreadIds: [],
+      custom: "preserved",
+    })}\n`, { mode: 0o600 });
+    await setup({ codexHome, mode: "plugin" });
+    const upgraded = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(upgraded.eventWake.enabled, false);
+    assert.equal(upgraded.eventWake.organizerThreadId, null);
+    assert.equal(upgraded.custom, "preserved");
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
 });
 
 test("setup is idempotent and preserves unrelated hooks", () => {
@@ -239,6 +356,28 @@ test("plugin uninstall never edits global hooks", async () => {
     await writeFile(hooksPath, original, { mode: 0o600 });
     await uninstall({ codexHome, mode: "plugin", purge: true });
     assert.equal(await readFile(hooksPath, "utf8"), original);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("normal uninstall keeps configuration and wake state while purge removes the runtime", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-uninstall-state-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  try {
+    await setup({ codexHome, mode: "source" });
+    for (const name of ["wake-state.json", "event-wake-probe-request.json", "event-wake-probe-result.json"]) {
+      await writeFile(path.join(runtime, name), "{}\n", { mode: 0o600 });
+    }
+    await uninstall({ codexHome, mode: "source" });
+    assert.equal((await stat(path.join(runtime, "config.json"))).isFile(), true);
+    assert.equal((await stat(path.join(runtime, "wake-state.json"))).isFile(), true);
+    assert.equal((await stat(path.join(runtime, "event-wake-probe-request.json"))).isFile(), true);
+    assert.equal((await stat(path.join(runtime, "event-wake-probe-result.json"))).isFile(), true);
+
+    await setup({ codexHome, mode: "source" });
+    await uninstall({ codexHome, mode: "source", purge: true });
+    await assert.rejects(stat(runtime), /ENOENT/);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }

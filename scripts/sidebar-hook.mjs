@@ -13,6 +13,10 @@ import {
   updateManagedState,
 } from "./sidebar-realtime.mjs";
 import { normalizeLifecycleEnvelope, wakeOrganizer } from "./event-wake.mjs";
+import {
+  claimEventWakeProbe,
+  writeEventWakeProbeResult,
+} from "./doctor.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "./setup.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -305,6 +309,19 @@ async function wakeBeforeDeadline(task, deadlineAt, now = Date.now) {
   }
 }
 
+export async function inspectEventWakeCapability(appTools, deadlineAt, now = Date.now) {
+  const host = await runBeforeDeadline(() => appTools.connect(), deadlineAt, now);
+  return host?.toolMap instanceof Map && host.toolMap.has("send_message_to_thread");
+}
+
+function runtimeEventWakeConfig(config) {
+  return {
+    ...(config.eventWake ?? {}),
+    wakeStateFile: config.wakeStateFile ?? config.eventWake?.wakeStateFile,
+    excludeThreadIds: config.excludeThreadIds ?? [],
+  };
+}
+
 export async function handleHook(
   input,
   configPath = DEFAULT_CONFIG_PATH,
@@ -317,6 +334,9 @@ export async function handleHook(
     loadState = loadManagedState,
     updateManaged = updateManagedState,
     wake = wakeOrganizer,
+    claimProbe = claimEventWakeProbe,
+    writeProbeResult = writeEventWakeProbeResult,
+    inspectCapability = inspectEventWakeCapability,
     now = Date.now,
   } = dependencies;
   if (!["UserPromptSubmit", "Stop"].includes(input?.hook_event_name)) return null;
@@ -351,6 +371,24 @@ export async function handleHook(
 
   const startedAt = now();
   const deadlineAt = startedAt + (config.hookDeadlineMs ?? DEFAULT_HOOK_DEADLINE_MS);
+  const probeClaim = await claimProbe(config, { now });
+  let eventWakeProbeStatus = null;
+  if (probeClaim.status === "expired") {
+    eventWakeProbeStatus = "expired";
+    await writeProbeResult(config, "expired", { now });
+  } else if (probeClaim.status === "claimed") {
+    const probeTools = createAppTools(config, { requiredTools: OBSERVATION_REQUIRED_TOOLS });
+    let present = false;
+    try {
+      present = await inspectCapability(probeTools, deadlineAt, now);
+    } catch {
+      present = false;
+    } finally {
+      probeTools.reset?.();
+    }
+    eventWakeProbeStatus = present ? "present" : "missing";
+    await writeProbeResult(config, eventWakeProbeStatus, { now });
+  }
   const managedState = await loadState(config.stateFile);
   const result = await execute(input, config, {
     managedState,
@@ -364,12 +402,12 @@ export async function handleHook(
     observe: result.observedIdentities,
   });
   let wakeOutcome = null;
-  if (result.eventEnvelope != null && now() < deadlineAt) {
+  if (result.eventEnvelope != null && probeClaim.status !== "claimed" && now() < deadlineAt) {
     const wakeTools = createAppTools(config, { requiredTools: EVENT_WAKE_REQUIRED_TOOLS });
     try {
       wakeOutcome = boundedWakeResult(
         await wakeBeforeDeadline(
-          (signal) => wake(result.eventEnvelope, config.eventWake, wakeTools, {
+          (signal) => wake(result.eventEnvelope, runtimeEventWakeConfig(config), wakeTools, {
             signal,
             canDispatch: () => now() < deadlineAt,
           }),
@@ -382,7 +420,7 @@ export async function handleHook(
     } finally {
       wakeTools.reset?.();
     }
-  } else if (result.eventEnvelope != null) {
+  } else if (result.eventEnvelope != null && probeClaim.status !== "claimed") {
     wakeOutcome = { wakeStatus: "failed", wakeErrorCode: "wake_deadline" };
   }
   await writeHookLog(config.hookLogFile ?? DEFAULT_LOG_PATH, {
@@ -397,6 +435,7 @@ export async function handleHook(
     pipeBasename: path.basename(process.env.CODEX_APP_TOOLS_PIPE_PATH ?? ""),
     toolsListSucceeded: true,
     durationMs: now() - startedAt,
+    ...(eventWakeProbeStatus == null ? {} : { eventWakeProbeStatus }),
     ...wakeOutcome,
   });
   return null;

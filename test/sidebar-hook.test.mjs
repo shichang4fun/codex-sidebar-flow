@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import {
   executeHookEvent,
   handleHook,
@@ -11,6 +13,7 @@ import {
 import { AppTools } from "../scripts/sidebar-realtime.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/setup.mjs";
 
+const execFileAsync = promisify(execFile);
 const config = { excludeThreadIds: ["automation"] };
 const eventWakeConfig = {
   enabled: true,
@@ -959,6 +962,274 @@ for (const [configuredMode, launcherMode] of [
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "missing"]]) {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), `sidebar-flow-hook-probe-${expectedStatus}-`));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const probeResultFile = path.join(runtime, "event-wake-probe-result.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let wakeCalls = 0;
+  let sendCalls = 0;
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
+      protocol: "codex-sidebar-flow/event-wake-probe-v1",
+      createdAt: 1_000,
+      expiresAt: 301_000,
+    })}\n`, { mode: 0o600 });
+
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit", prompt: "raw secret task content" },
+      configPath,
+      {
+        now: () => 2_000,
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+            },
+          };
+        },
+        createAppTools() {
+          return {
+            async connect() {
+              return {
+                toolMap: new Map(capabilityPresent
+                  ? [["send_message_to_thread", { name: "send_message_to_thread" }]]
+                  : []),
+              };
+            },
+            async sendMessageToThread() {
+              sendCalls += 1;
+            },
+            reset() {},
+          };
+        },
+        async updateManaged() {},
+        async wake() {
+          wakeCalls += 1;
+          return { status: "sent" };
+        },
+      },
+    );
+
+    const probeResult = JSON.parse(await readFile(probeResultFile, "utf8"));
+    assert.equal(probeResult.status, expectedStatus);
+    assert.equal(probeResult.checkedAt, 2_000);
+    assert.equal((await stat(probeResultFile)).mode & 0o777, 0o600);
+    assert.equal(JSON.stringify(probeResult).includes("raw secret"), false);
+    assert.equal(JSON.stringify(probeResult).includes(codexHome), false);
+    assert.equal(sendCalls, 0);
+    assert.equal(wakeCalls, 0);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-expired-probe-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let wakeCalls = 0;
+  let probeConnections = 0;
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
+      protocol: "codex-sidebar-flow/event-wake-probe-v1",
+      createdAt: 1_000,
+      expiresAt: 1_500,
+    })}\n`, { mode: 0o600 });
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        now: () => 2_000,
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [], managedRemoves: [], observedIdentities: [],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+            },
+          };
+        },
+        createAppTools(_config, options) {
+          if ((options?.requiredTools ?? []).includes("send_message_to_thread")) {
+            return { reset() {} };
+          }
+          probeConnections += 1;
+          return { async connect() { return { toolMap: new Map() }; }, reset() {} };
+        },
+        async updateManaged() {},
+        async wake() {
+          wakeCalls += 1;
+          return { status: "sent" };
+        },
+      },
+    );
+    assert.equal(probeConnections, 0);
+    assert.equal(wakeCalls, 1);
+    const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
+    assert.equal(result.status, "expired");
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-probe-race-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  let probeConnections = 0;
+  let wakeCalls = 0;
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
+      protocol: "codex-sidebar-flow/event-wake-probe-v1",
+      createdAt: 1_000,
+      expiresAt: 301_000,
+    })}\n`, { mode: 0o600 });
+    const dependencies = {
+      now: () => 2_000,
+      async execute() {
+        return {
+          attempts: 1,
+          managedAdds: [], managedRemoves: [], observedIdentities: [],
+          eventEnvelope: {
+            protocol: "codex-sidebar-flow/event-v1",
+            event: "UserPromptSubmit",
+            threadId: "thread-1",
+            hostId: "local",
+          },
+        };
+      },
+      createAppTools(_config, options) {
+        if ((options?.requiredTools ?? []).includes("send_message_to_thread")) {
+          return { reset() {} };
+        }
+        return {
+          async connect() {
+            probeConnections += 1;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return { toolMap: new Map([["send_message_to_thread", { name: "send_message_to_thread" }]]) };
+          },
+          reset() {},
+        };
+      },
+      async updateManaged() {},
+      async wake() {
+        wakeCalls += 1;
+        return { status: "sent" };
+      },
+    };
+    await Promise.all([
+      handleHook({ session_id: "thread-1", hook_event_name: "UserPromptSubmit" }, configPath, dependencies),
+      handleHook({ session_id: "thread-1", hook_event_name: "UserPromptSubmit" }, configPath, dependencies),
+    ]);
+    assert.equal(probeConnections, 1);
+    assert.equal(wakeCalls, 1);
+    const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
+    assert.equal(result.status, "present");
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-probe-process-race-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const fixture = path.resolve("test/fixtures/event-wake-probe.mjs");
+  try {
+    const runtimeConfig = {
+      ...defaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: "local",
+        maxPerMinute: 20,
+      },
+    };
+    await writeJsonAtomic(configPath, runtimeConfig);
+    await writeFile(runtimeConfig.eventWakeProbeRequestFile, `${JSON.stringify({
+      protocol: "codex-sidebar-flow/event-wake-probe-v1",
+      createdAt: 1_000,
+      expiresAt: 301_000,
+    })}\n`, { mode: 0o600 });
+
+    const children = [
+      execFileAsync(process.execPath, [fixture, configPath, runtime]),
+      execFileAsync(process.execPath, [fixture, configPath, runtime]),
+    ];
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const readyCount = (await readdir(runtime)).filter((name) => name.startsWith("ready-")).length;
+      if (readyCount === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal((await readdir(runtime)).filter((name) => name.startsWith("ready-")).length, 2);
+    await writeFile(path.join(runtime, "release"), "\n", { mode: 0o600 });
+    const outcomes = (await Promise.all(children)).map(({ stdout }) => JSON.parse(stdout));
+    assert.equal(outcomes.reduce((sum, result) => sum + result.probeConnections, 0), 1);
+    assert.equal(outcomes.reduce((sum, result) => sum + result.wakeCalls, 0), 1);
+    const result = JSON.parse(await readFile(runtimeConfig.eventWakeProbeResultFile, "utf8"));
+    assert.equal(result.status, "present");
+  } finally {
     await rm(codexHome, { recursive: true, force: true });
   }
 }

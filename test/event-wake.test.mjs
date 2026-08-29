@@ -64,15 +64,6 @@ test("normalizeLifecycleEnvelope accepts only bounded content-free event envelop
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), protocol: null }), /protocol/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), threadId: "" }), /threadId/i);
   assert.throws(() => normalizeLifecycleEnvelope({ ...makeEnvelope(), hostId: "" }), /hostId/i);
-  const fingerprint = "a".repeat(64);
-  assert.deepEqual(
-    normalizeLifecycleEnvelope({ ...makeEnvelope(), fingerprint }),
-    { ...makeEnvelope(), fingerprint },
-  );
-  assert.throws(
-    () => normalizeLifecycleEnvelope({ ...makeEnvelope(), fingerprint: "raw prompt content" }),
-    /fingerprint/i,
-  );
 });
 
 test("renderEventWakePrompt is fixed, targeted, and never interpolates task content", () => {
@@ -109,10 +100,7 @@ test("renderEventWakePrompt is fixed, targeted, and never interpolates task cont
     prompt.includes("Require exactly one listed candidate matching both the envelope threadId and envelope hostId; never fall back to the same threadId on another host."),
     true,
   );
-  assert.equal(
-    prompt.includes("If `UserPromptSubmit` is already idle, completed, failed, or needs-attention, treat it as a short task that finished before this wake and move an eligible task from Tasks, In Progress, or an eligible Project task to For Review."),
-    true,
-  );
+  assert.equal(prompt.includes("If `UserPromptSubmit` is already idle"), false);
   assert.equal(
     prompt.includes("For `Stop`, confirm the exact target is idle, completed, failed, or needs-attention before moving an eligible task from Tasks, In Progress, or an eligible Project task to For Review."),
     true,
@@ -136,12 +124,6 @@ test("renderEventWakePrompt is fixed, targeted, and never interpolates task cont
   );
   assert.equal(hostilePrompt.includes("/tmp/"), false);
   assert.equal(hostilePrompt.includes("raw secret body"), false);
-  const fingerprint = "a".repeat(64);
-  const fingerprintedPrompt = renderEventWakePrompt(
-    { ...makeEnvelope(), fingerprint },
-    makeConfig(),
-  );
-  assert.equal(fingerprintedPrompt.includes(fingerprint), false);
 });
 
 test("renderEventWakePrompt rejects recursive organizer targets", () => {
@@ -175,10 +157,9 @@ test("acquireWakePermit stores private state with one-minute expiry", async () =
     assert.deepEqual(second, { ok: true });
     assert.deepEqual(third, { ok: false, errorCode: "rate_limited" });
     assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
-    assert.deepEqual(
-      JSON.parse(await readFile(stateFile, "utf8")).timestamps,
-      [now, now + 10],
-    );
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), {
+      timestamps: [now, now + 10],
+    });
 
     const afterExpiry = await acquireWakePermit(
       stateFile,
@@ -229,92 +210,6 @@ test("acquireWakePermit fails closed on malformed timestamp entries", async () =
     await writeFile(stateFile, "{\"timestamps\":[\"bad\"]}\n", { encoding: "utf8", mode: 0o600 });
     const accepted = await acquireWakePermit(stateFile, { maxPerMinute: 2 }, { now: () => 100_000 });
     assert.deepEqual(accepted, { ok: false, errorCode: "invalid_state" });
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("acquireWakePermit accepts legacy state but fails closed on malformed fingerprint records", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-fingerprint-state-"));
-  const legacyFile = path.join(directory, "legacy.json");
-  const malformedFile = path.join(directory, "malformed.json");
-
-  try {
-    await writeFile(legacyFile, `${JSON.stringify({ timestamps: [100_000] })}\n`, { mode: 0o600 });
-    assert.deepEqual(
-      await acquireWakePermit(
-        legacyFile,
-        { maxPerMinute: 2, fingerprint: "a".repeat(64), dedupeWindowMs: 2_000 },
-        { now: () => 100_100 },
-      ),
-      { ok: true },
-    );
-
-    await writeFile(
-      malformedFile,
-      `${JSON.stringify({ timestamps: [], fingerprints: [{ fingerprint: "raw prompt", timestamp: 100_000 }] })}\n`,
-      { mode: 0o600 },
-    );
-    assert.deepEqual(
-      await acquireWakePermit(
-        malformedFile,
-        { maxPerMinute: 2, fingerprint: "a".repeat(64), dedupeWindowMs: 2_000 },
-        { now: () => 100_100 },
-      ),
-      { ok: false, errorCode: "invalid_state" },
-    );
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("acquireWakePermit rejects non-string fingerprints in persisted wake state", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-non-string-state-"));
-  const hash = "a".repeat(64);
-  const invalidFingerprints = [[hash], { value: hash }, 123, null];
-
-  try {
-    for (const [index, fingerprint] of invalidFingerprints.entries()) {
-      const stateFile = path.join(directory, `state-${index}.json`);
-      const persisted = {
-        timestamps: [],
-        fingerprints: [{ fingerprint, timestamp: 100_000 }],
-      };
-      await writeFile(stateFile, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
-
-      assert.deepEqual(
-        await acquireWakePermit(
-          stateFile,
-          { maxPerMinute: 2, fingerprint: hash, dedupeWindowMs: 2_000 },
-          { now: () => 100_100 },
-        ),
-        { ok: false, errorCode: "invalid_state" },
-      );
-      assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), persisted);
-    }
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("acquireWakePermit rejects non-string current fingerprints without persisting them", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-non-string-current-"));
-  const hash = "a".repeat(64);
-  const invalidFingerprints = [[hash], { value: hash }, 123, null];
-
-  try {
-    for (const [index, fingerprint] of invalidFingerprints.entries()) {
-      const stateFile = path.join(directory, `state-${index}.json`);
-      assert.deepEqual(
-        await acquireWakePermit(
-          stateFile,
-          { maxPerMinute: 2, fingerprint, dedupeWindowMs: 2_000 },
-          { now: () => 100_100 },
-        ),
-        { ok: false, errorCode: "invalid_state" },
-      );
-      await assert.rejects(access(stateFile), (error) => error.code === "ENOENT");
-    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -673,91 +568,6 @@ test("wakeOrganizer routes local and remote organizers with exactly one send", a
         }),
       ),
     });
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("wakeOrganizer suppresses only the same fingerprint inside the two-second window", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-dedupe-"));
-  const stateFile = path.join(directory, "state.json");
-  const sent = [];
-  const appTools = {
-    async sendMessageToThread(args) {
-      sent.push(args);
-    },
-  };
-  const config = makeConfig({ wakeStateFile: stateFile, maxPerMinute: 2 });
-  const firstEnvelope = { ...makeEnvelope({ event: "Stop" }), fingerprint: "a".repeat(64) };
-  const distinctEnvelope = { ...makeEnvelope({ event: "Stop" }), fingerprint: "b".repeat(64) };
-
-  try {
-    assert.deepEqual(
-      await wakeOrganizer(firstEnvelope, config, appTools, { now: () => 100_000 }),
-      { status: "sent" },
-    );
-    assert.deepEqual(
-      await wakeOrganizer(firstEnvelope, config, appTools, { now: () => 100_100 }),
-      { status: "excluded", errorCode: "duplicate_event" },
-    );
-    assert.deepEqual(
-      await wakeOrganizer(distinctEnvelope, config, appTools, { now: () => 100_200 }),
-      { status: "sent" },
-    );
-    assert.deepEqual(
-      await wakeOrganizer(
-        { ...makeEnvelope({ event: "Stop" }), fingerprint: "c".repeat(64) },
-        config,
-        appTools,
-        { now: () => 100_300 },
-      ),
-      { status: "rate_limited" },
-    );
-    assert.equal(sent.length, 2);
-    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).timestamps, [100_000, 100_200]);
-
-    assert.deepEqual(
-      await wakeOrganizer(
-        firstEnvelope,
-        makeConfig({ wakeStateFile: stateFile, maxPerMinute: 3 }),
-        appTools,
-        { now: () => 102_001 },
-      ),
-      { status: "sent" },
-    );
-    assert.equal(sent.length, 3);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("wakeOrganizer suppresses concurrent duplicate fingerprints under one permit lock", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-dedupe-concurrent-"));
-  const stateFile = path.join(directory, "state.json");
-  let sends = 0;
-  const envelope = { ...makeEnvelope({ event: "Stop" }), fingerprint: "d".repeat(64) };
-
-  try {
-    const results = await Promise.all([
-      wakeOrganizer(
-        envelope,
-        makeConfig({ wakeStateFile: stateFile }),
-        { sendMessageToThread: async () => { sends += 1; } },
-        { now: () => 200_000 },
-      ),
-      wakeOrganizer(
-        envelope,
-        makeConfig({ wakeStateFile: stateFile }),
-        { sendMessageToThread: async () => { sends += 1; } },
-        { now: () => 200_000 },
-      ),
-    ]);
-    assert.deepEqual(
-      results.sort((left, right) => left.status.localeCompare(right.status)),
-      [{ status: "excluded", errorCode: "duplicate_event" }, { status: "sent" }],
-    );
-    assert.equal(sends, 1);
-    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).timestamps, [200_000]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

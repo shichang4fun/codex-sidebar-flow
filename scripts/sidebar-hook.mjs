@@ -2,7 +2,6 @@
 
 import { appendFile, chmod, mkdir, rename, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
-import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -32,21 +31,6 @@ const OBSERVATION_REQUIRED_TOOLS = ["list_threads", "read_thread"];
 const EVENT_WAKE_REQUIRED_TOOLS = ["list_threads", "read_thread", "send_message_to_thread"];
 const MAX_LOG_BYTES = 1024 * 1024;
 const LIFECYCLE_ID_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
-
-function lifecycleFingerprint(input, thread) {
-  const source = input?.hook_event_name === "UserPromptSubmit"
-    ? {
-        prompt: typeof input?.prompt === "string" ? input.prompt : null,
-        transcriptPath: typeof input?.transcript_path === "string" ? input.transcript_path : null,
-      }
-    : null;
-  return createHash("sha256").update(JSON.stringify({
-    event: input?.hook_event_name,
-    threadId: thread?.id,
-    hostId: thread?.hostId,
-    source,
-  })).digest("hex");
-}
 
 export function selectLifecycleThread(snapshot, input) {
   const threadId = input?.session_id;
@@ -115,7 +99,6 @@ function authoritativeEventEnvelope(snapshot, input, config) {
     event,
     threadId: thread.id,
     hostId: thread.hostId,
-    fingerprint: lifecycleFingerprint(input, thread),
   });
 }
 
@@ -318,7 +301,6 @@ function boundedWakeResult(result) {
 
 const STABLE_WAKE_ERROR_CODES = new Set([
   "invalid_config",
-  "duplicate_event",
   "invalid_envelope",
   "invalid_state",
   "io_failure",

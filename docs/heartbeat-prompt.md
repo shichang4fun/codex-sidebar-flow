@@ -12,4 +12,4 @@ Use this prompt only for a recurring Codex heartbeat explicitly requested by the
 | 1 hour | 24 | about 1 hour |
 | 4 hours | 6 | about 4 hours |
 
-The heartbeat is a model turn. Its token usage depends on the model and the number of visible tasks. It is the deterministic recovery path, not the primary fast path. A remote task that starts and finishes entirely between snapshots is invisible unless a supported remote lifecycle bridge captured it, so keep the interval aligned with the worst remote delay you still need to repair.
+The heartbeat is a model turn. Its token usage depends on the model and the number of visible tasks. It is the deterministic recovery path, not the primary fast path. At a five-minute interval it can repair terminal state only for a task already observed in In Progress. `UserPromptSubmit` never infers completion from a terminal observation, and a `Stop` event helps only when its exact final read still confirms the terminal state. A short task that starts and finishes between snapshots may therefore remain unclassified; later lifecycle events provide only additional bounded opportunities, not guaranteed recovery.

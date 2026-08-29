@@ -171,80 +171,12 @@ assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
   }]);
   assert.deepEqual(result.managedAdds, []);
   assert.deepEqual(result.observedIdentities, ["remote-control:env_remote_test:thread-1"]);
-  const { fingerprint, ...routingEnvelope } = result.eventEnvelope;
-  assert.match(fingerprint, /^[a-f0-9]{64}$/);
-  assert.deepEqual(routingEnvelope, {
+  assert.deepEqual(result.eventEnvelope, {
     protocol: "codex-sidebar-flow/event-v1",
     event: "UserPromptSubmit",
     threadId: "thread-1",
     hostId: "remote-control:env_remote_test",
   });
-}
-
-{
-  const execute = async (prompt) => executeHookEvent(
-    {
-      session_id: "thread-1",
-      hook_event_name: "UserPromptSubmit",
-      host_id: "local",
-      transcript_path: "/private/opaque/transcript.jsonl",
-      prompt,
-    },
-    {
-      ...config,
-      eventWake: eventWakeConfig,
-    },
-    {
-      createAppTools() {
-        return {
-          async listThreads() {
-            return snapshot({ hostId: "local" });
-          },
-          reset() {},
-        };
-      },
-      wait: async () => {},
-    },
-  );
-  const first = await execute("raw secret task content one");
-  const duplicate = await execute("raw secret task content one");
-  const distinct = await execute("raw secret task content two");
-  assert.match(first.eventEnvelope.fingerprint, /^[a-f0-9]{64}$/);
-  assert.equal(duplicate.eventEnvelope.fingerprint, first.eventEnvelope.fingerprint);
-  assert.notEqual(distinct.eventEnvelope.fingerprint, first.eventEnvelope.fingerprint);
-  assert.equal(JSON.stringify(first.eventEnvelope).includes("raw secret"), false);
-  assert.equal(JSON.stringify(first.eventEnvelope).includes("transcript"), false);
-}
-
-{
-  const executeStop = async (transcriptPath, stopHookActive) => executeHookEvent(
-    {
-      session_id: "thread-1",
-      hook_event_name: "Stop",
-      host_id: "local",
-      transcript_path: transcriptPath,
-      stop_hook_active: stopHookActive,
-    },
-    {
-      ...config,
-      stopSettleDelayMs: 0,
-      eventWake: eventWakeConfig,
-    },
-    {
-      createAppTools() {
-        return {
-          async listThreads() {
-            return snapshot({ hostId: "local" });
-          },
-          reset() {},
-        };
-      },
-      wait: async () => {},
-    },
-  );
-  const first = await executeStop("/private/first.jsonl", false);
-  const duplicate = await executeStop("/private/second.jsonl", true);
-  assert.equal(duplicate.eventEnvelope.fingerprint, first.eventEnvelope.fingerprint);
 }
 
 {
@@ -731,36 +663,6 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     assert.equal(records.at(-1).wakeStatus, "sent");
     assert.equal("wakeErrorCode" in records.at(-1), false);
 
-    const fingerprint = "a".repeat(64);
-    await handleHook(
-      { session_id: "thread-1", hook_event_name: "UserPromptSubmit", prompt: "raw secret prompt" },
-      configPath,
-      {
-        async execute() {
-          return {
-            attempts: 1,
-            managedAdds: [],
-            managedRemoves: [],
-            observedIdentities: [],
-            eventEnvelope: {
-              protocol: "codex-sidebar-flow/event-v1",
-              event: "UserPromptSubmit",
-              threadId: "thread-1",
-              hostId: "local",
-              fingerprint,
-            },
-          };
-        },
-        async wake() {
-          return { status: "excluded", errorCode: "duplicate_event" };
-        },
-      },
-    );
-    const duplicateRecord = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
-    assert.equal(duplicateRecord.wakeStatus, "excluded");
-    assert.equal(duplicateRecord.wakeErrorCode, "duplicate_event");
-    assert.equal(JSON.stringify(duplicateRecord).includes(fingerprint), false);
-    assert.equal(JSON.stringify(duplicateRecord).includes("raw secret"), false);
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;

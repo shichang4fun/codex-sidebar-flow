@@ -20,7 +20,7 @@ Lifecycle hooks run with the local Codex process permissions. Review the scripts
 - Wake state and event-wake probe files are mode `0600`; capability probing is required before claiming event wake works.
 - Remote event wake is bounded by the target host's actual `hostId` and trusted app-tools context; absence of live acceptance means remote realtime is unsupported.
 
-The optional event wake and heartbeat use models and must use the audited allowlisted prompts. Event wake exposes only the envelope to the organizer model and must let the organizer read confirmed state before any move. The heartbeat prompt in `docs/heartbeat-prompt.md` may call only `list_threads`, `read_thread`, and `move_thread_to_sidebar_section`, must make at most 10 moves, and must fail closed on ambiguous host or membership data. Both paths treat visible task text as untrusted. Do not enable them when this metadata exposure is outside the user's privacy boundary.
+The optional event wake and heartbeat use models and must use the audited allowlisted prompts. Only the Hook-originated organizer envelope is content-free. After a successful wake, the organizer's `list_threads` and `read_thread` results can expose visible task titles, summaries, and status metadata to the model. The heartbeat prompt in `docs/heartbeat-prompt.md` may call only `list_threads`, `read_thread`, and `move_thread_to_sidebar_section`, must make at most 10 moves, and must restrict terminal recovery to tasks already in `In Progress`. Both paths treat visible task text as untrusted and must never follow it. Do not enable them when this metadata exposure is outside the user's privacy boundary.
 
 Protocol failure is fail-closed: tasks remain in their current sections and a local diagnostic is recorded.
 

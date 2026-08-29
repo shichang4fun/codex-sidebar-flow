@@ -21,17 +21,21 @@ Membership is resolved from the real sidebar item key by task or Project ID. The
 
 Requirements: macOS, Codex Desktop, Node.js 20+, and custom sections named `In Progress`, `For Review`, and `For Later`.
 
+Source mode install/configure keeps event wake disabled first:
+
 ```bash
 git clone https://github.com/shichang4fun/codex-sidebar-flow.git
 cd codex-sidebar-flow
-node scripts/setup.mjs \
-  --enable-event-wake \
-  --organizer-thread-id <organizer-task-id> \
-  --organizer-host-id local
-node scripts/doctor.mjs
+node scripts/setup.mjs
 ```
 
-This is an explicit upgrade step. Existing v0.1 installations remain `eventWake.enabled=false` until you run setup again with `--enable-event-wake` and a confirmed organizer task ID. Do not infer the organizer from the current task.
+Plugin mode install/configure keeps event wake disabled first:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin
+```
+
+Existing v0.1 installations remain `eventWake.enabled=false` until you rerun setup with `--enable-event-wake` and a confirmed organizer task ID. Do not infer the organizer from the current task.
 
 If setup reports `LEGACY_HOOK_CONFLICT`, inspect the reported absolute path. Migrate it only when it is an older Sidebar Flow installation you recognize:
 
@@ -64,7 +68,7 @@ Cross-mode setup is rejected. To migrate plugin → source, first disable the pl
 
 - **Lifecycle observer**: `UserPromptSubmit` and `Stop` record the current task's authoritative identity and bounded diagnostics. Neither event mutates the sidebar before sibling Hook outcomes are known.
 - **Event wake**: when `eventWake.enabled=true` and a real Hook-context probe has confirmed `send_message_to_thread`, the Hook sends one content-free envelope containing only `threadId` and `hostId` to the configured organizer task. The organizer reads confirmed state and performs at most one targeted move.
-- **Deterministic reconciler**: the organizer turn or recurring heartbeat reads confirmed task status and performs all sidebar movement.
+- **Deterministic reconciler**: the organizer turn reads confirmed task status and performs event-path movement; the recurring heartbeat performs independent global recovery.
 - **Project tasks**: a task without direct membership uses its Project only as a source and protection signal. Moving the task creates explicit task membership in the destination section; the Project itself is not moved.
 - **Heartbeat recovery**: the recurring heartbeat performs global cross-host reconciliation and must call Codex task-management tools directly. It is the deterministic recovery path for missed events, unavailable remote event wake, and stopped tasks already in `In Progress`. A sandboxed heartbeat must not launch the native-pipe script because it lacks the trusted Desktop process context. Use the [audited prompt template](docs/heartbeat-prompt.md).
 
@@ -76,19 +80,35 @@ node scripts/render-heartbeat.mjs --exclude <organizer-task-id>
 
 Creation must fail if the placeholder remains or no exact organizer ID was supplied.
 
-Use the doctor probe as a one-shot sequence, not as synthetic acceptance:
+Enable event wake in two phases because `doctor` treats enabled-without-successful-probe as unhealthy.
 
-1. `node scripts/doctor.mjs --arm-event-wake-probe`
-2. Submit one real disposable Codex prompt on the target host.
-3. `node scripts/doctor.mjs --event-wake-probe-result`
+Source mode:
 
-The probe confirms whether a real lifecycle Hook saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself.
+1. Install/configure while disabled: `node scripts/setup.mjs`
+2. Arm the one-shot probe: `node scripts/doctor.mjs --arm-event-wake-probe`
+3. Submit one real disposable Codex prompt on the target host.
+4. Read the result: `node scripts/doctor.mjs --event-wake-probe-result`
+5. Require probe status `present`, then enable explicitly:
+   `node scripts/setup.mjs --enable-event-wake --organizer-thread-id <organizer-task-id> --organizer-host-id local`
+6. Verify: `node scripts/doctor.mjs`
+
+Plugin mode:
+
+1. Install/configure while disabled: `node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin`
+2. Arm the one-shot probe: `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin --arm-event-wake-probe`
+3. Submit one real disposable Codex prompt on the target host.
+4. Read the result: `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin --event-wake-probe-result`
+5. Require probe status `present`, then enable explicitly:
+   `node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin --enable-event-wake --organizer-thread-id <organizer-task-id> --organizer-host-id local`
+6. Verify: `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin`
+
+If the probe is missing, pending, expired, or not `present`, keep event wake disabled and retain the 5-minute heartbeat. The probe confirms whether a real lifecycle Hook saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself.
 
 Keep the heartbeat at 5 minutes until live acceptance succeeds on the hosts you care about. Only after verified event-path acceptance should you consider 30-60 minutes. If remote acceptance is absent or fails, do not claim remote realtime behavior and keep the heartbeat interval short enough to cover the remote repair delay you still need.
 
 With a five-minute heartbeat, an active task or a stopped task already in `In Progress` normally converges within five minutes even when event wake is unavailable. A task that starts and finishes entirely between polls is not observable without a supported post-outcome event bridge. This is a platform boundary, not a real-time guarantee.
 
-Hook observation uses zero model tokens. Event wake and heartbeat are model turns. The Hook sends one content-free envelope per lifecycle event, but the organizer message is still user-visible, model-triggering, and incurs model/token cost for each event. A heartbeat is a scheduled model turn: 5 minutes is 288 runs/day, 1 hour is 24, and 4 hours is 6. Actual token usage varies with the selected model and visible task count. Task-tool results can expose visible titles and summaries to the selected model even though the audited prompts prohibit using them for decisions; do not enable event wake or heartbeat if that metadata boundary is unacceptable.
+Hook observation uses zero model tokens. Event wake and heartbeat are model turns. Event wake produces at most one organizer turn per eligible successfully delivered lifecycle event; exclusions, probe suppression, rate limits, capability failures, identity failures, and send failures can reduce that to zero. A heartbeat is a scheduled model turn: 5 minutes is 288 runs/day, 1 hour is 24, and 4 hours is 6. Actual token usage varies with the selected model and visible task count. Only the Hook-originated organizer envelope is content-free; the organizer's subsequent `list_threads` and `read_thread` results can expose visible titles, summaries, and status metadata to the selected model even though the audited prompts prohibit using visible text for decisions. Do not enable event wake or heartbeat if that metadata boundary is unacceptable.
 
 ## Verify
 

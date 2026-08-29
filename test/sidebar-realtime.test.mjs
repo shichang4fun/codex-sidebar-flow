@@ -428,13 +428,14 @@ hostlessMissing.sections.find((section) => section.sectionId === "progress").ite
   "codex:thread:local:hostless-remote",
 );
 const hostlessCalls = [];
-await sidebarRealtime.hydrateCustomThreads(hostlessMissing, config, {
+const hostlessHydrated = await sidebarRealtime.hydrateCustomThreads(hostlessMissing, config, {
   readThread: async (threadId, hostId) => {
     hostlessCalls.push({ threadId, hostId });
     return { thread: { id: threadId, kind: "codex", hostId: remoteHostId, status: { type: "idle" } }, turns: [] };
   },
 });
-assert.deepEqual(hostlessCalls, [{ threadId: "hostless-remote", hostId: undefined }]);
+assert.deepEqual(hostlessCalls, []);
+assert.match(hostlessHydrated.hydrationErrors[0].error, /no authoritative hostId/);
 
 for (const protectedSection of ["pinned", "later"]) {
   const child = thread(`protected-parent-${protectedSection}`, "idle", "progress", {

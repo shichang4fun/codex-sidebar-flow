@@ -55,7 +55,11 @@ assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
   let created = 0;
   let reset = 0;
   const result = await executeHookEvent(
-    { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+    {
+      session_id: "thread-1",
+      hook_event_name: "UserPromptSubmit",
+      host_id: "remote-control:env_remote_test",
+    },
     config,
     {
       createAppTools() {
@@ -88,7 +92,11 @@ assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
 {
   const readCalls = [];
   const result = await executeHookEvent(
-    { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+    {
+      session_id: "thread-1",
+      hook_event_name: "UserPromptSubmit",
+      host_id: "remote-control:env_remote_test",
+    },
     config,
     {
       createAppTools() {
@@ -117,7 +125,10 @@ assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
       wait: async () => {},
     },
   );
-  assert.deepEqual(readCalls, [{ threadId: "thread-1", hostId: undefined }]);
+  assert.deepEqual(readCalls, [{
+    threadId: "thread-1",
+    hostId: "remote-control:env_remote_test",
+  }]);
   assert.deepEqual(result.managedAdds, []);
   assert.deepEqual(result.observedIdentities, ["remote-control:env_remote_test:thread-1"]);
 }

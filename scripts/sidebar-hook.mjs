@@ -122,11 +122,13 @@ async function hydrateHookThread(snapshot, input, appTools, deadlineAt) {
   const existing = threads.find((thread) => thread.id === threadId);
   const mustRead = existing == null || !existing.hostId;
   if (!mustRead) return snapshot;
+  const executionHostId = existing?.hostId ?? input.host_id;
+  if (typeof executionHostId !== "string" || executionHostId.length === 0) return snapshot;
   const result = await runBeforeDeadline(
-    () => appTools.readThread(threadId, existing?.hostId ?? input.host_id),
+    () => appTools.readThread(threadId, executionHostId),
     deadlineAt,
   );
-  const hostId = result.thread?.hostId ?? existing?.hostId ?? input.host_id;
+  const hostId = result.thread?.hostId ?? executionHostId;
   if (typeof hostId !== "string" || hostId.length === 0) return snapshot;
   const hydrated = {
     ...existing,

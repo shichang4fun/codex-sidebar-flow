@@ -880,6 +880,7 @@ export function statusFromThreadRead(result) {
 export async function hydrateCustomThreads(snapshot, config, appTools, knownHosts = new Map()) {
   const threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
   const threadById = new Map(threads.map((thread) => [thread.id, thread]));
+  snapshot.hydrationErrors = [];
   const customSections = (snapshot.sections ?? []).filter((section) =>
     [config.sections.inProgress, config.sections.forReview].includes(section.name),
   );
@@ -902,6 +903,13 @@ export async function hydrateCustomThreads(snapshot, config, appTools, knownHost
     const existingStatus = normalizedThreadStatus(existing);
     if (existing != null && !["notloaded", "active"].includes(existingStatus)) continue;
     const executionHostId = existing?.hostId ?? knownHosts.get(parsed.threadId);
+    if (typeof executionHostId !== "string" || executionHostId.length === 0) {
+      snapshot.hydrationErrors.push({
+        threadId: parsed.threadId,
+        error: "read_thread skipped because no authoritative hostId is available",
+      });
+      continue;
+    }
     reads.push({
       key,
       parsed,
@@ -912,7 +920,6 @@ export async function hydrateCustomThreads(snapshot, config, appTools, knownHost
   }
 
   const outcomes = await Promise.allSettled(reads.map(({ promise }) => promise));
-  snapshot.hydrationErrors = [];
   for (let index = 0; index < outcomes.length; index += 1) {
     const outcome = outcomes[index];
     const { key, parsed, existing, executionHostId } = reads[index];

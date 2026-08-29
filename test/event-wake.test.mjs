@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -593,6 +593,38 @@ test("wakeOrganizer counts failed and timed out sends against the permit without
     );
     assert.deepEqual(timedOut, { status: "failed", errorCode: "send_timeout" });
     assert.deepEqual(JSON.parse(await readFile(timeoutFile, "utf8")).timestamps, [200000]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("wakeOrganizer checks deadline signal immediately before send and never dispatches after abort", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-abort-before-send-"));
+  const stateFile = path.join(directory, "abort.json");
+  const controller = new AbortController();
+  let sends = 0;
+
+  try {
+    const result = await wakeOrganizer(
+      makeEnvelope(),
+      makeConfig({ wakeStateFile: stateFile, maxPerMinute: 1 }),
+      {
+        sendMessageToThread: async () => {
+          sends += 1;
+        },
+      },
+      {
+        signal: controller.signal,
+        renameFile: async (...args) => {
+          controller.abort();
+          return rename(...args);
+        },
+      },
+    );
+
+    assert.deepEqual(result, { status: "failed", errorCode: "wake_deadline" });
+    assert.equal(sends, 0);
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).timestamps.length, 1);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

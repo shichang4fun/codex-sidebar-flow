@@ -591,7 +591,9 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
           };
         },
         async wake() {
-          throw new Error("secret prompt body with thread-1 remote-control:env crash");
+          throw Object.assign(new Error("secret prompt body with thread-1 remote-control:env crash"), {
+            code: "bad\ncode:secret-thread-1",
+          });
         },
       },
     );
@@ -629,15 +631,27 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
       { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
       configPath,
       {
-        async execute() {
+        createAppTools(_configArg, options) {
+          const requiredTools = options?.requiredTools ?? [];
+          if (requiredTools.includes("send_message_to_thread")) {
+            return {
+              async sendMessageToThread() {
+                wakeCalls += 1;
+              },
+              reset() {},
+            };
+          }
           return {
-            attempts: 1,
-            managedAdds: [],
-            managedRemoves: [],
-            observedIdentities: ["local:thread-1"],
-            eventEnvelope: null,
+            async listThreads() {
+              return {
+                threads: [{ id: "thread-1", hostId: "local", kind: "codex", status: "active" }],
+                sections: [],
+              };
+            },
+            reset() {},
           };
         },
+        async updateManaged() {},
         async wake() {
           wakeCalls += 1;
           return { status: "sent" };

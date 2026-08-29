@@ -251,27 +251,53 @@ export async function executeHookEvent(
 
 function boundedWakeResult(result) {
   if (result == null || typeof result !== "object") return null;
-  const wakeStatus = typeof result.status === "string" ? result.status : "failed";
-  const wakeErrorCode = typeof result.errorCode === "string" ? result.errorCode : undefined;
+  const wakeStatus = sanitizeWakeStatus(result.status);
+  const wakeErrorCode = sanitizeWakeErrorCode(result.errorCode);
   return wakeErrorCode == null ? { wakeStatus } : { wakeStatus, wakeErrorCode };
 }
 
+const STABLE_WAKE_ERROR_CODES = new Set([
+  "invalid_config",
+  "invalid_envelope",
+  "invalid_state",
+  "io_failure",
+  "lock_unavailable",
+  "rate_limited",
+  "send_failed",
+  "send_timeout",
+  "wake_deadline",
+  "wake_failed",
+]);
+
+function sanitizeWakeStatus(status) {
+  return new Set(["disabled", "excluded", "failed", "rate_limited", "sent"]).has(status)
+    ? status
+    : "failed";
+}
+
+function sanitizeWakeErrorCode(errorCode) {
+  if (typeof errorCode !== "string") return undefined;
+  return STABLE_WAKE_ERROR_CODES.has(errorCode) ? errorCode : "wake_failed";
+}
+
 function boundedWakeThrown(error) {
-  const wakeErrorCode = typeof error?.code === "string" && error.code.length > 0
-    ? error.code
-    : "wake_failed";
+  const wakeErrorCode = sanitizeWakeErrorCode(error?.code) ?? "wake_failed";
   return { wakeStatus: "failed", wakeErrorCode };
 }
 
 async function wakeBeforeDeadline(task, deadlineAt, now = Date.now) {
   const remainingMs = remainingDeadlineMs(deadlineAt, now);
   if (remainingMs <= 0) return { status: "failed", errorCode: "wake_deadline" };
+  const controller = new AbortController();
   let timer;
   try {
     return await Promise.race([
-      Promise.resolve().then(task),
+      Promise.resolve().then(() => task(controller.signal)),
       new Promise((resolve) => {
-        timer = setTimeout(() => resolve({ status: "failed", errorCode: "wake_deadline" }), remainingMs);
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve({ status: "failed", errorCode: "wake_deadline" });
+        }, remainingMs);
       }),
     ]);
   } finally {
@@ -343,7 +369,7 @@ export async function handleHook(
     try {
       wakeOutcome = boundedWakeResult(
         await wakeBeforeDeadline(
-          () => wake(result.eventEnvelope, config.eventWake, wakeTools),
+          (signal) => wake(result.eventEnvelope, config.eventWake, wakeTools, { signal }),
           deadlineAt,
           now,
         ),

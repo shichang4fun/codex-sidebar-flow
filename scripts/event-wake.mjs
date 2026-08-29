@@ -258,6 +258,18 @@ function stableErrorCode(error) {
   return "send_failed";
 }
 
+function dispatchBlocked(dependencies = {}) {
+  if (dependencies.signal?.aborted === true) return true;
+  if (typeof dependencies.canDispatch === "function") {
+    try {
+      return dependencies.canDispatch() === false;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function wakeOrganizer(envelope, config, appTools, dependencies = {}) {
   if (!isRecord(config) || config.enabled !== true) return { status: "disabled" };
   let organizer;
@@ -280,6 +292,9 @@ export async function wakeOrganizer(envelope, config, appTools, dependencies = {
   ) {
     return { status: "excluded" };
   }
+  if (dispatchBlocked(dependencies)) {
+    return { status: "failed", errorCode: "wake_deadline" };
+  }
 
   const permit = await acquireWakePermit(
     organizer.wakeStateFile,
@@ -289,6 +304,9 @@ export async function wakeOrganizer(envelope, config, appTools, dependencies = {
   if (!permit.ok) {
     if (permit.errorCode === "rate_limited") return { status: "rate_limited" };
     return { status: "failed", errorCode: permit.errorCode };
+  }
+  if (dispatchBlocked(dependencies)) {
+    return { status: "failed", errorCode: "wake_deadline" };
   }
 
   try {

@@ -51,7 +51,7 @@ Restart Codex Desktop after setup. The installer:
 - backs up `~/.codex/hooks.json`;
 - installs only `UserPromptSubmit` and `Stop` handlers;
 - creates or upgrades `~/.codex/sidebar-flow/config.json` with the exact install mode and runtime fingerprint;
-- stages the fixed runtime file set, verifies its SHA-256 fingerprint, and atomically publishes an immutable release under `~/.codex/sidebar-flow/releases/<runtimeFingerprint>` before changing Hooks. Existing releases are retained, and no `current` symlink is used.
+- in source mode, stages the fixed runtime script set, verifies its SHA-256 fingerprint, and atomically publishes an immutable release under `~/.codex/sidebar-flow/releases/<runtimeFingerprint>` before changing Hooks. Existing releases are retained, and no `current` symlink is used. Plugin fingerprints cover that shared runtime plus the plugin manifest, Hook declaration, launcher, heartbeat renderer and prompt, and Sidebar Flow skill.
 
 Setup does not silently create a scheduled model task. Event wake is model-triggering and user-visible, so enable it only with explicit user authorization. The event-wake fast path requires only the lifecycle Hook and a configured organizer task.
 
@@ -80,7 +80,7 @@ node scripts/render-heartbeat.mjs --exclude <organizer-task-id>
 
 Creation must fail if the placeholder remains or no exact organizer ID was supplied.
 
-Enable event wake in two phases because capability is bound to both `installMode` and the SHA-256 fingerprint of the exact runtime files. A setup that changes either binding succeeds with event wake forced disabled. `--enable-event-wake` fails with `CAPABILITY_PROBE_REQUIRED` before writing unless the latest strict probe result is `present` for the current binding.
+Enable event wake in two phases because capability is bound to both `installMode` and the SHA-256 fingerprint of the exact mode-specific runtime files. A setup that changes either binding succeeds with event wake forced disabled. `--enable-event-wake` fails with `CAPABILITY_PROBE_REQUIRED` before writing unless the latest strict probe result is `present` for the current binding and its request TTL has not expired.
 
 Source mode:
 
@@ -102,7 +102,7 @@ Plugin mode:
    `node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin --enable-event-wake --organizer-thread-id <organizer-task-id> --organizer-host-id local`
 6. Verify: `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin`
 
-If the probe is missing, pending, expired, belongs to another install mode/runtime fingerprint, or is not `present`, keep event wake disabled and retain the 5-minute heartbeat. The Hook recomputes the fingerprint from its own actual files before it may record `present`. The probe confirms whether that exact runtime saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself.
+If the probe is missing, pending, expired, belongs to another install mode/runtime fingerprint, or is not `present`, keep event wake disabled and retain the 5-minute heartbeat. The Hook recomputes the mode-specific fingerprint from its own actual files before it may record `present`. The probe confirms whether that exact runtime saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself. During normal execution, each new AppTools connection still performs a live `tools/list` and fails closed when its required tools are absent; a prior capability result is never used as a substitute for that live check.
 
 Keep the heartbeat at 5 minutes until live acceptance succeeds on the hosts you care about. Only after verified event-path acceptance should you consider 30-60 minutes. If remote acceptance is absent or fails, do not claim remote realtime behavior and keep the heartbeat interval short enough to cover the remote repair delay you still need.
 
@@ -120,9 +120,9 @@ node scripts/doctor.mjs
 
 Plugin mode uses `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin`. Without an active `CLAUDE_PLUGIN_ROOT`, `--plugin-root <path>` can validate package completeness but reports app enablement as unverified.
 
-`doctor` validates static installation. Outside a trusted Hook it deliberately reports runtime capability as unverified; an observed-state acceptance test is still required. `doctor --probe` performs read-only `tools/list` and section checks when run in a trusted app-tools context. `doctor --arm-event-wake-probe` and `doctor --event-wake-probe-result` are the supported capability-gating path before claiming event wake works.
+`doctor` validates static installation and reproduces the configured fingerprint from the source Hook's owned target root or the supplied plugin root; a merely well-formed stored hash is not accepted. Outside a trusted Hook it deliberately reports runtime capability as unverified; an observed-state acceptance test is still required. `doctor --probe` performs read-only `tools/list` and section checks when run in a trusted app-tools context. `doctor --arm-event-wake-probe` and `doctor --event-wake-probe-result` are the supported capability-gating path before claiming event wake works.
 
-Hook diagnostics are written to `~/.codex/sidebar-flow/hook.log` with mode `0600` and one bounded rotation. Logs omit prompts, outputs, task titles, full task bodies, and private tool error bodies.
+Hook diagnostics are written to `~/.codex/sidebar-flow/hook.log` with mode `0600` and one bounded rotation. Logs contain only bounded event, status/error-code, attempt, capability, and duration fields; they omit prompts, outputs, task titles, full task bodies, complete task IDs, executable paths, socket paths/basenames, and private tool error bodies.
 
 ## Configuration
 

@@ -10,6 +10,7 @@ import {
   isRetryableHookError,
   managedMutationFromLifecycle,
 } from "../scripts/sidebar-hook.mjs";
+import * as sidebarHookModule from "../scripts/sidebar-hook.mjs";
 import { AppTools } from "../scripts/sidebar-realtime.mjs";
 import {
   armEventWakeProbe,
@@ -21,10 +22,13 @@ import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/set
 import { computeRuntimeFingerprint } from "../scripts/runtime-integrity.mjs";
 
 const execFileAsync = promisify(execFile);
-const TEST_RUNTIME_FINGERPRINT = await computeRuntimeFingerprint(path.resolve("."));
+const TEST_RUNTIME_FINGERPRINTS = {
+  source: await computeRuntimeFingerprint(path.resolve("."), "source"),
+  plugin: await computeRuntimeFingerprint(path.resolve("."), "plugin"),
+};
 
 function runtimeDefaultConfig(codexHome, installMode) {
-  return defaultConfig(codexHome, installMode, TEST_RUNTIME_FINGERPRINT);
+  return defaultConfig(codexHome, installMode, TEST_RUNTIME_FINGERPRINTS[installMode]);
 }
 
 async function withinTimeout(promise, timeoutMs, message) {
@@ -51,6 +55,25 @@ const eventWakeConfig = {
   organizerHostId: "remote-control:env_organizer",
   wakeStateFile: path.join(os.tmpdir(), `sidebar-hook-wake-${process.pid}.json`),
 };
+
+assert.equal(typeof sidebarHookModule.boundedHookLog, "function");
+assert.deepEqual(sidebarHookModule.boundedHookLog({
+  event: "Stop",
+  threadId: "secret-thread-id",
+  execPath: "/secret/runtime/node",
+  pipeBasename: "secret-app-tools.sock",
+  socketPath: "/secret/app-tools.sock",
+  attempts: 2,
+  toolsListSucceeded: false,
+  durationMs: 42,
+  errorCode: "APP_TOOLS_UNAVAILABLE",
+}), {
+  event: "Stop",
+  attempts: 2,
+  toolsListSucceeded: false,
+  durationMs: 42,
+  errorCode: "APP_TOOLS_UNAVAILABLE",
+});
 
 function snapshot({ hostId = "local", kind = "codex", includeThread = true } = {}) {
   return {
@@ -623,7 +646,9 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   const stateFile = path.join(codexHome, "sidebar-flow", "state.json");
   const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");
   const previousMode = process.env[INSTALL_MODE_ENV];
+  const previousPipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
   process.env[INSTALL_MODE_ENV] = "plugin";
+  process.env.CODEX_APP_TOOLS_PIPE_PATH = "/private/tmp/secret-app-tools.sock";
   const wakeCalls = [];
   try {
     await writeJsonAtomic(configPath, {
@@ -668,10 +693,16 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     const records = (await readFile(hookLogFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(records.at(-1).wakeStatus, "sent");
     assert.equal("wakeErrorCode" in records.at(-1), false);
+    for (const field of ["threadId", "execPath", "pipeBasename", "socketPath"]) {
+      assert.equal(Object.hasOwn(records.at(-1), field), false, field);
+    }
+    assert.equal(JSON.stringify(records.at(-1)).includes("secret-app-tools.sock"), false);
 
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;
+    if (previousPipe == null) delete process.env.CODEX_APP_TOOLS_PIPE_PATH;
+    else process.env.CODEX_APP_TOOLS_PIPE_PATH = previousPipe;
     await rm(codexHome, { recursive: true, force: true });
   }
 }

@@ -25,7 +25,7 @@ import {
 
 const ownedCommand = `${HOOK_MARKER} node /repo/scripts/sidebar-hook.mjs`;
 const execFileAsync = promisify(execFile);
-const runtimeFiles = [
+const sourceRuntimeFiles = [
   "scripts/doctor.mjs",
   "scripts/event-wake.mjs",
   "scripts/runtime-integrity.mjs",
@@ -34,10 +34,20 @@ const runtimeFiles = [
   "scripts/sidebar-realtime.mjs",
   "scripts/uninstall.mjs",
 ];
+const pluginRuntimeFiles = [
+  ...sourceRuntimeFiles,
+  ".codex-plugin/plugin.json",
+  "docs/heartbeat-prompt.md",
+  "hooks/hooks.json",
+  "scripts/plugin-hook.sh",
+  "scripts/render-heartbeat.mjs",
+  "skills/sidebar-flow/SKILL.md",
+].sort();
 
-async function expectedRuntimeFingerprint(root) {
+async function expectedRuntimeFingerprint(root, mode = "source") {
+  const files = mode === "source" ? sourceRuntimeFiles : pluginRuntimeFiles;
   const hash = createHash("sha256");
-  for (const relativePath of runtimeFiles) {
+  for (const relativePath of files) {
     hash.update(relativePath);
     hash.update("\0");
     hash.update(await readFile(path.join(root, relativePath)));
@@ -47,27 +57,30 @@ async function expectedRuntimeFingerprint(root) {
 }
 
 async function copyRuntimeFixture(sourceRoot, targetRoot) {
-  for (const relativePath of runtimeFiles) {
+  for (const relativePath of sourceRuntimeFiles) {
     await mkdir(path.dirname(path.join(targetRoot, relativePath)), { recursive: true });
     await copyFile(path.join(sourceRoot, relativePath), path.join(targetRoot, relativePath));
   }
 }
 
-async function recordPresentProbe(config, runtimeRoot) {
+async function recordPresentProbe(config, runtimeRoot, {
+  armedAt = Date.now(),
+  probeId = "probe-setup-present",
+} = {}) {
   const pending = await armEventWakeProbe(config, {
     runtimeRoot,
-    now: () => 1_000,
-    createProbeId: () => "probe-setup-present",
+    now: () => armedAt,
+    createProbeId: () => probeId,
   });
   const claim = await claimEventWakeProbe(config, {
     runtimeRoot,
-    now: () => 2_000,
-    createClaimId: () => "claim-setup-present",
+    now: () => armedAt + 100,
+    createClaimId: () => `claim-${probeId}`,
   });
   assert.equal(claim.status, "claimed");
   assert.equal(await writeEventWakeProbeResult(config, "present", {
     runtimeRoot,
-    now: () => 2_500,
+    now: () => armedAt + 200,
     claim,
   }), true);
   await releaseEventWakeProbeClaim(config, claim, { runtimeRoot });
@@ -195,6 +208,20 @@ test("setup requires a present probe bound to the exact mode and runtime before 
     assert.equal(upgraded.installMode, "source");
     assert.match(upgraded.runtimeFingerprint, /^[a-f0-9]{64}$/);
     assert.deepEqual(upgraded.unrelated, { keep: true });
+    await recordPresentProbe(upgraded, runtime, {
+      armedAt: 1_000,
+      probeId: "probe-setup-expired",
+    });
+    const beforeExpiredEnable = await readFile(configPath, "utf8");
+    await assert.rejects(
+      setup({
+        codexHome,
+        enableEventWake: true,
+        organizerThreadId: "organizer-expired",
+      }),
+      (error) => error.code === "CAPABILITY_PROBE_REQUIRED",
+    );
+    assert.equal(await readFile(configPath, "utf8"), beforeExpiredEnable);
     await recordPresentProbe(upgraded, runtime);
 
     await setup({
@@ -248,7 +275,7 @@ test("source setup publishes immutable fingerprinted releases before changing ho
     assert.equal(first.runtimeFingerprint, firstFingerprint);
     assert.equal(first.releaseRoot, path.join(codexHome, "sidebar-flow", "releases", firstFingerprint));
     assert.equal((await lstat(first.releaseRoot)).isSymbolicLink(), false);
-    for (const relativePath of runtimeFiles) {
+    for (const relativePath of sourceRuntimeFiles) {
       assert.equal((await stat(path.join(first.releaseRoot, relativePath))).isFile(), true);
     }
     assert.equal(firstHooks.includes(path.join(first.releaseRoot, "scripts", "sidebar-hook.mjs")), true);
@@ -267,7 +294,7 @@ test("source setup publishes immutable fingerprinted releases before changing ho
       /injected staging failure/,
     );
     assert.equal(await readFile(first.hooksPath, "utf8"), firstHooks);
-    for (const relativePath of runtimeFiles) {
+    for (const relativePath of sourceRuntimeFiles) {
       assert.equal((await stat(path.join(first.releaseRoot, relativePath))).isFile(), true);
     }
 
@@ -478,6 +505,7 @@ test("plugin setup creates configuration without global hooks", async () => {
     const config = JSON.parse(await readFile(result.configPath, "utf8"));
     assert.equal(config.allowSocketDiscovery, false);
     assert.equal(config.installMode, "plugin");
+    assert.equal(config.runtimeFingerprint, await expectedRuntimeFingerprint(path.resolve("."), "plugin"));
     await assert.rejects(readFile(path.join(codexHome, "hooks.json"), "utf8"), /ENOENT/);
   } finally {
     await rm(codexHome, { recursive: true, force: true });

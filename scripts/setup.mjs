@@ -77,6 +77,19 @@ export function findUnmarkedSidebarHookPaths(existing = {}) {
   return [...paths];
 }
 
+export function findOwnedSidebarHookPaths(existing = {}) {
+  const paths = new Set();
+  for (const event of ["UserPromptSubmit", "Stop"]) {
+    for (const matcher of existing.hooks?.[event] ?? []) {
+      for (const hook of matcher?.hooks ?? []) {
+        if (typeof hook?.command !== "string" || !hook.command.includes(HOOK_MARKER)) continue;
+        for (const candidate of sidebarHookPaths(hook.command)) paths.add(candidate);
+      }
+    }
+  }
+  return [...paths];
+}
+
 function isOwnedHook(hook, legacyHookPaths = []) {
   return typeof hook?.command === "string" && (
     hook.command.includes(HOOK_MARKER)
@@ -204,7 +217,7 @@ async function verifyRelease(releaseRoot, expectedFingerprint) {
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
     throw new Error("Runtime release must be a real directory");
   }
-  const actualFingerprint = await computeRuntimeFingerprint(releaseRoot);
+  const actualFingerprint = await computeRuntimeFingerprint(releaseRoot, "source");
   if (actualFingerprint !== expectedFingerprint) {
     const error = new Error("Runtime release fingerprint mismatch");
     error.code = "RUNTIME_FINGERPRINT_MISMATCH";
@@ -243,7 +256,7 @@ async function publishSourceRelease(
       await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
       await copyRuntimeFile(path.join(sourceRoot, relativePath), destination);
     }
-    const stagedFingerprint = await computeRuntimeFingerprint(stagingRoot);
+    const stagedFingerprint = await computeRuntimeFingerprint(stagingRoot, "source");
     if (stagedFingerprint !== runtimeFingerprint) {
       const error = new Error("Staged runtime fingerprint mismatch");
       error.code = "RUNTIME_FINGERPRINT_MISMATCH";
@@ -299,7 +312,7 @@ export async function setup({
   const backupPath = `${hooksPath}.sidebar-flow.bak`;
   const configPath = path.join(runtimeRoot, "config.json");
   const sourceRoot = dependencies.sourceRoot ?? ROOT;
-  const runtimeFingerprint = await computeRuntimeFingerprint(sourceRoot);
+  const runtimeFingerprint = await computeRuntimeFingerprint(sourceRoot, mode);
   const releaseRoot = mode === "source"
     ? path.join(runtimeRoot, "releases", runtimeFingerprint)
     : sourceRoot;

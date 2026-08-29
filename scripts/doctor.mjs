@@ -7,9 +7,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppTools } from "./sidebar-realtime.mjs";
-import { isRuntimeFingerprint } from "./runtime-integrity.mjs";
+import { computeRuntimeFingerprint, isRuntimeFingerprint } from "./runtime-integrity.mjs";
 import {
   detectNodeExecutable,
+  findOwnedSidebarHookPaths,
   findUnmarkedSidebarHookPaths,
   HOOK_MARKER,
   isSafeIdentifier,
@@ -437,10 +438,10 @@ export async function readEventWakeProbeResult(
     await afterResultRead({ attempt, probeId: firstRequest.probeId });
     const secondRequest = await readCurrentProbeRequest(paths);
     if (!sameRequest(firstRequest, secondRequest)) continue;
-    if (result != null) return publicProbeResult(result);
     if (observedAt > firstRequest.expiresAt) {
       return { status: "expired", ...publicProbeRequest(firstRequest) };
     }
+    if (result != null) return publicProbeResult(result);
     return { status: "pending", ...publicProbeRequest(firstRequest) };
   }
   return { status: "pending" };
@@ -465,9 +466,9 @@ export async function claimEventWakeProbe(
   const request = await readCurrentProbeRequest(paths);
   if (request == null) return { status: "none" };
   await cleanupOrphanedProbeGenerations(paths, request, observedAt).catch(() => {});
+  if (observedAt > request.expiresAt) return { status: "expired", ...publicProbeRequest(request) };
   const result = await readCompletedProbeResult(paths, request);
   if (result != null) return { status: "complete", result: publicProbeResult(result) };
-  if (observedAt > request.expiresAt) return { status: "expired", ...publicProbeRequest(request) };
   const generation = generationProbePaths(paths, request.probeId);
   await afterInitialResultRead({ probeId: request.probeId });
   const claimId = createClaimId();
@@ -482,11 +483,12 @@ export async function claimEventWakeProbe(
     );
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
+    if (observedAt > request.expiresAt) {
+      return { status: "expired", ...publicProbeRequest(request) };
+    }
     const completedResult = await readCompletedProbeResult(paths, request);
     if (completedResult != null) return { status: "complete", result: publicProbeResult(completedResult) };
-    return observedAt > request.expiresAt
-      ? { status: "expired", ...publicProbeRequest(request) }
-      : { status: "busy" };
+    return { status: "busy" };
   }
   const claimRecord = {
     protocol: EVENT_WAKE_PROBE_PROTOCOL,
@@ -589,6 +591,43 @@ export async function writeExpiredEventWakeProbeResult(
   return true;
 }
 
+export async function inspectRuntimeBinding({
+  mode,
+  hooks,
+  config,
+  pluginRoot,
+  computeFingerprint = computeRuntimeFingerprint,
+} = {}) {
+  if (!new Set(["source", "plugin"]).has(mode)) {
+    return { mode, runtimeFingerprint: null, matches: false };
+  }
+  let root;
+  if (mode === "source") {
+    const hookPaths = findOwnedSidebarHookPaths(hooks);
+    if (hookPaths.length !== 1) return { mode, runtimeFingerprint: null, matches: false };
+    root = path.dirname(path.dirname(hookPaths[0]));
+  } else {
+    root = pluginRoot;
+  }
+  if (!isBoundedAbsolutePath(root) || path.normalize(root) !== root) {
+    return { mode, runtimeFingerprint: null, matches: false };
+  }
+  try {
+    const metadata = await lstat(root);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      return { mode, runtimeFingerprint: null, matches: false };
+    }
+    const runtimeFingerprint = await computeFingerprint(root, mode);
+    return {
+      mode,
+      runtimeFingerprint,
+      matches: config?.installMode === mode && config?.runtimeFingerprint === runtimeFingerprint,
+    };
+  } catch {
+    return { mode, runtimeFingerprint: null, matches: false };
+  }
+}
+
 export function inspectInstallation({
   hooks,
   config,
@@ -601,6 +640,7 @@ export function inspectInstallation({
   pluginBundle = null,
   legacyHookConflicts = [],
   runtimeRoot,
+  runtimeBinding = null,
 } = {}) {
   const checks = [];
   checks.push({
@@ -629,12 +669,17 @@ export function inspectInstallation({
       ? `${mode} mode recorded`
       : (config?.installMode == null ? "Install mode is not recorded" : `Configuration records ${config.installMode} mode`),
   });
+  const runtimeBindingValid = config?.installMode === mode
+    && isRuntimeFingerprint(config?.runtimeFingerprint)
+    && runtimeBinding?.matches === true
+    && runtimeBinding?.mode === mode
+    && runtimeBinding?.runtimeFingerprint === config.runtimeFingerprint;
   checks.push({
-    level: config?.installMode === mode && isRuntimeFingerprint(config?.runtimeFingerprint) ? "ok" : "error",
+    level: runtimeBindingValid ? "ok" : "error",
     name: "runtime-binding",
-    message: config?.installMode === mode && isRuntimeFingerprint(config?.runtimeFingerprint)
-      ? "Configuration is bound to a runtime fingerprint"
-      : "Configuration is missing an exact install mode and runtime fingerprint binding",
+    message: runtimeBindingValid
+      ? "Configured runtime fingerprint matches the installed runtime"
+      : "Configured runtime fingerprint was not reproduced from the installed runtime",
   });
   if (mode === "source") {
     for (const event of ["UserPromptSubmit", "Stop"]) {
@@ -659,6 +704,9 @@ export function inspectInstallation({
       "uninstall",
       "doctor",
       "runtimeIntegrity",
+      "renderHeartbeat",
+      "skill",
+      "heartbeatPrompt",
     ].every(
       (name) => pluginBundle[name] === true,
     );
@@ -772,6 +820,9 @@ export async function inspectPluginBundle(pluginRoot, { enabledContext = false }
     uninstall: "scripts/uninstall.mjs",
     doctor: "scripts/doctor.mjs",
     runtimeIntegrity: "scripts/runtime-integrity.mjs",
+    renderHeartbeat: "scripts/render-heartbeat.mjs",
+    skill: "skills/sidebar-flow/SKILL.md",
+    heartbeatPrompt: "docs/heartbeat-prompt.md",
   };
   const result = { enabledContext };
   await Promise.all(Object.entries(entries).map(async ([name, relativePath]) => {
@@ -830,6 +881,7 @@ async function main(argv = process.argv.slice(2)) {
     }
   }
   const eventWakeProbe = await readEventWakeProbeResult(config, { runtimeRoot });
+  const runtimeBinding = await inspectRuntimeBinding({ mode, hooks, config, pluginRoot });
   const pluginBundle = mode === "plugin"
     ? await inspectPluginBundle(pluginRoot, {
         enabledContext: pluginRoot != null && process.env.CLAUDE_PLUGIN_ROOT === pluginRoot,
@@ -842,6 +894,7 @@ async function main(argv = process.argv.slice(2)) {
     pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH,
     runtimeProbe,
     eventWakeProbe,
+    runtimeBinding,
     runtimeRoot,
     legacyHookConflicts: findUnmarkedSidebarHookPaths(hooks),
     pluginBundle,

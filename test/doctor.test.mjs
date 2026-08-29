@@ -15,6 +15,7 @@ import {
   writeEventWakeProbeResult,
 } from "../scripts/doctor.mjs";
 import { defaultConfig, HOOK_MARKER } from "../scripts/setup.mjs";
+import { computeRuntimeFingerprint } from "../scripts/runtime-integrity.mjs";
 
 const execFileAsync = promisify(execFile);
 const TEST_RUNTIME_FINGERPRINT = "a".repeat(64);
@@ -36,6 +37,69 @@ const config = {
   sections: { inProgress: "In Progress", forReview: "For Review", forLater: "For Later" },
 };
 
+test("doctor runtime binding requires a recomputed exact fingerprint", () => {
+  const storedOnly = inspectInstallation({ config, mode: "plugin" });
+  assert.equal(storedOnly.find((check) => check.name === "runtime-binding").level, "error");
+
+  const matched = inspectInstallation({
+    config,
+    mode: "plugin",
+    runtimeBinding: {
+      mode: "plugin",
+      runtimeFingerprint: TEST_RUNTIME_FINGERPRINT,
+      matches: true,
+    },
+  });
+  assert.equal(matched.find((check) => check.name === "runtime-binding").level, "ok");
+});
+
+test("doctor CLI recomputes source Hook and plugin-root fingerprints", async () => {
+  const doctorScript = path.resolve("scripts/doctor.mjs");
+  const repositoryRoot = path.resolve(".");
+  for (const mode of ["source", "plugin"]) {
+    const codexHome = await mkdtemp(path.join(os.tmpdir(), `sidebar-flow-doctor-binding-${mode}-`));
+    const runtimeRoot = path.join(codexHome, "sidebar-flow");
+    try {
+      await mkdir(runtimeRoot, { recursive: true });
+      if (mode === "source") {
+        const command = `${HOOK_MARKER} node ${path.join(repositoryRoot, "scripts/sidebar-hook.mjs")}`;
+        await writeFile(path.join(codexHome, "hooks.json"), `${JSON.stringify({
+          hooks: {
+            UserPromptSubmit: [{ hooks: [{ type: "command", command }] }],
+            Stop: [{ hooks: [{ type: "command", command }] }],
+          },
+        })}\n`, { mode: 0o600 });
+      }
+      const configPath = path.join(runtimeRoot, "config.json");
+      await writeFile(configPath, `${JSON.stringify(
+        defaultConfig(codexHome, mode, "f".repeat(64)),
+      )}\n`, { mode: 0o600 });
+      const args = [doctorScript, "--codex-home", codexHome];
+      if (mode === "plugin") args.push("--plugin", "--plugin-root", repositoryRoot);
+      await assert.rejects(
+        execFileAsync(process.execPath, args),
+        (error) => {
+          const payload = JSON.parse(error.stdout);
+          return error.code === 1
+            && payload.checks.find((check) => check.name === "runtime-binding")?.level === "error";
+        },
+      );
+
+      const actualFingerprint = await computeRuntimeFingerprint(repositoryRoot, mode);
+      await writeFile(configPath, `${JSON.stringify(
+        defaultConfig(codexHome, mode, actualFingerprint),
+      )}\n`, { mode: 0o600 });
+      const { stdout } = await execFileAsync(process.execPath, args);
+      assert.equal(
+        JSON.parse(stdout).checks.find((check) => check.name === "runtime-binding")?.level,
+        "ok",
+      );
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }
+});
+
 test("plugin doctor rejects a missing bundle", () => {
   const checks = inspectInstallation({
     config,
@@ -45,7 +109,8 @@ test("plugin doctor rejects a missing bundle", () => {
     pluginBundle: {
       manifest: false, hooks: false, launcher: false, sidebarHook: false,
       sidebarRealtime: false, eventWake: false, setup: false, uninstall: false,
-      doctor: false, runtimeIntegrity: false, enabledContext: false,
+      doctor: false, runtimeIntegrity: false, renderHeartbeat: false, skill: false,
+      heartbeatPrompt: false, enabledContext: false,
     },
   });
   assert.equal(checks.find((check) => check.name === "plugin-bundle").level, "error");
@@ -60,7 +125,8 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
       sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
-      doctor: true, runtimeIntegrity: true, enabledContext: false,
+      doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
+      heartbeatPrompt: true, enabledContext: false,
     },
   });
   assert.equal(staticChecks.find((check) => check.name === "plugin-bundle").level, "warning");
@@ -73,7 +139,8 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
       sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
-      doctor: true, runtimeIntegrity: true, enabledContext: true,
+      doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
+      heartbeatPrompt: true, enabledContext: true,
     },
   });
   assert.equal(activeChecks.find((check) => check.name === "plugin-bundle").level, "ok");
@@ -88,7 +155,8 @@ test("doctor reports unowned legacy sidebar Hooks as an error", () => {
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
       sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
-      doctor: true, runtimeIntegrity: true, enabledContext: true,
+      doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
+      heartbeatPrompt: true, enabledContext: true,
     },
     legacyHookConflicts: ["/opt/old/scripts/sidebar-hook.mjs"],
   });
@@ -109,11 +177,15 @@ test("plugin doctor requires every runtime and administration bundle component",
     uninstall: true,
     doctor: true,
     runtimeIntegrity: true,
+    renderHeartbeat: true,
+    skill: true,
+    heartbeatPrompt: true,
     enabledContext: true,
   };
   for (const missing of [
     "manifest", "hooks", "launcher", "sidebarHook", "sidebarRealtime", "eventWake",
-    "setup", "uninstall", "doctor", "runtimeIntegrity",
+    "setup", "uninstall", "doctor", "runtimeIntegrity", "renderHeartbeat", "skill",
+    "heartbeatPrompt",
   ]) {
     const checks = inspectInstallation({
       config,
@@ -139,6 +211,9 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
     ["uninstall", "scripts/uninstall.mjs"],
     ["doctor", "scripts/doctor.mjs"],
     ["runtimeIntegrity", "scripts/runtime-integrity.mjs"],
+    ["renderHeartbeat", "scripts/render-heartbeat.mjs"],
+    ["skill", "skills/sidebar-flow/SKILL.md"],
+    ["heartbeatPrompt", "docs/heartbeat-prompt.md"],
   ];
   try {
     for (const [, relativePath] of entries) {
@@ -157,6 +232,9 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
       uninstall: true,
       doctor: true,
       runtimeIntegrity: true,
+      renderHeartbeat: true,
+      skill: true,
+      heartbeatPrompt: true,
       enabledContext: true,
     });
 
@@ -294,23 +372,16 @@ test("doctor arms and reads bounded private event-wake probe state", async () =>
       expiresAt: 301_000,
     });
     assert.deepEqual(await readEventWakeProbeResult(config, { runtimeRoot, now: () => 400_000 }), {
-      status: "present",
+      status: "expired",
       probeId: "probe-00000001",
       armedAt: 1_000,
-      claimedAt: 2_000,
-      observedAt: 2_500,
       expiresAt: 301_000,
     });
     assert.deepEqual(await claimEventWakeProbe(config, { runtimeRoot, now: () => 400_000 }), {
-      status: "complete",
-      result: {
-        status: "present",
-        probeId: "probe-00000001",
-        armedAt: 1_000,
-        claimedAt: 2_000,
-        observedAt: 2_500,
-        expiresAt: 301_000,
-      },
+      status: "expired",
+      probeId: "probe-00000001",
+      armedAt: 1_000,
+      expiresAt: 301_000,
     });
 
     const next = await armEventWakeProbe(config, {
@@ -384,7 +455,7 @@ test("probe records are strictly bound to install mode and runtime fingerprint",
   }
 });
 
-test("doctor CLI stays healthy after request ttl when a matching present probe result already exists", async () => {
+test("a completed present probe expires with its request ttl", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-cli-present-"));
   const runtimeRoot = path.join(codexHome, "sidebar-flow");
   const config = runtimeDefaultConfig(codexHome, "source");
@@ -427,14 +498,15 @@ test("doctor CLI stays healthy after request ttl when a matching present probe r
       runtimeFingerprint: TEST_RUNTIME_FINGERPRINT,
     })}\n`, { mode: 0o600 });
 
-    const { stdout } = await execFileAsync(process.execPath, [
-      path.resolve("scripts/doctor.mjs"),
-      "--codex-home",
-      codexHome,
-    ]);
-    const payload = JSON.parse(stdout);
-    assert.equal(payload.mode, "source");
-    assert.equal(payload.checks.find((check) => check.name === "event-wake-capability").level, "ok");
+    assert.deepEqual(
+      await readEventWakeProbeResult(config, { runtimeRoot, now: () => 400_000 }),
+      {
+        status: "expired",
+        probeId: "probe-00000001",
+        armedAt: 1_000,
+        expiresAt: 301_000,
+      },
+    );
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }

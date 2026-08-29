@@ -109,6 +109,32 @@ async function readHookInput() {
   return JSON.parse(source || "{}");
 }
 
+const HOOK_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+const PROBE_LOG_STATUSES = new Set(["present", "missing", "pending", "expired"]);
+
+export function boundedHookLog(payload = {}) {
+  const record = {};
+  record.event = ["UserPromptSubmit", "Stop"].includes(payload.event) ? payload.event : "unknown";
+  if (Number.isSafeInteger(payload.attempts) && payload.attempts >= 0 && payload.attempts <= 10) {
+    record.attempts = payload.attempts;
+  }
+  for (const field of ["observationOnly", "hasPipe", "toolsListSucceeded"]) {
+    if (typeof payload[field] === "boolean") record[field] = payload[field];
+  }
+  if (Number.isSafeInteger(payload.durationMs) && payload.durationMs >= 0 && payload.durationMs <= 60_000) {
+    record.durationMs = payload.durationMs;
+  }
+  if (PROBE_LOG_STATUSES.has(payload.eventWakeProbeStatus)) {
+    record.eventWakeProbeStatus = payload.eventWakeProbeStatus;
+  }
+  if (Object.hasOwn(payload, "wakeStatus")) record.wakeStatus = sanitizeWakeStatus(payload.wakeStatus);
+  const wakeErrorCode = sanitizeWakeErrorCode(payload.wakeErrorCode);
+  if (wakeErrorCode != null) record.wakeErrorCode = wakeErrorCode;
+  record.errorCode = HOOK_ERROR_CODE_PATTERN.test(payload.errorCode) ? payload.errorCode : undefined;
+  if (record.errorCode == null) delete record.errorCode;
+  return record;
+}
+
 async function writeHookLog(logPath, payload) {
   const directory = path.dirname(logPath);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -117,25 +143,15 @@ async function writeHookLog(logPath, payload) {
   if (metadata?.size > MAX_LOG_BYTES) {
     await rename(logPath, `${logPath}.1`).catch(() => {});
   }
-  const record = { at: new Date().toISOString(), ...payload };
+  const record = { at: new Date().toISOString(), ...boundedHookLog(payload) };
   await appendFile(logPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
   await chmod(logPath, 0o600);
 }
 
 function safeError(error) {
   const code = typeof error?.code === "string" ? error.code : "HOOK_ERROR";
-  const safeMessages = [
-    /app tools pipe closed/i,
-    /no live codex app-tools socket/i,
-    /timed out (?:connecting to|calling)/i,
-    /expected exactly one sidebar section/i,
-    /missing built-in/i,
-    /hook deadline exceeded/i,
-  ];
-  const message = String(error?.message ?? "");
   return {
-    errorCode: code,
-    error: safeMessages.some((pattern) => pattern.test(message)) ? message.slice(0, 240) : code,
+    errorCode: HOOK_ERROR_CODE_PATTERN.test(code) ? code : "HOOK_ERROR",
   };
 }
 
@@ -389,7 +405,7 @@ export async function handleHook(
     error.code = "INSTALL_MODE_MISSING";
     throw error;
   }
-  const actualRuntimeFingerprint = await computeFingerprint(RUNTIME_ROOT);
+  const actualRuntimeFingerprint = await computeFingerprint(RUNTIME_ROOT, installMode);
   let config;
   try {
     config = await load(configPath);
@@ -486,14 +502,9 @@ export async function handleHook(
   }
   await writeHookLog(config.hookLogFile ?? DEFAULT_LOG_PATH, {
     event: input.hook_event_name,
-    destination: null,
     observationOnly: true,
     attempts: result.attempts,
-    pid: process.pid,
-    ppid: process.ppid,
-    execPath: process.execPath,
     hasPipe: Boolean(process.env.CODEX_APP_TOOLS_PIPE_PATH),
-    pipeBasename: path.basename(process.env.CODEX_APP_TOOLS_PIPE_PATH ?? ""),
     toolsListSucceeded: true,
     durationMs: now() - startedAt,
     ...(eventWakeProbeStatus == null ? {} : { eventWakeProbeStatus }),
@@ -511,13 +522,8 @@ async function main() {
     const safe = safeError(error);
     await writeHookLog(DEFAULT_LOG_PATH, {
       event: input?.hook_event_name ?? "unknown",
-      threadId: input?.session_id ?? null,
       attempts: error?.hookAttempts ?? 1,
-      pid: process.pid,
-      ppid: process.ppid,
-      execPath: process.execPath,
       hasPipe: Boolean(process.env.CODEX_APP_TOOLS_PIPE_PATH),
-      pipeBasename: path.basename(process.env.CODEX_APP_TOOLS_PIPE_PATH ?? ""),
       toolsListSucceeded: false,
       ...safe,
     }).catch(() => {});

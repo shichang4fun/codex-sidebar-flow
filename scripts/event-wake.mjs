@@ -247,6 +247,7 @@ function stableErrorCode(error) {
   const code = String(error?.code ?? "").toUpperCase();
   const name = String(error?.name ?? "").toLowerCase();
   const message = String(error?.message ?? "").toLowerCase();
+  if (code === "WAKE_DEADLINE") return "wake_deadline";
   if (
     code === "ETIMEDOUT" ||
     code === "ERR_TIMEOUT" ||
@@ -314,7 +315,7 @@ export async function wakeOrganizer(envelope, config, appTools, dependencies = {
       threadId: organizer.organizerThreadId,
       hostId: organizer.organizerHostId,
       prompt: renderEventWakePrompt(normalized, organizer),
-    });
+    }, dependencies);
     return { status: "sent" };
   } catch (error) {
     return { status: "failed", errorCode: stableErrorCode(error) };

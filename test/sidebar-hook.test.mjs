@@ -8,6 +8,7 @@ import {
   isRetryableHookError,
   managedMutationFromLifecycle,
 } from "../scripts/sidebar-hook.mjs";
+import { AppTools } from "../scripts/sidebar-realtime.mjs";
 import { defaultConfig, INSTALL_MODE_ENV, writeJsonAtomic } from "../scripts/setup.mjs";
 
 const config = { excludeThreadIds: ["automation"] };
@@ -625,6 +626,95 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     assert.equal(record.wakeStatus, "failed");
     assert.equal(record.wakeErrorCode, "wake_deadline");
     assert.equal(sends, 0);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-real-apptools-deadline-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "plugin";
+  const createdTools = [];
+  let sendCalls = 0;
+  let closedHosts = 0;
+  try {
+    await writeJsonAtomic(configPath, {
+      ...defaultConfig(codexHome, "plugin"),
+      hookDeadlineMs: 20,
+      hookLogFile,
+      eventWake: {
+        ...eventWakeConfig,
+        wakeStateFile: path.join(codexHome, "sidebar-flow", "wake.json"),
+      },
+    });
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+            eventEnvelope: {
+              protocol: "codex-sidebar-flow/event-v1",
+              event: "UserPromptSubmit",
+              threadId: "thread-1",
+              hostId: "local",
+            },
+          };
+        },
+        createAppTools(configArg, options) {
+          const tools = new AppTools(
+            {
+              ...configArg,
+              quiet: true,
+              socketProbeTimeoutMs: 200,
+              requestTimeoutMs: 200,
+              discoveryTimeoutMs: 200,
+            },
+            {
+              ...options,
+              discoverHost: async () => {
+                await new Promise((resolve) => setTimeout(resolve, 80));
+                return {
+                  socketPath: "/tmp/fake.sock",
+                  toolMap: new Map([
+                    ["send_message_to_thread", { name: "send_message_to_thread", namespace: "codex" }],
+                  ]),
+                  client: {
+                    timeoutMs: 200,
+                    close() {
+                      closedHosts += 1;
+                    },
+                    async request(method) {
+                      if (method === "tools/call") sendCalls += 1;
+                      return { success: true, contentItems: [] };
+                    },
+                  },
+                };
+              },
+            },
+          );
+          createdTools.push(tools);
+          return tools;
+        },
+        now: Date.now,
+      },
+    );
+    const record = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
+    assert.equal(record.wakeStatus, "failed");
+    assert.equal(record.wakeErrorCode, "wake_deadline");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(sendCalls, 0);
+    assert.equal(closedHosts, 1);
+    assert.equal(createdTools.at(-1)?.host, null);
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
     else process.env[INSTALL_MODE_ENV] = previousMode;

@@ -24,6 +24,28 @@ function now() {
   return new Date().toISOString();
 }
 
+function cancellationError() {
+  const error = new Error("Wake deadline exceeded");
+  error.code = "WAKE_DEADLINE";
+  return error;
+}
+
+function isDispatchCancelled({ signal, canDispatch } = {}) {
+  if (signal?.aborted === true) return true;
+  if (typeof canDispatch === "function") {
+    try {
+      return canDispatch() === false;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function throwIfDispatchCancelled(options) {
+  if (isDispatchCancelled(options)) throw cancellationError();
+}
+
 function sessionDayDirectory(sessionsDir, date) {
   const year = String(date.getFullYear());
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -69,25 +91,35 @@ export class NativePipeClient {
     this.connecting = null;
   }
 
-  async connect() {
+  async connect(options = {}) {
     if (this.socket != null && !this.socket.destroyed) return;
     if (this.connecting != null) return this.connecting;
+    throwIfDispatchCancelled(options);
 
     this.connecting = new Promise((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
       const timer = setTimeout(() => {
         fail(new Error(`Timed out connecting to ${path.basename(this.socketPath)}`));
       }, this.timeoutMs);
+      const abort = () => fail(cancellationError());
       const fail = (error) => {
         clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
         socket.destroy();
         reject(error);
       };
 
+      options.signal?.addEventListener?.("abort", abort, { once: true });
       socket.once("error", fail);
       socket.once("connect", () => {
         clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
         socket.off("error", fail);
+        if (isDispatchCancelled(options)) {
+          socket.destroy();
+          reject(cancellationError());
+          return;
+        }
         this.socket = socket;
         this.buffer = Buffer.alloc(0);
         socket.on("data", (chunk) => this.onData(chunk));
@@ -102,8 +134,10 @@ export class NativePipeClient {
     return this.connecting;
   }
 
-  async request(method, params, timeoutMs = this.timeoutMs) {
-    await this.connect();
+  async request(method, params, timeoutMs = this.timeoutMs, options = {}) {
+    throwIfDispatchCancelled(options);
+    await this.connect(options);
+    throwIfDispatchCancelled(options);
     const id = this.nextId++;
     const payload = Buffer.from(JSON.stringify({ id, jsonrpc: "2.0", method, params }), "utf8");
     const frame = Buffer.alloc(4 + payload.length);
@@ -113,24 +147,44 @@ export class NativePipeClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        options.signal?.removeEventListener?.("abort", abort);
         reject(new Error(`Timed out calling ${method}`));
       }, timeoutMs);
+      const abort = () => {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
+        reject(cancellationError());
+      };
 
       this.pending.set(id, {
         resolve: (value) => {
           clearTimeout(timer);
+          options.signal?.removeEventListener?.("abort", abort);
           resolve(value);
         },
         reject: (error) => {
           clearTimeout(timer);
+          options.signal?.removeEventListener?.("abort", abort);
           reject(error);
         },
       });
+      options.signal?.addEventListener?.("abort", abort, { once: true });
 
+      try {
+        throwIfDispatchCancelled(options);
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
+        reject(error);
+        return;
+      }
       this.socket.write(frame, (error) => {
         if (error == null) return;
         const pending = this.pending.get(id);
         this.pending.delete(id);
+        options.signal?.removeEventListener?.("abort", abort);
         pending?.reject(error);
       });
     });
@@ -627,7 +681,8 @@ async function socketCandidates(socketDir, explicitPath, maximum, allowSocketDis
   return filterTrustedSocketPaths(selectSocketCandidates(preferred, discovered, maximum));
 }
 
-async function discoverHost(config, requiredTools = RECONCILER_TOOLS) {
+async function discoverHost(config, requiredTools = RECONCILER_TOOLS, options = {}) {
+  throwIfDispatchCancelled(options);
   const candidates = await socketCandidates(
     config.socketDir ?? DEFAULT_SOCKET_DIR,
     process.env.CODEX_APP_TOOLS_PIPE_PATH,
@@ -638,6 +693,7 @@ async function discoverHost(config, requiredTools = RECONCILER_TOOLS) {
   const deadline = Date.now() + (config.discoveryTimeoutMs ?? 6000);
 
   for (const socketPath of candidates) {
+    throwIfDispatchCancelled(options);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) break;
     const probeTimeoutMs = Math.max(
@@ -650,7 +706,9 @@ async function discoverHost(config, requiredTools = RECONCILER_TOOLS) {
         "tools/list",
         { threadStartKind: "all" },
         probeTimeoutMs,
+        options,
       );
+      throwIfDispatchCancelled(options);
       const tools = Array.isArray(result?.tools) ? result.tools : [];
       const host = { client, socketPath, toolMap: new Map(tools.map((tool) => [tool.name, tool])) };
       if (hostHasRequiredTools(host, requiredTools)) {
@@ -693,15 +751,19 @@ function parseToolText(result, toolName) {
 }
 
 export class AppTools {
-  constructor(config, { requiredTools = RECONCILER_TOOLS } = {}) {
+  constructor(config, { requiredTools = RECONCILER_TOOLS, discoverHost: discoverHostImpl = discoverHost } = {}) {
     this.config = config;
     this.requiredTools = [...requiredTools];
+    this.discoverHost = discoverHostImpl;
     this.host = null;
     this.failureCount = 0;
     this.nextConnectAt = 0;
+    this.connectionGeneration = 0;
+    this.connecting = null;
   }
 
-  async connect() {
+  async connect(options = {}) {
+    throwIfDispatchCancelled(options);
     if (this.host != null) return this.host;
     if (Date.now() < this.nextConnectAt) {
       const error = new Error("Codex app tools reconnect is backing off");
@@ -709,8 +771,21 @@ export class AppTools {
       error.retryAfterMs = this.nextConnectAt - Date.now();
       throw error;
     }
+    const generation = this.connectionGeneration;
+    if (this.connecting == null) {
+      this.connecting = this.discoverHost(this.config, this.requiredTools, options)
+        .finally(() => {
+          if (this.connectionGeneration === generation) this.connecting = null;
+        });
+    }
+    let discoveredHost;
     try {
-      this.host = await discoverHost(this.config, this.requiredTools);
+      discoveredHost = await this.connecting;
+      if (generation !== this.connectionGeneration || isDispatchCancelled(options)) {
+        discoveredHost?.client.close();
+        throw cancellationError();
+      }
+      this.host = discoveredHost;
       this.failureCount = 0;
       this.nextConnectAt = 0;
     } catch (error) {
@@ -736,6 +811,8 @@ export class AppTools {
   }
 
   reset() {
+    this.connectionGeneration += 1;
+    this.connecting = null;
     this.host?.client.close();
     this.host = null;
   }
@@ -761,8 +838,10 @@ export class AppTools {
     }
   }
 
-  async call(name, args) {
-    const host = await this.connect();
+  async call(name, args, options = {}) {
+    throwIfDispatchCancelled(options);
+    const host = await this.connect(options);
+    throwIfDispatchCancelled(options);
     const tool = host.toolMap.get(name);
     if (tool == null) throw new Error(`Missing Codex app tool: ${name}`);
     try {
@@ -773,7 +852,7 @@ export class AppTools {
         threadId: this.config.actorThreadId,
         tool: tool.name,
         turnId: `sidebar-realtime-${randomUUID()}`,
-      });
+      }, host.client.timeoutMs, options);
     } catch (error) {
       this.noteFailure();
       error.backoffRecorded = true;
@@ -782,23 +861,23 @@ export class AppTools {
     }
   }
 
-  async listThreads() {
+  async listThreads(options = {}) {
     return parseToolText(
-      await this.call("list_threads", { limit: this.config.listLimit }),
+      await this.call("list_threads", { limit: this.config.listLimit }, options),
       "list_threads",
     );
   }
 
-  async moveThread(move) {
+  async moveThread(move, options = {}) {
     const args = { threadId: move.threadId, sectionId: move.sectionId };
     if (move.hostId) args.hostId = move.hostId;
     return assertToolSuccess(
-      await this.call("move_thread_to_sidebar_section", args),
+      await this.call("move_thread_to_sidebar_section", args, options),
       "move_thread_to_sidebar_section",
     );
   }
 
-  async readThread(threadId, hostId) {
+  async readThread(threadId, hostId, options = {}) {
     const args = {
       threadId,
       turnLimit: 1,
@@ -807,16 +886,16 @@ export class AppTools {
     };
     if (hostId) args.hostId = hostId;
     return parseToolText(
-      await this.call("read_thread", args),
+      await this.call("read_thread", args, options),
       "read_thread",
     );
   }
 
-  async sendMessageToThread({ threadId, hostId, prompt }) {
+  async sendMessageToThread({ threadId, hostId, prompt }, options = {}) {
     const args = { threadId, prompt };
     if (hostId) args.hostId = hostId;
     return assertToolSuccess(
-      await this.call("send_message_to_thread", args),
+      await this.call("send_message_to_thread", args, options),
       "send_message_to_thread",
     );
   }

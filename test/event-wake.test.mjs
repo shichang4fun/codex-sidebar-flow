@@ -630,6 +630,35 @@ test("wakeOrganizer checks deadline signal immediately before send and never dis
   }
 });
 
+test("wakeOrganizer forwards cancellation dependencies into sendMessageToThread and maps WAKE_DEADLINE", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-forward-deps-"));
+  const controller = new AbortController();
+
+  try {
+    const result = await wakeOrganizer(
+      makeEnvelope(),
+      makeConfig({ wakeStateFile: path.join(directory, "state.json") }),
+      {
+        sendMessageToThread: async (_args, dependencies = {}) => {
+          assert.equal(dependencies.signal, controller.signal);
+          assert.equal(dependencies.canDispatch(), true);
+          const error = new Error("deadline");
+          error.code = "WAKE_DEADLINE";
+          throw error;
+        },
+      },
+      {
+        signal: controller.signal,
+        canDispatch: () => true,
+      },
+    );
+
+    assert.deepEqual(result, { status: "failed", errorCode: "wake_deadline" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("wakeOrganizer distinguishes quota exhaustion from operational permit failures", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-permit-errors-"));
 

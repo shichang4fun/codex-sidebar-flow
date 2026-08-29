@@ -651,6 +651,86 @@ assert.deepEqual(sendMessageCalls, [{
   },
 }]);
 
+{
+  const client = new sidebarRealtime.NativePipeClient("/tmp/not-used.sock", 200);
+  let writes = 0;
+  let logicalNow = 0;
+  client.connect = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    logicalNow = 50;
+    client.socket = {
+      destroyed: false,
+      write(_frame, callback) {
+        writes += 1;
+        callback?.(null);
+      },
+    };
+  };
+  await assert.rejects(
+    client.request("tools/call", { ping: true }, 200, {
+      canDispatch: () => logicalNow < 20,
+    }),
+    (error) => error?.code === "WAKE_DEADLINE",
+  );
+  assert.equal(writes, 0);
+}
+
+{
+  let closedHosts = 0;
+  let sendCalls = 0;
+  const cancellingTools = new sidebarRealtime.AppTools(
+    {
+      ...config,
+      quiet: true,
+      actorThreadId: "hook-actor",
+      socketProbeTimeoutMs: 200,
+      requestTimeoutMs: 200,
+      discoveryTimeoutMs: 200,
+    },
+    {
+      requiredTools: ["list_threads", "read_thread", "send_message_to_thread"],
+      discoverHost: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return {
+          socketPath: "/tmp/fake.sock",
+          toolMap: new Map([
+            ["send_message_to_thread", { name: "send_message_to_thread", namespace: "codex" }],
+          ]),
+          client: {
+            timeoutMs: 200,
+            close() {
+              closedHosts += 1;
+            },
+            async request(method) {
+              if (method === "tools/call") sendCalls += 1;
+              return { success: true, contentItems: [] };
+            },
+          },
+        };
+      },
+    },
+  );
+  const controller = new AbortController();
+
+  try {
+    const pendingSend = cancellingTools.sendMessageToThread(
+      { threadId: "hook-target", hostId: remoteHostId, prompt: "hook prompt" },
+      { signal: controller.signal, canDispatch: () => !controller.signal.aborted },
+    );
+    setTimeout(() => {
+      controller.abort();
+      cancellingTools.reset();
+    }, 10);
+    await assert.rejects(pendingSend, (error) => error?.code === "WAKE_DEADLINE");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(sendCalls, 0);
+    assert.equal(cancellingTools.host, null);
+    assert.equal(closedHosts, 1);
+  } finally {
+    controller.abort();
+  }
+}
+
 const reducedCapabilityHost = {
   client: { close() {} },
   toolMap: new Map([

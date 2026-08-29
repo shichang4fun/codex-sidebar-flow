@@ -2,8 +2,8 @@
 
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { createReadStream, existsSync, realpathSync, watch } from "node:fs";
-import { open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants, createReadStream, existsSync, realpathSync, watch } from "node:fs";
+import { lstat, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +18,7 @@ export const RECONCILER_TOOLS = [
 ];
 const DEFAULT_SOCKET_DIR = "/tmp/codex-browser-use";
 const DEFAULT_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
+const MAX_MANAGED_LOCK_OWNER_BYTES = 4_096;
 const execFileAsync = promisify(execFile);
 
 function now() {
@@ -358,55 +359,135 @@ function processIsAlive(pid) {
   }
 }
 
-async function clearStaleLock(lockPath, staleAfterMs = 30000) {
-  const [contents, metadata] = await Promise.all([
-    readFile(lockPath, "utf8").catch(() => null),
-    stat(lockPath).catch(() => null),
+function sameFileIdentity(left, right) {
+  return left != null && right != null && left.dev === right.dev && left.ino === right.ino;
+}
+
+async function unlinkOwnedLock(lockPath, handle) {
+  if (handle == null) return false;
+  const [ownedStat, currentStat] = await Promise.all([
+    handle.stat().catch(() => null),
+    lstat(lockPath).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }),
   ]);
-  if (metadata == null) return true;
-  let owner = null;
-  try {
-    owner = JSON.parse(contents);
-  } catch {}
-  const createdAt = Number.isFinite(owner?.createdAt) ? owner.createdAt : metadata.mtimeMs;
-  const staleByAge = Date.now() - createdAt > staleAfterMs;
-  const ownerGone = Number.isInteger(owner?.pid) && !processIsAlive(owner.pid);
-  if (!staleByAge && !ownerGone) return false;
+  if (!sameFileIdentity(ownedStat, currentStat)) return false;
   await unlink(lockPath).catch((error) => {
     if (error.code !== "ENOENT") throw error;
   });
   return true;
 }
 
-async function withFileLock(lockPath, task, { attempts = 80, delayMs = 25, staleAfterMs = 30000 } = {}) {
+async function readLockOwner(handle, metadata) {
+  if (!metadata.isFile() || metadata.size > MAX_MANAGED_LOCK_OWNER_BYTES) return null;
+  const buffer = Buffer.alloc(MAX_MANAGED_LOCK_OWNER_BYTES + 1);
+  const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+  if (bytesRead > MAX_MANAGED_LOCK_OWNER_BYTES) return null;
+  let owner = null;
+  try {
+    owner = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+  } catch {}
+  return owner;
+}
+
+async function clearStaleLock(
+  lockPath,
+  staleAfterMs = 30000,
+  { now = Date.now, isProcessAlive = processIsAlive, onBeforeReclaim = null } = {},
+) {
   let handle;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  try {
+    handle = await open(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    return false;
+  }
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) return false;
+    const owner = await readLockOwner(handle, metadata);
+    const createdAt = Number.isFinite(owner?.createdAt) ? owner.createdAt : metadata.mtimeMs;
+    const staleByAge = now() - createdAt > staleAfterMs;
+    let ownerGone = false;
+    if (Number.isInteger(owner?.pid)) {
+      try {
+        ownerGone = isProcessAlive(owner.pid) === false;
+      } catch {
+        ownerGone = false;
+      }
+    }
+    if (!staleByAge && !ownerGone) return false;
+    if (typeof onBeforeReclaim === "function") {
+      await onBeforeReclaim({ lockPath, owner });
+    }
+    return await unlinkOwnedLock(lockPath, handle);
+  } catch {
+    return false;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+async function withFileLock(
+  lockPath,
+  task,
+  {
+    attempts = 80,
+    delayMs = 25,
+    staleAfterMs = 30000,
+    now = Date.now,
+    isProcessAlive = processIsAlive,
+    onBeforeReclaim = null,
+    onBeforeRelease = null,
+  } = {},
+) {
+  let handle = null;
+  let blockedAttempts = 0;
+  let recoveryAttempts = 0;
+  while (handle == null) {
     try {
       handle = await open(lockPath, "wx", 0o600);
       try {
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: Date.now() })}\n`);
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: now() })}\n`);
       } catch (error) {
+        await unlinkOwnedLock(lockPath, handle);
         await handle.close().catch(() => {});
         handle = null;
-        await unlink(lockPath).catch(() => {});
         throw error;
       }
       break;
     } catch (error) {
-      if (error.code !== "EEXIST" || attempt + 1 >= attempts) throw error;
-      if (await clearStaleLock(lockPath, staleAfterMs)) continue;
+      if (error.code !== "EEXIST") throw error;
+      if (recoveryAttempts < attempts) {
+        recoveryAttempts += 1;
+        const reclaimed = await clearStaleLock(lockPath, staleAfterMs, {
+          now,
+          isProcessAlive,
+          onBeforeReclaim,
+        });
+        if (reclaimed) continue;
+      }
+      blockedAttempts += 1;
+      if (blockedAttempts >= attempts) throw error;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
   try {
     return await task();
   } finally {
-    await handle?.close().catch(() => {});
-    await unlink(lockPath).catch(() => {});
+    try {
+      if (typeof onBeforeRelease === "function") {
+        await onBeforeRelease({ lockPath });
+      }
+    } finally {
+      await unlinkOwnedLock(lockPath, handle);
+      await handle?.close().catch(() => {});
+    }
   }
 }
 
-export async function saveManagedState(filePath, state) {
+export async function saveManagedState(filePath, state, lockOptions = {}) {
   if (!filePath) return normalizeManagedState(state);
   return withFileLock(`${filePath}.lock`, async () => {
     let current = null;
@@ -429,12 +510,13 @@ export async function saveManagedState(filePath, state) {
           sessionFiles: { ...current.sessionFiles, ...proposed.sessionFiles },
         };
     return writeManagedStateFile(filePath, next);
-  });
+  }, lockOptions);
 }
 
 export async function updateManagedState(
   filePath,
   { add = [], remove = [], observe = [], lastSessionScanAt = null, sessionFiles = null } = {},
+  lockOptions = {},
 ) {
   if (!filePath) return normalizeManagedState(null);
   return withFileLock(`${filePath}.lock`, async () => {
@@ -454,7 +536,7 @@ export async function updateManagedState(
       sessionFiles: sessionFiles == null ? current.sessionFiles : { ...current.sessionFiles, ...sessionFiles },
     };
     return writeManagedStateFile(filePath, next);
-  });
+  }, lockOptions);
 }
 
 export function managedHostsByThreadId(managedThreadIds = []) {

@@ -287,7 +287,7 @@ test("acquireWakePermit reclaims a dead owner only after the grace period", asyn
   }
 });
 
-test("acquireWakePermit reclaims an owner after the hard lease even if its pid is alive", async () => {
+test("acquireWakePermit never reclaims a valid owner while its pid is alive", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-expired-lock-"));
   const stateFile = path.join(directory, "wake-state.json");
   const lockFile = `${stateFile}.lock`;
@@ -303,15 +303,66 @@ test("acquireWakePermit reclaims an owner after the hard lease even if its pid i
       })}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
-    const recovered = await acquireWakePermit(
+    const blocked = await acquireWakePermit(
       stateFile,
       { maxPerMinute: 1 },
       { now: () => 160_000, attempts: 1, delayMs: 0, isProcessAlive: () => true },
     );
 
-    assert.deepEqual(recovered, { ok: true });
-    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), { timestamps: [160_000] });
+    assert.deepEqual(blocked, { ok: false, errorCode: "lock_unavailable" });
+    assert.match(await readFile(lockFile, "utf8"), /00000000-0000-4000-8000-000000000002/);
+    await assert.rejects(access(stateFile), { code: "ENOENT" });
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit never grants a second permit while a live owner is slow", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-slow-live-owner-"));
+  const stateFile = path.join(directory, "wake-state.json");
+  let releaseHolder = null;
+  let holderReleased = false;
+  let signalHolderReady;
+  const holderReady = new Promise((resolve) => {
+    signalHolderReady = resolve;
+  });
+  const holderRelease = new Promise((resolve) => {
+    releaseHolder = () => {
+      if (holderReleased) return;
+      holderReleased = true;
+      resolve();
+    };
+  });
+  let firstPermit = null;
+
+  try {
+    firstPermit = acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      {
+        now: () => 100_000,
+        renameFile: async (source, destination) => {
+          signalHolderReady();
+          await holderRelease;
+          await rename(source, destination);
+        },
+      },
+    );
+    await holderReady;
+
+    const secondPermit = await acquireWakePermit(
+      stateFile,
+      { maxPerMinute: 1 },
+      { now: () => 160_000, attempts: 1, delayMs: 0, isProcessAlive: () => true },
+    );
+    assert.deepEqual(secondPermit, { ok: false, errorCode: "lock_unavailable" });
+
+    releaseHolder();
+    assert.deepEqual(await firstPermit, { ok: true });
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), { timestamps: [100_000] });
+  } finally {
+    releaseHolder?.();
+    await firstPermit?.catch(() => {});
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -433,7 +484,7 @@ test("acquireWakePermit never removes a replacement inode during stale-lock reco
         now: () => 160_000,
         attempts: 1,
         delayMs: 0,
-        isProcessAlive: () => true,
+        isProcessAlive: () => false,
         onBeforeReclaim: async () => {
           await rm(lockFile, { force: true });
           await writeFile(lockFile, "replacement\n", { encoding: "utf8", mode: 0o600 });
@@ -472,7 +523,7 @@ test("acquireWakePermit never removes a replacement symlink to the stale lock in
         now: () => 160_000,
         attempts: 1,
         delayMs: 0,
-        isProcessAlive: () => true,
+        isProcessAlive: () => false,
         onBeforeReclaim: async () => {
           await rename(lockFile, movedLockFile);
           await symlink(movedLockFile, lockFile);

@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -227,6 +237,76 @@ assert.equal(
   JSON.parse(await readFile(statePath, "utf8")).managedThreadIds.includes("local:after-stale-lock"),
   true,
 );
+
+const staleSymlinkTarget = path.join(stateDirectory, "stale-symlink-target.lock");
+await writeFile(
+  staleSymlinkTarget,
+  `${JSON.stringify({ pid: 999_999_999, createdAt: Date.now() - 60_000 })}\n`,
+  { mode: 0o600 },
+);
+await symlink(staleSymlinkTarget, `${statePath}.lock`);
+await assert.rejects(
+  sidebarRealtime.updateManagedState(
+    statePath,
+    { add: ["local:must-not-follow-lock-symlink"] },
+    { attempts: 1, delayMs: 0 },
+  ),
+  (error) => error.code === "EEXIST",
+);
+assert.equal((await lstat(`${statePath}.lock`)).isSymbolicLink(), true);
+assert.match(await readFile(staleSymlinkTarget, "utf8"), /999999999/);
+await rm(`${statePath}.lock`, { force: true });
+
+await writeFile(
+  `${statePath}.lock`,
+  `${JSON.stringify({ pid: 999_999_999, createdAt: Date.now() - 60_000 })}\n`,
+  { mode: 0o600 },
+);
+await assert.rejects(
+  sidebarRealtime.updateManagedState(
+    statePath,
+    { add: ["local:must-not-delete-replacement-lock"] },
+    {
+      attempts: 1,
+      delayMs: 0,
+      onBeforeReclaim: async ({ lockPath }) => {
+        await rm(lockPath, { force: true });
+        await writeFile(lockPath, "replacement\n", { mode: 0o600 });
+      },
+    },
+  ),
+  (error) => error.code === "EEXIST",
+);
+assert.equal(await readFile(`${statePath}.lock`, "utf8"), "replacement\n");
+await rm(`${statePath}.lock`, { force: true });
+
+await sidebarRealtime.updateManagedState(
+  statePath,
+  { add: ["local:release-replacement"] },
+  {
+    onBeforeRelease: async ({ lockPath }) => {
+      await rm(lockPath, { force: true });
+      await writeFile(lockPath, "release replacement\n", { mode: 0o600 });
+    },
+  },
+);
+assert.equal(await readFile(`${statePath}.lock`, "utf8"), "release replacement\n");
+await rm(`${statePath}.lock`, { force: true });
+
+const movedOwnedLock = path.join(stateDirectory, "moved-owned.lock");
+await sidebarRealtime.updateManagedState(
+  statePath,
+  { add: ["local:release-symlink-replacement"] },
+  {
+    onBeforeRelease: async ({ lockPath }) => {
+      await rename(lockPath, movedOwnedLock);
+      await symlink(movedOwnedLock, lockPath);
+    },
+  },
+);
+assert.equal((await lstat(`${statePath}.lock`)).isSymbolicLink(), true);
+assert.match(await readFile(movedOwnedLock, "utf8"), /createdAt/);
+await rm(`${statePath}.lock`, { force: true });
 await sidebarRealtime.updateManagedState(statePath, { observe: ["remote-control:env_remote_test:blocked-prompt"] });
 const observedOnlyState = await sidebarRealtime.loadManagedState(statePath);
 assert.equal(observedOnlyState.knownThreadIdentities.includes("remote-control:env_remote_test:blocked-prompt"), true);

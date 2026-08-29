@@ -190,14 +190,13 @@ async function reclaimStaleLock(
     const owner = await readBoundedLockOwner(handle, fileStat);
     let stale = currentTime - fileStat.mtimeMs >= LOCK_HARD_LEASE_MS;
     if (owner != null) {
-      stale = currentTime >= owner.expiresAt;
-      if (!stale && currentTime - owner.createdAt >= LOCK_DEAD_OWNER_GRACE_MS) {
-        try {
-          stale = isProcessAlive(owner.pid) === false;
-        } catch {
-          stale = false;
-        }
+      let ownerAlive = true;
+      try {
+        ownerAlive = isProcessAlive(owner.pid) !== false;
+      } catch {
+        ownerAlive = true;
       }
+      stale = !ownerAlive && currentTime - owner.createdAt >= LOCK_DEAD_OWNER_GRACE_MS;
     }
     if (!stale) return false;
     if (typeof onBeforeReclaim === "function") {

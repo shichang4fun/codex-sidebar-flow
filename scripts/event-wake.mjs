@@ -213,6 +213,7 @@ function normalizeWakeState(raw, nowValue, dedupeWindowMs) {
     || fingerprints.some((record) => (
       !isRecord(record)
       || Object.keys(record).length !== 2
+      || typeof record.fingerprint !== "string"
       || !FINGERPRINT_PATTERN.test(record.fingerprint)
       || !Number.isFinite(record.timestamp)
       || record.timestamp < 0
@@ -274,8 +275,9 @@ export async function acquireWakePermit(filePath, limits = {}, dependencies = {}
     && limits.dedupeWindowMs <= MAX_DEDUPE_WINDOW_MS
     ? limits.dedupeWindowMs
     : DEFAULT_DEDUPE_WINDOW_MS;
-  const fingerprint = Object.hasOwn(limits, "fingerprint") ? limits.fingerprint : null;
-  if (fingerprint != null && (typeof fingerprint !== "string" || !FINGERPRINT_PATTERN.test(fingerprint))) {
+  const hasFingerprint = Object.hasOwn(limits, "fingerprint");
+  const fingerprint = hasFingerprint ? limits.fingerprint : null;
+  if (hasFingerprint && (typeof fingerprint !== "string" || !FINGERPRINT_PATTERN.test(fingerprint))) {
     return { ok: false, errorCode: "invalid_state" };
   }
   try {

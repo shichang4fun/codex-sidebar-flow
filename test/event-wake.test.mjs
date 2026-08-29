@@ -268,6 +268,58 @@ test("acquireWakePermit accepts legacy state but fails closed on malformed finge
   }
 });
 
+test("acquireWakePermit rejects non-string fingerprints in persisted wake state", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-non-string-state-"));
+  const hash = "a".repeat(64);
+  const invalidFingerprints = [[hash], { value: hash }, 123, null];
+
+  try {
+    for (const [index, fingerprint] of invalidFingerprints.entries()) {
+      const stateFile = path.join(directory, `state-${index}.json`);
+      const persisted = {
+        timestamps: [],
+        fingerprints: [{ fingerprint, timestamp: 100_000 }],
+      };
+      await writeFile(stateFile, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
+
+      assert.deepEqual(
+        await acquireWakePermit(
+          stateFile,
+          { maxPerMinute: 2, fingerprint: hash, dedupeWindowMs: 2_000 },
+          { now: () => 100_100 },
+        ),
+        { ok: false, errorCode: "invalid_state" },
+      );
+      assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")), persisted);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireWakePermit rejects non-string current fingerprints without persisting them", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-non-string-current-"));
+  const hash = "a".repeat(64);
+  const invalidFingerprints = [[hash], { value: hash }, 123, null];
+
+  try {
+    for (const [index, fingerprint] of invalidFingerprints.entries()) {
+      const stateFile = path.join(directory, `state-${index}.json`);
+      assert.deepEqual(
+        await acquireWakePermit(
+          stateFile,
+          { maxPerMinute: 2, fingerprint, dedupeWindowMs: 2_000 },
+          { now: () => 100_100 },
+        ),
+        { ok: false, errorCode: "invalid_state" },
+      );
+      await assert.rejects(access(stateFile), (error) => error.code === "ENOENT");
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("acquireWakePermit never removes a replacement lock during release", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "event-wake-lock-replacement-"));
   const stateFile = path.join(directory, "wake-state.json");

@@ -7,6 +7,7 @@ export const SOURCE_RUNTIME_FILES = Object.freeze([
   "scripts/event-wake.mjs",
   "scripts/runtime-integrity.mjs",
   "scripts/setup.mjs",
+  "scripts/sidebar-agent-context.mjs",
   "scripts/sidebar-hook.mjs",
   "scripts/sidebar-policy.mjs",
   "scripts/sidebar-realtime.mjs",

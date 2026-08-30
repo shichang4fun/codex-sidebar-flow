@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { chmod, copyFile, link, lstat, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
-import { existsSync, realpathSync } from "node:fs";
+import { chmod, copyFile, link, lstat, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { constants, existsSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -17,8 +17,10 @@ import { validateSectionNames } from "./sidebar-policy.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const HOOK_MARKER = "CODEX_SIDEBAR_FLOW_OWNER=codex-sidebar-flow-v1";
+export const AGENT_TRANSITIONS_START = "<!-- CODEX_SIDEBAR_FLOW_AGENT_TRANSITIONS_START -->";
+export const AGENT_TRANSITIONS_END = "<!-- CODEX_SIDEBAR_FLOW_AGENT_TRANSITIONS_END -->";
 export const INSTALL_MODE_ENV = "CODEX_SIDEBAR_FLOW_INSTALL_MODE";
-export const CURRENT_CONFIG_VERSION = 2;
+export const CURRENT_CONFIG_VERSION = 3;
 export const DEFAULT_HOOK_DEADLINE_MS = 14000;
 export const DEFAULT_STOP_SETTLE_DELAY_MS = 3000;
 const SAFE_IDENTIFIER_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
@@ -171,10 +173,173 @@ export async function writeJsonAtomic(filePath, value) {
   await rename(temporaryPath, filePath);
 }
 
+export async function readAgentInstructionsFile(filePath) {
+  const metadata = await lstat(filePath).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (metadata == null) return { exists: false, content: "", mode: 0o600 };
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    const error = new Error(`Global agent instructions must be a regular file: ${filePath}`);
+    error.code = "UNSAFE_AGENT_INSTRUCTIONS";
+    throw error;
+  }
+  let handle;
+  try {
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== metadata.dev || opened.ino !== metadata.ino) {
+      const error = new Error(`Global agent instructions changed while being read: ${filePath}`);
+      error.code = "AGENT_INSTRUCTIONS_CHANGED";
+      throw error;
+    }
+    return {
+      exists: true,
+      content: await handle.readFile("utf8"),
+      mode: opened.mode & 0o777,
+      identity: { dev: opened.dev, ino: opened.ino },
+    };
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function writeTextAtomic(filePath, value, current) {
+  await ensureRealDirectory(path.dirname(filePath), { create: true, label: "Agent instructions directory" });
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, value, { encoding: "utf8", mode: current.mode, flag: "wx" });
+    const latest = await readAgentInstructionsFile(filePath);
+    const unchanged = current.exists === latest.exists
+      && current.content === latest.content
+      && (
+        !current.exists
+        || (
+          current.identity.dev === latest.identity.dev
+          && current.identity.ino === latest.identity.ino
+          && current.mode === latest.mode
+        )
+      );
+    if (!unchanged) {
+      const error = new Error(`Global agent instructions changed during setup: ${filePath}`);
+      error.code = "AGENT_INSTRUCTIONS_CHANGED";
+      throw error;
+    }
+    await rename(temporaryPath, filePath);
+  } finally {
+    await unlink(temporaryPath).catch(() => {});
+  }
+}
+
+function markerCount(content, marker) {
+  return content.split(marker).length - 1;
+}
+
+export function removeAgentTransitionInstructions(content = "") {
+  const starts = markerCount(content, AGENT_TRANSITIONS_START);
+  const ends = markerCount(content, AGENT_TRANSITIONS_END);
+  if (starts === 0 && ends === 0) return content;
+  if (starts !== 1 || ends !== 1) {
+    const error = new Error("Malformed Sidebar Flow block in global agent instructions");
+    error.code = "MALFORMED_AGENT_INSTRUCTIONS";
+    throw error;
+  }
+  const start = content.indexOf(AGENT_TRANSITIONS_START);
+  const end = content.indexOf(AGENT_TRANSITIONS_END, start) + AGENT_TRANSITIONS_END.length;
+  if (end <= start || content.indexOf(AGENT_TRANSITIONS_END) < start) {
+    const error = new Error("Malformed Sidebar Flow block in global agent instructions");
+    error.code = "MALFORMED_AGENT_INSTRUCTIONS";
+    throw error;
+  }
+  const before = content.slice(0, start).trimEnd();
+  const after = content.slice(end).trimStart();
+  const joined = [before, after].filter((part) => part.length > 0).join("\n\n");
+  return joined.length > 0 ? `${joined}\n` : "";
+}
+
+function safeMarkdownCommand(value, label) {
+  if (typeof value !== "string" || /[`\r\n]/.test(value)) {
+    const error = new Error(`${label} cannot be embedded in managed agent instructions`);
+    error.code = "UNSAFE_AGENT_INSTRUCTIONS";
+    throw error;
+  }
+  return quote(value);
+}
+
+export function agentTransitionInstructions({ runtimeRoot, configPath, nodeExecutable }) {
+  const command = [
+    safeMarkdownCommand(nodeExecutable, "Node executable"),
+    safeMarkdownCommand(path.join(runtimeRoot, "scripts", "sidebar-agent-context.mjs"), "Runtime path"),
+  ].join(" ");
+  const configArgument = safeMarkdownCommand(configPath, "Configuration path");
+  return `${AGENT_TRANSITIONS_START}
+## Codex Sidebar Flow managed lifecycle
+
+Apply this workflow only to the root Codex task. At the first tool opportunity in every user turn, run \`${command} start --config ${configArgument}\`. Immediately before a successful final response, run the same command with \`finish\`. If the command fails or returns \`eligible:false\`, do nothing else for this workflow.
+
+When it returns \`eligible:true\`, use only Codex task-management tools and structured fields. Call \`list_threads\` once with the returned limit and select exactly one Codex task whose ID equals the returned \`threadId\`; never use title, summary, prompt, or output text to identify it. Resolve each returned destination name to exactly one non-built-in custom section, require the three section IDs to be distinct, and fail closed on missing or duplicate names. Resolve membership from the real task or parent Project item key, but use the task's actual \`hostId\` for every \`read_thread\` and move. A task with no direct membership is eligible through its parent Project only when that Project has exactly one membership and it is the built-in Projects section. Fail closed on a missing or duplicate identity, multiple direct or Project memberships, tool error, archived task, non-Codex task, Pinned, For Later, or an excluded/protected parent Project. Never move a Project object.
+
+For \`start\`, require the exact \`read_thread\` to confirm active status with no approval/user-input attention flag; move only the current task from Tasks, For Review, or an eligible Project task to the returned In Progress section, unless already there. For \`finish\`, act only when the current agent is genuinely about to return a successful final response and is not blocked or waiting for input; the exact read may still report active during finalization. Move only the current task from Tasks, In Progress, or an eligible Project task to the returned For Review section, unless already there. Perform at most one move per phase.
+${AGENT_TRANSITIONS_END}`;
+}
+
+export async function syncAgentTransitionInstructions({
+  codexHome,
+  enabled,
+  runtimeRoot,
+  configPath,
+  nodeExecutable = detectNodeExecutable(),
+  dryRun = false,
+}) {
+  const agentsPath = path.join(codexHome, "AGENTS.md");
+  const overridePath = path.join(codexHome, "AGENTS.override.md");
+  const [agents, override] = await Promise.all([
+    readAgentInstructionsFile(agentsPath),
+    readAgentInstructionsFile(overridePath),
+  ]);
+  const activePath = override.content.trim().length > 0 ? overridePath : agentsPath;
+  const block = enabled
+    ? agentTransitionInstructions({ runtimeRoot, configPath, nodeExecutable })
+    : null;
+  const updates = [];
+  for (const [filePath, current] of [[agentsPath, agents], [overridePath, override]]) {
+    let content = removeAgentTransitionInstructions(current.content);
+    if (enabled && filePath === activePath) {
+      content = content.trimEnd();
+      content = content.length > 0 ? `${content}\n\n${block}\n` : `${block}\n`;
+    }
+    if (content !== current.content) updates.push({ filePath, current, content });
+  }
+  if (!dryRun) {
+    for (const update of updates) {
+      if (update.current.exists) {
+        await writePrivateContentBackup(update.current.content, `${update.filePath}.sidebar-flow.bak`);
+      }
+      await writeTextAtomic(update.filePath, update.content, update.current);
+    }
+  }
+  return { enabled, activePath, changedPaths: updates.map((update) => update.filePath) };
+}
+
 async function writePrivateBackup(sourcePath, backupPath) {
   if (existsSync(backupPath)) return false;
   const temporaryPath = `${backupPath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporaryPath, await readFile(sourcePath), { mode: 0o600, flag: "wx" });
+  try {
+    await link(temporaryPath, backupPath);
+    return true;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    return false;
+  } finally {
+    await unlink(temporaryPath).catch(() => {});
+  }
+}
+
+async function writePrivateContentBackup(content, backupPath) {
+  if (existsSync(backupPath)) return false;
+  const temporaryPath = `${backupPath}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporaryPath, content, { mode: 0o600, flag: "wx" });
   try {
     await link(temporaryPath, backupPath);
     return true;
@@ -207,6 +372,9 @@ export function defaultConfig(codexHome, installMode = null, runtimeFingerprint 
       organizerThreadId: null,
       organizerHostId: "local",
       maxPerMinute: 20,
+    },
+    agentTransitions: {
+      enabled: false,
     },
     wakeStateFile: path.join(runtime, "wake-state.json"),
     eventWakeProbeRequestFile: path.join(runtime, "event-wake-probe-request.json"),
@@ -301,6 +469,7 @@ export async function setup({
   organizerThreadId,
   organizerHostId,
   eventWakeMaxPerMinute,
+  agentTransitionsEnabled,
 } = {}, dependencies = {}) {
   if (!new Set(["source", "plugin"]).has(mode)) throw new Error(`Unknown setup mode: ${mode}`);
   if (!isSingleLine(codexHome, 4096) || !path.isAbsolute(codexHome)) {
@@ -407,6 +576,11 @@ export async function setup({
       ...(existingConfig?.eventWake ?? {}),
       ...(bindingChanged ? { enabled: false } : {}),
     },
+    agentTransitions: {
+      ...defaults.agentTransitions,
+      ...(existingConfig?.agentTransitions ?? {}),
+      ...(agentTransitionsEnabled == null ? {} : { enabled: agentTransitionsEnabled }),
+    },
     installMode: mode,
     runtimeFingerprint,
   };
@@ -452,6 +626,21 @@ export async function setup({
   const hooks = mode === "source"
     ? installHooks(existingHooks, hookCommand(releaseRoot, detectNodeExecutable(), configPath), ownedLegacyHookPaths)
     : null;
+  const agentInstructionOptions = {
+    codexHome,
+    enabled: config.agentTransitions.enabled === true,
+    runtimeRoot: releaseRoot,
+    configPath,
+  };
+  const shouldSyncAgentInstructions = config.agentTransitions.enabled === true
+    || existingConfig?.agentTransitions?.enabled === true
+    || agentTransitionsEnabled === false;
+  const agentInstructionPreview = shouldSyncAgentInstructions
+    ? await syncAgentTransitionInstructions({
+        ...agentInstructionOptions,
+        dryRun: true,
+      })
+    : { enabled: false, activePath: null, changedPaths: [], skipped: true };
   if (!dryRun) {
     await revalidateRealDirectory(runtimeRoot, runtimeRootIdentity, "Sidebar Flow runtime root");
     if (mode === "source") {
@@ -466,6 +655,9 @@ export async function setup({
       await rm(runtimeScripts, { recursive: true, force: true });
     }
   }
+  const agentInstructions = !shouldSyncAgentInstructions || dryRun
+    ? agentInstructionPreview
+    : await syncAgentTransitionInstructions(agentInstructionOptions);
   return {
     mode,
     hooksPath,
@@ -477,6 +669,7 @@ export async function setup({
     dryRun,
     migratedLegacyHookPaths: authorizedLegacyHookPaths,
     nodeExecutable: detectNodeExecutable(),
+    agentInstructions,
   };
 }
 
@@ -520,6 +713,18 @@ export function parseSetupArgs(argv) {
     if (argv[index] === "--dry-run") result.dryRun = true;
     else if (argv[index] === "--plugin") result.mode = "plugin";
     else if (argv[index] === "--enable-event-wake") result.enableEventWake = true;
+    else if (argv[index] === "--enable-agent-transitions") {
+      if (result.agentTransitionsEnabled != null) {
+        throw invalidArgument("Choose only one agent-transitions mode");
+      }
+      result.agentTransitionsEnabled = true;
+    }
+    else if (argv[index] === "--disable-agent-transitions") {
+      if (result.agentTransitionsEnabled != null) {
+        throw invalidArgument("Choose only one agent-transitions mode");
+      }
+      result.agentTransitionsEnabled = false;
+    }
     else if (argv[index] === "--codex-home") {
       result.codexHome = optionValue(argv, index, "--codex-home");
       index += 1;

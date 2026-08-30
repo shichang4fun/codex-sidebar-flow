@@ -7,14 +7,19 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppTools } from "./sidebar-realtime.mjs";
+import { validAgentTransitionConfig } from "./sidebar-agent-context.mjs";
 import { computeRuntimeFingerprint, ensureRealDirectory, isRuntimeFingerprint } from "./runtime-integrity.mjs";
 import { resolveConfiguredSections, validateSectionNames } from "./sidebar-policy.mjs";
 import {
   detectNodeExecutable,
+  agentTransitionInstructions,
+  AGENT_TRANSITIONS_END,
+  AGENT_TRANSITIONS_START,
   findOwnedSidebarHookPaths,
   findUnmarkedSidebarHookPaths,
   HOOK_MARKER,
   isSafeIdentifier,
+  readAgentInstructionsFile,
 } from "./setup.mjs";
 
 export const EVENT_WAKE_PROBE_PROTOCOL = "codex-sidebar-flow/event-wake-probe-v1";
@@ -646,6 +651,7 @@ export function inspectInstallation({
   legacyHookConflicts = [],
   runtimeRoot,
   runtimeBinding = null,
+  agentInstructions = null,
 } = {}) {
   const checks = [];
   checks.push({
@@ -670,6 +676,26 @@ export function inspectInstallation({
     level: configValid ? "ok" : "error",
     name: "config",
     message: configValid ? "Section configuration is valid" : "Three unique section names are required",
+  });
+  const agentTransitionsEnabled = config?.agentTransitions?.enabled === true;
+  const agentConfigurationValid = !agentTransitionsEnabled || validAgentTransitionConfig(config);
+  const agentInstructionsValid = agentTransitionsEnabled
+    ? agentConfigurationValid
+      && agentInstructions?.safe !== false
+      && agentInstructions?.malformed !== true
+      && agentInstructions?.stale !== true
+      && agentInstructions?.installed === true
+    : agentInstructions?.installed !== true
+      && agentInstructions?.malformed !== true
+      && agentInstructions?.stale !== true;
+  checks.push({
+    level: agentInstructionsValid ? "ok" : "error",
+    name: "agent-transitions",
+    message: agentInstructionsValid
+      ? (agentTransitionsEnabled
+          ? "Agent-native lifecycle transitions are enabled"
+          : "Agent-native lifecycle transitions are disabled")
+      : "Agent-native lifecycle configuration, policy, and global instructions do not match",
   });
   checks.push({
     level: config?.installMode === mode ? "ok" : (config?.installMode == null ? "warning" : "error"),
@@ -706,6 +732,7 @@ export function inspectInstallation({
       "manifest",
       "hooks",
       "launcher",
+      "agentContext",
       "sidebarHook",
       "sidebarPolicy",
       "sidebarRealtime",
@@ -794,6 +821,55 @@ async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
+async function readOptionalAgentInstructions(filePath) {
+  try {
+    const result = await readAgentInstructionsFile(filePath);
+    return { content: result.content, safe: true };
+  } catch (error) {
+    if (new Set(["UNSAFE_AGENT_INSTRUCTIONS", "AGENT_INSTRUCTIONS_CHANGED"]).has(error.code)) {
+      return { content: "", safe: false };
+    }
+    throw error;
+  }
+}
+
+function managedAgentBlockState(content) {
+  const starts = content.split(AGENT_TRANSITIONS_START).length - 1;
+  const ends = content.split(AGENT_TRANSITIONS_END).length - 1;
+  const start = content.indexOf(AGENT_TRANSITIONS_START);
+  const end = content.indexOf(AGENT_TRANSITIONS_END);
+  return {
+    present: starts > 0 || ends > 0,
+    valid: starts === 1 && ends === 1 && start >= 0 && end > start,
+  };
+}
+
+export async function inspectAgentTransitionInstructions(codexHome, { expectedBlock = null } = {}) {
+  const [agents, override] = await Promise.all([
+    readOptionalAgentInstructions(path.join(codexHome, "AGENTS.md")),
+    readOptionalAgentInstructions(path.join(codexHome, "AGENTS.override.md")),
+  ]);
+  const active = override.content.trim().length > 0 ? override : agents;
+  const inactive = active === override ? agents : override;
+  const activeBlock = managedAgentBlockState(active.content);
+  const inactiveBlock = managedAgentBlockState(inactive.content);
+  const activeManagedBlock = activeBlock.valid
+    ? active.content.slice(
+        active.content.indexOf(AGENT_TRANSITIONS_START),
+        active.content.indexOf(AGENT_TRANSITIONS_END) + AGENT_TRANSITIONS_END.length,
+      )
+    : null;
+  return {
+    safe: agents.safe && override.safe,
+    installed: activeBlock.valid
+      && activeManagedBlock === expectedBlock
+      && !inactiveBlock.present,
+    malformed: (activeBlock.present && !activeBlock.valid)
+      || (inactiveBlock.present && !inactiveBlock.valid),
+    stale: inactiveBlock.present,
+  };
+}
+
 export function parseDoctorArgs(argv) {
   const result = { mode: "source", probe: false, armEventWakeProbe: false, eventWakeProbeResult: false };
   for (let index = 0; index < argv.length; index += 1) {
@@ -823,6 +899,7 @@ export async function inspectPluginBundle(pluginRoot, { enabledContext = false }
     manifest: ".codex-plugin/plugin.json",
     hooks: "hooks/hooks.json",
     launcher: "scripts/plugin-hook.sh",
+    agentContext: "scripts/sidebar-agent-context.mjs",
     sidebarHook: "scripts/sidebar-hook.mjs",
     sidebarPolicy: "scripts/sidebar-policy.mjs",
     sidebarRealtime: "scripts/sidebar-realtime.mjs",
@@ -889,6 +966,19 @@ async function main(argv = process.argv.slice(2)) {
     }
   }
   const eventWakeProbe = await readEventWakeProbeResult(config, { runtimeRoot });
+  const expectedAgentRuntimeRoot = mode === "source"
+    ? path.join(runtimeRoot, "releases", config.runtimeFingerprint ?? "invalid")
+    : pluginRoot;
+  const expectedAgentBlock = expectedAgentRuntimeRoot == null
+    ? null
+    : agentTransitionInstructions({
+        runtimeRoot: expectedAgentRuntimeRoot,
+        configPath: path.join(runtimeRoot, "config.json"),
+        nodeExecutable: detectNodeExecutable(),
+      });
+  const agentInstructions = await inspectAgentTransitionInstructions(codexHome, {
+    expectedBlock: expectedAgentBlock,
+  });
   const runtimeBinding = await inspectRuntimeBinding({ mode, hooks, config, pluginRoot });
   const pluginBundle = mode === "plugin"
     ? await inspectPluginBundle(pluginRoot, {
@@ -906,6 +996,7 @@ async function main(argv = process.argv.slice(2)) {
     runtimeRoot,
     legacyHookConflicts: findUnmarkedSidebarHookPaths(hooks),
     pluginBundle,
+    agentInstructions,
   });
   process.stdout.write(`${JSON.stringify({ mode, checks }, null, 2)}\n`);
   if (checks.some((check) => check.level === "error") || runtimeProbe?.ok === false) process.exitCode = 1;

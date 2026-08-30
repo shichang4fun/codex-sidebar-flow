@@ -1,14 +1,16 @@
 # Codex Sidebar Flow
 
-Codex Sidebar Flow v0.2 uses a hybrid control plane: `UserPromptSubmit` observes and persists task identity, then optionally sends one content-free event envelope to an organizer task; when the private app-tools pipe is busy, it uses the public `additionalContext` contract to ask the current agent to reconcile only itself. `Stop` runs in the background, waits briefly, then directly moves only a task whose exact final read is authoritatively terminal. A recurring heartbeat repairs missed events and stopped tasks that were already in `In Progress`. Classification never follows task content.
+Codex Sidebar Flow v0.3 uses the current root agent as an experimental multi-host realtime path on compatible Codex Desktop builds. It must be installed separately on every execution host. A managed global `AGENTS.md` block asks each task to move only itself at turn start and immediately before a successful final response, using exact structured identity, membership, and status checks. Local lifecycle Hooks remain a zero-extra-model-turn optimization; a recurring heartbeat repairs missed or interrupted transitions. Classification never follows task content.
 
 > [!WARNING]
-> Codex Hooks are supported, but custom-sidebar mutation currently depends on a private Codex Desktop app-tools pipe. This experimental macOS integration can break after a Desktop update.
+> Agent-native transitions depend on Codex task-management tools and instruction compliance. Local direct Hook mutation still uses a private Codex Desktop app-tools pipe and can break after a Desktop update.
 
 ## State rules
 
 | Event or state | Destination |
 |---|---|
+| Root agent starts/resumes an eligible task | In Progress |
+| Root agent is about to return a successful final response | For Review |
 | Active task observed in Tasks, For Review, or an eligible Project | In Progress |
 | Authoritative `Stop` observes an idle, completed, failed, or needs-attention task in Tasks, In Progress, or an eligible Project | For Review |
 | Heartbeat observes an idle, completed, failed, or needs-attention task already in In Progress | For Review |
@@ -22,18 +24,20 @@ Membership is resolved from the real sidebar item key by task or Project ID. A l
 
 Requirements: macOS, Codex Desktop, Node.js 20+, and custom sections named `In Progress`, `For Review`, and `For Later`.
 
-Source mode install/configure keeps event wake disabled first:
+Run setup and doctor separately on the local machine and on every connected execution host such as `scmeituan.local`. Remote Connections use that host's own Codex home, configuration, credentials, plugins, and global AGENTS files; one local installation is not shared with remote tasks.
+
+Source mode with agent-native realtime enabled and event wake disabled:
 
 ```bash
 git clone https://github.com/shichang4fun/codex-sidebar-flow.git
 cd codex-sidebar-flow
-node scripts/setup.mjs
+node scripts/setup.mjs --enable-agent-transitions
 ```
 
-Plugin mode install/configure keeps event wake disabled first:
+Plugin mode with agent-native realtime enabled and event wake disabled:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin
+node "${CLAUDE_PLUGIN_ROOT}/scripts/setup.mjs" --plugin --enable-agent-transitions
 ```
 
 Existing v0.1 installations remain `eventWake.enabled=false` until setup publishes the current runtime, a trusted Hook records a probe for that exact runtime, and setup is rerun with `--enable-event-wake` and a confirmed organizer task ID. Do not infer the organizer from the current task.
@@ -52,9 +56,10 @@ Restart Codex Desktop after setup. The installer:
 - backs up `~/.codex/hooks.json`;
 - installs only `UserPromptSubmit` and `Stop` handlers;
 - creates or upgrades `~/.codex/sidebar-flow/config.json` with the exact install mode and runtime fingerprint;
+- with `--enable-agent-transitions`, adds one marked block to the active global `~/.codex/AGENTS.override.md` or `~/.codex/AGENTS.md`, preserves unrelated instructions, and keeps a first-run backup;
 - in source mode, stages the fixed runtime script set, verifies its SHA-256 fingerprint, and atomically publishes an immutable release under `~/.codex/sidebar-flow/releases/<runtimeFingerprint>` before changing Hooks. Existing releases are retained, and no `current` symlink is used. Plugin fingerprints cover that shared runtime plus the plugin manifest, Hook declaration, launcher, heartbeat renderer and prompt, and Sidebar Flow skill.
 
-Setup does not silently create a scheduled model task. Event wake is model-triggering and user-visible, so enable it only with explicit user authorization. The event-wake fast path requires only the lifecycle Hook and a configured organizer task.
+Setup does not silently enable agent transitions or create a scheduled model task. Agent transitions modify global task behavior, and event wake creates user-visible organizer turns, so both require explicit options and user authorization.
 
 A hook installed on one machine does not receive events from another machine's Codex app server. [OpenAI's Hooks documentation](https://learn.chatgpt.com/docs/hooks) states that matching command Hooks run concurrently and that a background Hook cannot block. Sidebar Flow therefore keeps `UserPromptSubmit` synchronous for its optional `additionalContext` fallback, but runs `Stop` in the background. After a bounded delay, the background handler performs an exact final read and moves only a confirmed terminal task; if another Stop Hook continued the turn and it remains active, Sidebar Flow does not move it. The delay narrows the publication race but is not a synchronization barrier. The recurring heartbeat remains an independent global recovery path.
 
@@ -69,6 +74,7 @@ Plugin mode must use the same `CODEX_HOME` inherited by Codex Desktop. It reject
 
 ## Runtime model
 
+- **Agent-native transitions**: the opt-in managed global instruction runs a fingerprint-bound helper that admits only a root task where `CODEX_THREAD_ID === CODEX_SESSION_ID`. These internal environment variables are current-build behavior, not a documented stable API. Subagents, excluded tasks, stale runtimes, and invalid configuration return `eligible:false`. The current agent then uses `list_threads`, exact-host `read_thread`, and at most one task move per phase. The path is designed for separately installed local and remote execution hosts without requiring their Desktop Hook to fire, but each host/build must pass live acceptance before it is treated as working.
 - **Lifecycle Hooks**: synchronous `UserPromptSubmit` records authoritative identity and may provide the bounded self-move fallback. After a bounded delay, background `Stop` performs an exact `read_thread` and directly moves a confirmed terminal or attention-needing task from Tasks, In Progress, or an eligible Project to For Review. An active or internally conflicting final read fails closed.
 - **Event wake**: when `eventWake.enabled=true` and a real Hook-context probe has confirmed `send_message_to_thread`, a Hook that did not directly reconcile may send one content-free envelope containing only `protocol`, `event`, `threadId`, and `hostId` to the configured organizer task. `UserPromptSubmit` may move only an authoritatively active task to In Progress; a delayed `Stop` envelope may move a confirmed terminal or attention-needing task from Tasks, In Progress, or an eligible Project to For Review. Immediately before a move, the organizer performs an exact `read_thread` and rechecks structured host, status, attention, kind, and membership. This narrows but cannot eliminate the platform time-of-check/time-of-use window; it is not an atomic compare-and-swap.
 - **Agent self-move fallback**: a Desktop turn can temporarily own the private app-tools pipe, especially during `UserPromptSubmit`. A recognized transient transport/contention failure can return a bounded `hookSpecificOutput.additionalContext` instruction even when organizer event wake is disabled; non-retryable failures and capability-probe events fail closed. The current agent then uses its already-connected `list_threads`, exact `read_thread`, and at most one `move_thread_to_sidebar_section` call to move only itself to the configured In Progress section after checking structured status, attention flags, host identity, direct/Project membership, and parent protection. Excluded and organizer tasks never receive this context. This fallback is model-assisted, not a deterministic external daemon.
@@ -110,11 +116,11 @@ Plugin mode:
 
 If the probe is missing, pending, expired, belongs to another install mode/runtime fingerprint, or is not `present`, keep event wake disabled and retain the 5-minute heartbeat. The Hook recomputes the mode-specific fingerprint from its own actual files before it may record `present`. The probe confirms whether that exact runtime saw the trusted app-tools context and whether organizer wake stayed suppressed for that probe event. It does not prove end-to-end organizer movement by itself. During normal execution, each new AppTools connection still performs a live `tools/list` and fails closed when its required tools are absent; a prior capability result is never used as a substitute for that live check.
 
-Keep the heartbeat at 5 minutes until live acceptance succeeds on the hosts you care about. Only after verified event-path acceptance should you consider 30-60 minutes. If remote acceptance is absent or fails, do not claim remote realtime behavior and keep the heartbeat interval short enough to cover the remote repair delay you still need.
+Keep the heartbeat at 5 minutes until agent-native start and finish movement succeeds on every host you care about. After that acceptance, 30-60 minutes is a reasonable recovery cadence; the realtime path does not depend on that interval.
 
 With a five-minute heartbeat, an active task or a stopped task already in `In Progress` normally converges within five minutes even when event wake is unavailable. `UserPromptSubmit` does not infer short-task completion from a terminal observation. A later authoritative `Stop` can recover an eligible terminal task from Tasks, In Progress, or an eligible Project even if the start move was missed. If that `Stop` path is unavailable or misses the final state, the heartbeat can recover terminal state only for a task already observed in `In Progress`; a short task that starts and finishes entirely between polls can therefore remain unclassified. Short-task recovery is improved by `Stop`, but is not guaranteed.
 
-Successful Hook observation and a successful background Stop direct move use zero model tokens. Event wake and heartbeat are model turns. A transient `UserPromptSubmit` pipe failure adds one short developer-context instruction to the current turn and normally causes one `list_threads`, one exact `read_thread`, and at most one move call; it does not start a separate fallback model turn, but it does add input/tool-result usage even when event wake is disabled. Event wake produces at most one organizer turn per eligible successfully delivered lifecycle event; exclusions, a successful direct Stop move, probe suppression, rate limits, capability failures, identity failures, and send failures can reduce that to zero. A heartbeat is a scheduled model turn: 5 minutes is 288 runs/day, 1 hour is 24, and 4 hours is 6. Actual token usage varies with the selected model and visible task count. Only the Hook-originated organizer envelope is content-free; the organizer or self-move fallback can expose visible titles, summaries, and status metadata to the selected model even though the audited instructions prohibit using visible text for decisions. Do not install the local fallback or enable event wake/heartbeat if that metadata boundary is unacceptable.
+Agent-native transitions do not create a separate model turn, but each phase adds one small helper result plus bounded task-tool calls to the current turn. Successful Hook observation and a successful background Stop direct move use zero model tokens. Event wake and heartbeat are separate model turns. A heartbeat is scheduled 288 times/day at 5 minutes, 24 at 1 hour, and 6 at 4 hours. Actual token usage varies with the selected model and visible task count. Agent-native, organizer, and heartbeat paths can expose visible task metadata to the selected model even though the policy prohibits using text for decisions.
 
 ## Verify
 
@@ -126,13 +132,13 @@ node scripts/doctor.mjs
 
 Plugin mode uses `node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.mjs" --plugin`. Without an active `CLAUDE_PLUGIN_ROOT`, `--plugin-root <path>` can validate package completeness but reports app enablement as unverified.
 
-`doctor` validates static installation and reproduces the configured fingerprint from the source Hook's owned target root or the supplied plugin root; a merely well-formed stored hash is not accepted. Outside a trusted Hook it deliberately reports runtime capability as unverified; an observed-state acceptance test is still required. `doctor --probe` performs read-only `tools/list` and section checks when run in a trusted app-tools context. `doctor --arm-event-wake-probe` and `doctor --event-wake-probe-result` are the supported capability-gating path before claiming event wake works. The self-move fallback uses the documented [`UserPromptSubmit` additional-context output](https://learn.chatgpt.com/docs/hooks#userpromptsubmit); a capability probe does not prove that the current model will obey the injected instruction, so live movement acceptance remains required.
+`doctor` validates the runtime fingerprint and verifies that `agentTransitions.enabled` matches the active global AGENTS block. A merely well-formed stored hash is not accepted. Outside a trusted Hook it deliberately reports Hook runtime capability as unverified; observed-state acceptance is still required.
 
 Hook diagnostics are written to `~/.codex/sidebar-flow/hook.log` with mode `0600` and one bounded rotation. Logs contain only bounded event, status/error-code, attempt, capability, fallback, and duration fields; they omit prompts, outputs, task titles, full task bodies, complete task IDs, executable paths, socket paths/basenames, and private tool error bodies.
 
 ## Configuration
 
-Edit `~/.codex/sidebar-flow/config.json`. Section names must be unique. Add organizer task IDs to `excludeThreadIds`; content and summary substrings never control exclusion. Event wake remains disabled until `eventWake.enabled` is explicitly set through setup. A background `Stop` waits 3 seconds for Desktop turn finalization, then has a 14-second total Hook deadline; its command handler allows 20 seconds so fingerprint checks and bounded logging do not consume the mutation window.
+Edit `~/.codex/sidebar-flow/config.json`. Section names must be unique. Add organizer task IDs to `excludeThreadIds`; content and summary substrings never control exclusion. Use setup's `--enable-agent-transitions` or `--disable-agent-transitions` options instead of editing the managed AGENTS block. Event wake remains disabled until explicitly enabled through setup.
 
 Socket discovery is disabled by default. The supported path is the explicit `CODEX_APP_TOOLS_PIPE_PATH` inherited by a trusted Codex Hook. Enabling `allowSocketDiscovery` is for local debugging only.
 
@@ -140,18 +146,20 @@ Socket discovery is disabled by default. The supported path is the explicit `COD
 
 Run `node scripts/uninstall.mjs` from the source checkout. If the checkout was removed, use the `releaseRoot` printed by setup and run `node <releaseRoot>/scripts/uninstall.mjs`.
 
-Source mode removes only Sidebar Flow entries from global hooks. A normal uninstall also disables event wake and removes the install-mode/runtime-fingerprint binding while preserving configuration and state. Plugin users should disable the plugin and run `node scripts/uninstall.mjs --plugin --purge` from the checkout; plugin mode never edits global hooks. Add `--purge` to remove configuration, state, installed runtime files, releases, and logs.
+Source mode removes only Sidebar Flow entries from global hooks. Every uninstall removes only the marked Sidebar Flow block from global agent instructions and disables agent transitions/event wake while preserving unrelated content and state. Plugin users should disable the plugin and run `node scripts/uninstall.mjs --plugin --purge` from the checkout. Add `--purge` to remove configuration, state, installed runtime files, releases, and logs.
 
 ## Known boundaries
 
 - The private Desktop sidebar protocol may change without notice.
 - A local Hook cannot receive a remote app server's lifecycle event.
+- Agent-native movement is realtime at agent tool-call granularity, not an external authoritative task-state observer; a model that ignores the managed instruction or a task that crashes before finalization still needs heartbeat recovery.
+- Do not edit `AGENTS.md` or `AGENTS.override.md` concurrently with setup/uninstall. The installer detects observed file replacement and fails closed, but the platform provides no atomic compare-and-swap across both global instruction files.
 - Codex launches matching command Hooks concurrently. The Hook therefore observes and persists first, then may send one envelope to the organizer. If the app-tools pipe is unavailable during `UserPromptSubmit`, it can only inject a bounded self-move instruction into the current agent; that fallback depends on model/tool execution and fails closed on ambiguity.
 - The organizer's exact final read reduces the read/move race but the platform exposes no atomic conditional move, so status or membership can still change before the move commits.
 - Current public remote Hook/MCP capabilities do not expose the multi-step custom-sidebar workflow required by a cross-host event bridge; remote Hook installation is therefore capability-gated, not assumed, and remote realtime must not be claimed without live acceptance.
 - Heartbeat recovery has a bounded delay but cannot reconstruct an event that occurred entirely between snapshots.
 - `list_threads` is limited to 50 summaries. In Progress items outside that window require successful `read_thread` discovery or an authoritative managed host identity; otherwise the tool fails closed.
-- There is no external backend or detached daemon. v0.2 remains a local Hook-plus-organizer-plus-heartbeat system.
+- There is no external backend or detached daemon. v0.3 uses root-agent transitions plus local Hook optimizations and heartbeat recovery.
 
 ## License
 

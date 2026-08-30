@@ -5,7 +5,12 @@ import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { hasOwnedHooks, removeHooks, writeJsonAtomic } from "./setup.mjs";
+import {
+  hasOwnedHooks,
+  removeHooks,
+  syncAgentTransitionInstructions,
+  writeJsonAtomic,
+} from "./setup.mjs";
 import { ensureRealDirectory, revalidateRealDirectory } from "./runtime-integrity.mjs";
 
 export async function uninstall({
@@ -50,8 +55,15 @@ export async function uninstall({
     error.code = "INSTALL_MODE_CONFLICT";
     throw error;
   }
+  const shouldSyncAgentInstructions = config?.agentTransitions?.enabled === true;
+  if (shouldSyncAgentInstructions) {
+    await syncAgentTransitionInstructions({ codexHome, enabled: false, dryRun: true });
+  }
   if (mode === "source") {
     await writeJsonAtomic(hooksPath, removeHooks(hooks, legacyHookPath));
+  }
+  if (shouldSyncAgentInstructions) {
+    await syncAgentTransitionInstructions({ codexHome, enabled: false });
   }
   if (purge) {
     if (runtimeRootIdentity != null) {
@@ -68,6 +80,10 @@ export async function uninstall({
       ...remainingConfig,
       eventWake: {
         ...(remainingConfig.eventWake ?? {}),
+        enabled: false,
+      },
+      agentTransitions: {
+        ...(remainingConfig.agentTransitions ?? {}),
         enabled: false,
       },
     });

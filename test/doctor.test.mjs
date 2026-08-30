@@ -9,12 +9,17 @@ import {
   armEventWakeProbe,
   claimEventWakeProbe,
   inspectInstallation,
+  inspectAgentTransitionInstructions,
   inspectPluginBundle,
   readEventWakeProbeResult,
   releaseEventWakeProbeClaim,
   writeEventWakeProbeResult,
 } from "../scripts/doctor.mjs";
-import { defaultConfig, HOOK_MARKER } from "../scripts/setup.mjs";
+import {
+  agentTransitionInstructions,
+  defaultConfig,
+  HOOK_MARKER,
+} from "../scripts/setup.mjs";
 import { computeRuntimeFingerprint } from "../scripts/runtime-integrity.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -51,6 +56,65 @@ test("doctor runtime binding requires a recomputed exact fingerprint", () => {
     },
   });
   assert.equal(matched.find((check) => check.name === "runtime-binding").level, "ok");
+});
+
+test("doctor verifies agent-transition configuration against the active global instructions", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-agents-"));
+  try {
+    const expectedBlock = agentTransitionInstructions({
+      runtimeRoot: "/tmp/runtime",
+      configPath: "/tmp/config.json",
+      nodeExecutable: "/tmp/node",
+    });
+    await writeFile(path.join(codexHome, "AGENTS.md"), `${expectedBlock}\n`, { mode: 0o600 });
+    const agentInstructions = await inspectAgentTransitionInstructions(codexHome, { expectedBlock });
+    assert.deepEqual(agentInstructions, {
+      safe: true,
+      installed: true,
+      malformed: false,
+      stale: false,
+    });
+    const enabledConfig = {
+      ...config,
+      actorThreadId: "organizer",
+      excludeThreadIds: [],
+      listLimit: 50,
+      agentTransitions: { enabled: true },
+    };
+    const enabledChecks = inspectInstallation({
+      config: enabledConfig,
+      mode: "plugin",
+      agentInstructions,
+    });
+    assert.equal(enabledChecks.find((check) => check.name === "agent-transitions").level, "ok");
+    const disabledChecks = inspectInstallation({ config, mode: "plugin", agentInstructions });
+    assert.equal(disabledChecks.find((check) => check.name === "agent-transitions").level, "error");
+
+    for (const malformed of [
+      { actorThreadId: "bad actor" },
+      { excludeThreadIds: "organizer" },
+      { listLimit: 51 },
+    ]) {
+      const malformedChecks = inspectInstallation({
+        config: { ...enabledConfig, ...malformed },
+        mode: "plugin",
+        agentInstructions,
+      });
+      assert.equal(malformedChecks.find((check) => check.name === "agent-transitions").level, "error");
+    }
+
+    await writeFile(
+      path.join(codexHome, "AGENTS.md"),
+      `${expectedBlock.replace("/tmp/runtime", "/tmp/stale-runtime")}\n`,
+      { mode: 0o600 },
+    );
+    assert.equal(
+      (await inspectAgentTransitionInstructions(codexHome, { expectedBlock })).installed,
+      false,
+    );
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
 });
 
 test("doctor CLI recomputes source Hook and plugin-root fingerprints", async () => {
@@ -107,7 +171,7 @@ test("plugin doctor rejects a missing bundle", () => {
     platform: "darwin",
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
-      manifest: false, hooks: false, launcher: false, sidebarHook: false,
+      manifest: false, hooks: false, launcher: false, agentContext: false, sidebarHook: false,
       sidebarPolicy: false, sidebarRealtime: false, eventWake: false, setup: false, uninstall: false,
       doctor: false, runtimeIntegrity: false, renderHeartbeat: false, skill: false,
       heartbeatPrompt: false, enabledContext: false,
@@ -123,7 +187,7 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     platform: "darwin",
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
-      manifest: true, hooks: true, launcher: true, sidebarHook: true,
+      manifest: true, hooks: true, launcher: true, agentContext: true, sidebarHook: true,
       sidebarPolicy: true, sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
       doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
       heartbeatPrompt: true, enabledContext: false,
@@ -137,7 +201,7 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     platform: "darwin",
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
-      manifest: true, hooks: true, launcher: true, sidebarHook: true,
+      manifest: true, hooks: true, launcher: true, agentContext: true, sidebarHook: true,
       sidebarPolicy: true, sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
       doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
       heartbeatPrompt: true, enabledContext: true,
@@ -153,7 +217,7 @@ test("doctor reports unowned legacy sidebar Hooks as an error", () => {
     platform: "darwin",
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
-      manifest: true, hooks: true, launcher: true, sidebarHook: true,
+      manifest: true, hooks: true, launcher: true, agentContext: true, sidebarHook: true,
       sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
       doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
       heartbeatPrompt: true, enabledContext: true,
@@ -170,6 +234,7 @@ test("plugin doctor requires every runtime and administration bundle component",
     manifest: true,
     hooks: true,
     launcher: true,
+    agentContext: true,
     sidebarHook: true,
     sidebarRealtime: true,
     eventWake: true,
@@ -183,7 +248,7 @@ test("plugin doctor requires every runtime and administration bundle component",
     enabledContext: true,
   };
   for (const missing of [
-    "manifest", "hooks", "launcher", "sidebarHook", "sidebarRealtime", "eventWake",
+    "manifest", "hooks", "launcher", "agentContext", "sidebarHook", "sidebarRealtime", "eventWake",
     "setup", "uninstall", "doctor", "runtimeIntegrity", "renderHeartbeat", "skill",
     "heartbeatPrompt",
   ]) {
@@ -204,6 +269,7 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
     ["manifest", ".codex-plugin/plugin.json"],
     ["hooks", "hooks/hooks.json"],
     ["launcher", "scripts/plugin-hook.sh"],
+    ["agentContext", "scripts/sidebar-agent-context.mjs"],
     ["sidebarHook", "scripts/sidebar-hook.mjs"],
     ["sidebarPolicy", "scripts/sidebar-policy.mjs"],
     ["sidebarRealtime", "scripts/sidebar-realtime.mjs"],
@@ -226,6 +292,7 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
       manifest: true,
       hooks: true,
       launcher: true,
+      agentContext: true,
       sidebarHook: true,
       sidebarPolicy: true,
       sidebarRealtime: true,

@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0] - 2026-08-30
+
+### Added
+
+- Add opt-in root-agent `start` and `finish` transitions for local and remote-controlled tasks on separately installed hosts, without relying on remote Desktop Hook delivery.
+- Add a fingerprint-bound context helper with root/subagent identity gating, exclusions, and fail-closed configuration validation.
+- Add managed global AGENTS installation, idempotent updates, first-run backup, uninstall cleanup, and doctor verification.
+
+### Changed
+
+- Treat local Hooks as an optimization and heartbeat as recovery after agent-native lifecycle acceptance.
+- Preserve Pinned, For Later, archived, ambiguous, non-Codex, excluded, and protected Project items across every path.
+- Document that agent-native movement is realtime at the current agent's tool boundary, not an external authoritative observer.
+
 ## [0.2.1] - 2026-08-30
 
 ### Added

@@ -8,6 +8,8 @@ import test from "node:test";
 import { promisify } from "node:util";
 import {
   defaultConfig,
+  AGENT_TRANSITIONS_END,
+  AGENT_TRANSITIONS_START,
   findUnmarkedSidebarHookPaths,
   HOOK_MARKER,
   installHooks,
@@ -30,6 +32,7 @@ const sourceRuntimeFiles = [
   "scripts/event-wake.mjs",
   "scripts/runtime-integrity.mjs",
   "scripts/setup.mjs",
+  "scripts/sidebar-agent-context.mjs",
   "scripts/sidebar-hook.mjs",
   "scripts/sidebar-policy.mjs",
   "scripts/sidebar-realtime.mjs",
@@ -104,6 +107,10 @@ test("setup and uninstall CLI parsers reject missing or flag-shaped path values"
   assert.throws(
     () => parseSetupArgs(["--plugin", "--codex-home", "/tmp/custom-plugin-home"]),
     /plugin.*CODEX_HOME|CODEX_HOME.*plugin/i,
+  );
+  assert.throws(
+    () => parseSetupArgs(["--enable-agent-transitions", "--disable-agent-transitions"]),
+    /one agent-transitions mode/,
   );
   await assert.rejects(
     setup({ codexHome: "relative-home", dryRun: true }),
@@ -183,7 +190,7 @@ test("default configuration keeps event wake disabled with private runtime paths
   assert.equal(config.eventWakeProbeRequestFile, path.join(runtime, "event-wake-probe-request.json"));
   assert.equal(config.eventWakeProbeResultFile, path.join(runtime, "event-wake-probe-result.json"));
   assert.equal(config.eventWakeProbeTtlMs, 300000);
-  assert.equal(config.configVersion, 2);
+  assert.equal(config.configVersion, 3);
   assert.equal(config.hookDeadlineMs, 14000);
   assert.equal(config.stopSettleDelayMs, 3000);
 });
@@ -430,7 +437,7 @@ test("upgrading a v0.1 configuration adds disabled event wake defaults", async (
     const upgraded = JSON.parse(await readFile(configPath, "utf8"));
     assert.equal(upgraded.eventWake.enabled, false);
     assert.equal(upgraded.eventWake.organizerThreadId, null);
-    assert.equal(upgraded.configVersion, 2);
+    assert.equal(upgraded.configVersion, 3);
     assert.equal(upgraded.hookDeadlineMs, 14000);
     assert.equal(upgraded.stopSettleDelayMs, 3000);
     assert.equal(upgraded.custom, "preserved");
@@ -452,7 +459,7 @@ test("timing migration preserves explicit non-legacy overrides", async () => {
     })}\n`, { mode: 0o600 });
     await setupPluginForTest(codexHome);
     const upgraded = JSON.parse(await readFile(configPath, "utf8"));
-    assert.equal(upgraded.configVersion, 2);
+    assert.equal(upgraded.configVersion, 3);
     assert.equal(upgraded.hookDeadlineMs, 18000);
     assert.equal(upgraded.stopSettleDelayMs, 4500);
   } finally {
@@ -547,6 +554,120 @@ test("setup preserves the original backup across reruns", async () => {
     assert.equal(JSON.parse(await readFile(path.join(codexHome, "sidebar-flow", "config.json"), "utf8")).installMode, "source");
   } finally {
     await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("agent transitions are opt-in, idempotent, and uninstall preserves user instructions", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-agents-"));
+  try {
+    const agentsPath = path.join(codexHome, "AGENTS.md");
+    const original = "User-owned global instructions.\n";
+    await writeFile(agentsPath, original, { mode: 0o644 });
+
+    const installed = await setup({ codexHome, agentTransitionsEnabled: true });
+    let managed = await readFile(agentsPath, "utf8");
+    assert.equal(managed.includes(original.trim()), true);
+    assert.equal(managed.split(AGENT_TRANSITIONS_START).length - 1, 1);
+    assert.equal(managed.split(AGENT_TRANSITIONS_END).length - 1, 1);
+    assert.equal(managed.includes(path.join(installed.releaseRoot, "scripts", "sidebar-agent-context.mjs")), true);
+    assert.equal(managed.includes("exactly one non-built-in custom section"), true);
+    assert.equal(managed.includes("three section IDs to be distinct"), true);
+    assert.equal(
+      managed.includes("no direct membership is eligible through its parent Project only when that Project has exactly one membership and it is the built-in Projects section"),
+      true,
+    );
+    assert.equal((await stat(agentsPath)).mode & 0o777, 0o644);
+    assert.equal(await readFile(`${agentsPath}.sidebar-flow.bak`, "utf8"), original);
+    assert.equal(
+      JSON.parse(await readFile(installed.configPath, "utf8")).agentTransitions.enabled,
+      true,
+    );
+
+    await setup({ codexHome });
+    managed = await readFile(agentsPath, "utf8");
+    assert.equal(managed.split(AGENT_TRANSITIONS_START).length - 1, 1);
+
+    await uninstall({ codexHome });
+    assert.equal(await readFile(agentsPath, "utf8"), original);
+    assert.equal(
+      JSON.parse(await readFile(installed.configPath, "utf8")).agentTransitions.enabled,
+      false,
+    );
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("agent transitions use a nonempty AGENTS override and preserve the base file", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-agents-override-"));
+  try {
+    const agentsPath = path.join(codexHome, "AGENTS.md");
+    const overridePath = path.join(codexHome, "AGENTS.override.md");
+    await writeFile(agentsPath, "Base instructions.\n", { mode: 0o600 });
+    await writeFile(overridePath, "Override instructions.\n", { mode: 0o600 });
+
+    await setup({ codexHome, agentTransitionsEnabled: true });
+    assert.equal((await readFile(agentsPath, "utf8")).includes(AGENT_TRANSITIONS_START), false);
+    assert.equal((await readFile(overridePath, "utf8")).includes(AGENT_TRANSITIONS_START), true);
+
+    await uninstall({ codexHome });
+    assert.equal(await readFile(agentsPath, "utf8"), "Base instructions.\n");
+    assert.equal(await readFile(overridePath, "utf8"), "Override instructions.\n");
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("setup rejects malformed managed agent instructions before hook mutation", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-agents-malformed-"));
+  try {
+    await writeFile(path.join(codexHome, "AGENTS.md"), `${AGENT_TRANSITIONS_START}\ntruncated\n`, { mode: 0o600 });
+    await assert.rejects(
+      setup({ codexHome, agentTransitionsEnabled: true }),
+      (error) => error.code === "MALFORMED_AGENT_INSTRUCTIONS",
+    );
+    await assert.rejects(readFile(path.join(codexHome, "hooks.json"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(path.join(codexHome, "sidebar-flow", "config.json"), "utf8"), /ENOENT/);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("setup refuses symlinked global agent instructions without touching their target", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-agents-symlink-"));
+  const targetDirectory = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-agents-target-"));
+  try {
+    const target = path.join(targetDirectory, "target.md");
+    const original = "External instructions.\n";
+    await writeFile(target, original, { mode: 0o600 });
+    await symlink(target, path.join(codexHome, "AGENTS.md"));
+    await assert.rejects(
+      setup({ codexHome, agentTransitionsEnabled: true }),
+      (error) => error.code === "UNSAFE_AGENT_INSTRUCTIONS",
+    );
+    assert.equal(await readFile(target, "utf8"), original);
+    await assert.rejects(readFile(path.join(codexHome, "hooks.json"), "utf8"), /ENOENT/);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+    await rm(targetDirectory, { recursive: true, force: true });
+  }
+});
+
+test("setup leaves symlinked global instructions untouched when agent transitions are not enabled", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-agents-symlink-disabled-"));
+  const targetDirectory = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-agents-disabled-target-"));
+  try {
+    const target = path.join(targetDirectory, "target.md");
+    const original = "External instructions.\n";
+    await writeFile(target, original, { mode: 0o600 });
+    await symlink(target, path.join(codexHome, "AGENTS.md"));
+    const installed = await setup({ codexHome });
+    assert.equal(installed.agentInstructions.skipped, true);
+    assert.equal(await readFile(target, "utf8"), original);
+    assert.equal((await stat(installed.configPath)).isFile(), true);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+    await rm(targetDirectory, { recursive: true, force: true });
   }
 });
 

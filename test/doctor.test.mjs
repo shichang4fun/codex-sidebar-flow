@@ -108,7 +108,7 @@ test("plugin doctor rejects a missing bundle", () => {
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
       manifest: false, hooks: false, launcher: false, sidebarHook: false,
-      sidebarRealtime: false, eventWake: false, setup: false, uninstall: false,
+      sidebarPolicy: false, sidebarRealtime: false, eventWake: false, setup: false, uninstall: false,
       doctor: false, runtimeIntegrity: false, renderHeartbeat: false, skill: false,
       heartbeatPrompt: false, enabledContext: false,
     },
@@ -124,7 +124,7 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
-      sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
+      sidebarPolicy: true, sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
       doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
       heartbeatPrompt: true, enabledContext: false,
     },
@@ -138,7 +138,7 @@ test("plugin doctor distinguishes a complete bundle from verified enablement", (
     nodeExecutable: "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
     pluginBundle: {
       manifest: true, hooks: true, launcher: true, sidebarHook: true,
-      sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
+      sidebarPolicy: true, sidebarRealtime: true, eventWake: true, setup: true, uninstall: true,
       doctor: true, runtimeIntegrity: true, renderHeartbeat: true, skill: true,
       heartbeatPrompt: true, enabledContext: true,
     },
@@ -205,6 +205,7 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
     ["hooks", "hooks/hooks.json"],
     ["launcher", "scripts/plugin-hook.sh"],
     ["sidebarHook", "scripts/sidebar-hook.mjs"],
+    ["sidebarPolicy", "scripts/sidebar-policy.mjs"],
     ["sidebarRealtime", "scripts/sidebar-realtime.mjs"],
     ["eventWake", "scripts/event-wake.mjs"],
     ["setup", "scripts/setup.mjs"],
@@ -226,6 +227,7 @@ test("plugin bundle inspection rejects directories, symlinks, and unreadable ent
       hooks: true,
       launcher: true,
       sidebarHook: true,
+      sidebarPolicy: true,
       sidebarRealtime: true,
       eventWake: true,
       setup: true,
@@ -323,7 +325,7 @@ test("doctor validates event-wake configuration and reports capability separatel
     runtimeRoot: path.join(codexHome, "sidebar-flow"),
     eventWakeProbe: { status: "expired", checkedAt: 100 },
   });
-  assert.equal(expired.find((check) => check.name === "event-wake-capability").level, "error");
+  assert.equal(expired.find((check) => check.name === "event-wake-capability").level, "warning");
 });
 
 test("doctor arms and reads bounded private event-wake probe state", async () => {

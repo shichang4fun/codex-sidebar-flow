@@ -16,6 +16,19 @@ test("heartbeat renderer fails closed without an organizer ID", () => {
   assert.throws(() => renderHeartbeatPrompt("> x {{EXCLUDED_TASK_IDS}}", []), /At least one/);
 });
 
+test("heartbeat renderer uses the configured section policy", async () => {
+  const template = await readFile(new URL("../docs/heartbeat-prompt.md", import.meta.url), "utf8");
+  const prompt = renderHeartbeatPrompt(template, ["organizer"], {
+    inProgress: "Doing",
+    forReview: "Review Queue",
+    forLater: "Later",
+  });
+  assert.equal(prompt.includes('inProgress="Doing"'), true);
+  assert.equal(prompt.includes('forReview="Review Queue"'), true);
+  assert.equal(prompt.includes('protected forLater="Later"'), true);
+  assert.equal(prompt.includes("In Progress"), false);
+});
+
 test("heartbeat prompt enforces audited allowlist, protections, and fail-closed recovery policy", async () => {
   const template = await readFile(new URL("../docs/heartbeat-prompt.md", import.meta.url), "utf8");
   const organizerId = "01a00000-0000-7000-8000-000000000001";
@@ -28,7 +41,7 @@ test("heartbeat prompt enforces audited allowlist, protections, and fail-closed 
     true,
   );
   assert.equal(
-    prompt.includes("Never move Pinned, For Later, archived, non-Codex, Project objects, or an excluded task ID."),
+    prompt.includes('Never move Pinned, "For Later", archived, non-Codex, Project objects, or an excluded task ID.'),
     true,
   );
   assert.equal(prompt.includes("Move Pinned"), false);
@@ -38,15 +51,15 @@ test("heartbeat prompt enforces audited allowlist, protections, and fail-closed 
     true,
   );
   assert.equal(
-    prompt.includes("A `UserPromptSubmit`-equivalent start move requires a confirmed active task with no attention flags before moving an eligible task from Tasks, For Review, or an eligible Project task to In Progress."),
+    prompt.includes('A `UserPromptSubmit`-equivalent start move requires a confirmed active task with no attention flags before moving an eligible task from Tasks, "For Review", or an eligible Project task to "In Progress".'),
     true,
   );
   assert.equal(
-    prompt.includes("Heartbeat terminal recovery is limited to tasks already in In Progress."),
+    prompt.includes('Heartbeat terminal recovery is limited to tasks already in "In Progress".'),
     true,
   );
   assert.equal(
-    prompt.includes("A `Stop`-equivalent terminal move requires a confirmed idle, completed, failed, or needs-attention task before moving a task already in In Progress to For Review."),
+    prompt.includes('A `Stop`-equivalent terminal move requires a confirmed idle, completed, failed, or needs-attention task before moving a task already in "In Progress" to "For Review".'),
     true,
   );
   assert.equal(

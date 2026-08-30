@@ -42,6 +42,11 @@ function makeConfig(overrides = {}) {
     wakeStateFile: path.join(os.tmpdir(), `event-wake-${Date.now()}-${Math.random()}.json`),
     excludeThreadIds: [],
     maxPerMinute: 20,
+    sections: {
+      inProgress: "In Progress",
+      forReview: "For Review",
+      forLater: "For Later",
+    },
     ...overrides,
   };
 }
@@ -114,7 +119,7 @@ test("renderEventWakePrompt is fixed, targeted, and never interpolates task cont
   );
   assert.equal(prompt.includes("If `UserPromptSubmit` is already idle"), false);
   assert.equal(
-    prompt.includes("For `Stop`, confirm the exact target is idle, completed, failed, or needs-attention before moving an eligible task from Tasks, In Progress, or an eligible Project task to For Review."),
+    prompt.includes('For `Stop`, confirm the exact target is idle, completed, failed, or needs-attention before moving an eligible task from Tasks, "In Progress", or an eligible Project task to "For Review".'),
     true,
   );
 
@@ -127,11 +132,11 @@ test("renderEventWakePrompt is fixed, targeted, and never interpolates task cont
     true,
   );
   assert.equal(
-    hostilePrompt.includes("For `UserPromptSubmit`, confirm the exact target is active and has no attention flags before moving an eligible task from Tasks, For Review, or an eligible Project task to In Progress."),
+    hostilePrompt.includes('For `UserPromptSubmit`, confirm the exact target is active and has no attention flags before moving an eligible task from Tasks, "For Review", or an eligible Project task to "In Progress".'),
     true,
   );
   assert.equal(
-    hostilePrompt.includes("For `Stop`, confirm the exact target is idle, completed, failed, or needs-attention before moving an eligible task from Tasks, In Progress, or an eligible Project task to For Review."),
+    hostilePrompt.includes('For `Stop`, confirm the exact target is idle, completed, failed, or needs-attention before moving an eligible task from Tasks, "In Progress", or an eligible Project task to "For Review".'),
     true,
   );
   assert.equal(hostilePrompt.includes("/tmp/"), false);
@@ -141,6 +146,16 @@ test("renderEventWakePrompt is fixed, targeted, and never interpolates task cont
 test("renderEventWakePrompt rejects recursive organizer targets", () => {
   const config = makeConfig({ organizerThreadId: makeEnvelope().threadId });
   assert.throws(() => renderEventWakePrompt(makeEnvelope(), config), /organizer/i);
+});
+
+test("renderEventWakePrompt uses the configured section policy", () => {
+  const prompt = renderEventWakePrompt(makeEnvelope(), makeConfig({
+    sections: { inProgress: "Doing", forReview: "Review Queue", forLater: "Later" },
+  }));
+  assert.equal(prompt.includes('inProgress="Doing"'), true);
+  assert.equal(prompt.includes('forReview="Review Queue"'), true);
+  assert.equal(prompt.includes('protected forLater="Later"'), true);
+  assert.equal(prompt.includes("In Progress"), false);
 });
 
 test("acquireWakePermit stores private state with one-minute expiry", async () => {

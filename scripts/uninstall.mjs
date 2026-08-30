@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { hasOwnedHooks, removeHooks, writeJsonAtomic } from "./setup.mjs";
+import { ensureRealDirectory, revalidateRealDirectory } from "./runtime-integrity.mjs";
 
 export async function uninstall({
   codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
@@ -19,8 +20,16 @@ export async function uninstall({
     throw error;
   }
   const hooksPath = path.join(codexHome, "hooks.json");
-  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
-  const legacyHookPath = path.join(codexHome, "sidebar-flow", "scripts", "sidebar-hook.mjs");
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const runtimeRootIdentity = await ensureRealDirectory(runtimeRoot, {
+    create: false,
+    label: "Sidebar Flow runtime root",
+  }).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  const configPath = path.join(runtimeRoot, "config.json");
+  const legacyHookPath = path.join(runtimeRoot, "scripts", "sidebar-hook.mjs");
   let hooks = {};
   let config = null;
   try {
@@ -45,7 +54,10 @@ export async function uninstall({
     await writeJsonAtomic(hooksPath, removeHooks(hooks, legacyHookPath));
   }
   if (purge) {
-    await rm(path.join(codexHome, "sidebar-flow"), { recursive: true, force: true });
+    if (runtimeRootIdentity != null) {
+      await revalidateRealDirectory(runtimeRoot, runtimeRootIdentity, "Sidebar Flow runtime root");
+      await rm(runtimeRoot, { recursive: true, force: true });
+    }
   } else if (config != null) {
     const {
       installMode: _installMode,

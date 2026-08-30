@@ -1,5 +1,5 @@
 {
-  "description": "Record trusted lifecycle identity without committing sidebar state before sibling Hook outcomes are known.",
+  "description": "Observe task starts and reconcile terminal stops after sibling Hook outcomes settle.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -18,7 +18,8 @@
           {
             "type": "command",
             "command": "exec /bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/plugin-hook.sh\"",
-            "timeout": 15
+            "timeout": 20,
+            "async": true
           }
         ]
       }

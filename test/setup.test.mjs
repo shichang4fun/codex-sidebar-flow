@@ -31,6 +31,7 @@ const sourceRuntimeFiles = [
   "scripts/runtime-integrity.mjs",
   "scripts/setup.mjs",
   "scripts/sidebar-hook.mjs",
+  "scripts/sidebar-policy.mjs",
   "scripts/sidebar-realtime.mjs",
   "scripts/uninstall.mjs",
 ];
@@ -63,6 +64,13 @@ async function copyRuntimeFixture(sourceRoot, targetRoot) {
   }
 }
 
+function setupPluginForTest(codexHome, options = {}) {
+  return setup(
+    { codexHome, mode: "plugin", ...options },
+    { runtimeCodexHome: codexHome },
+  );
+}
+
 async function recordPresentProbe(config, runtimeRoot, {
   armedAt = Date.now(),
   probeId = "probe-setup-present",
@@ -93,6 +101,10 @@ test("setup and uninstall CLI parsers reject missing or flag-shaped path values"
   assert.throws(() => parseSetupArgs(["--migrate-legacy-hook"]), /requires a value/);
   assert.throws(() => parseUninstallArgs(["--codex-home"]), /requires a value/);
   assert.throws(() => parseUninstallArgs(["--codex-home", "--purge"]), /requires a value/);
+  assert.throws(
+    () => parseSetupArgs(["--plugin", "--codex-home", "/tmp/custom-plugin-home"]),
+    /plugin.*CODEX_HOME|CODEX_HOME.*plugin/i,
+  );
   await assert.rejects(
     setup({ codexHome: "relative-home", dryRun: true }),
     (error) => error.code === "INVALID_CODEX_HOME",
@@ -112,6 +124,23 @@ test("setup and uninstall CLI parsers reject missing or flag-shaped path values"
     execFileAsync(process.execPath, [uninstallScript, "--codex-home"]),
     (error) => error.code === 1 && /requires a value/.test(error.stderr),
   );
+});
+
+test("plugin setup rejects a CODEX_HOME that the runtime will not inherit", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-plugin-custom-home-"));
+  try {
+    await assert.rejects(
+      setup({ codexHome, mode: "plugin" }),
+      (error) => error.code === "PLUGIN_CODEX_HOME_MISMATCH",
+    );
+    const installed = await setup(
+      { codexHome, mode: "plugin" },
+      { runtimeCodexHome: codexHome },
+    );
+    assert.equal(installed.configPath, path.join(codexHome, "sidebar-flow", "config.json"));
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
 });
 
 test("setup parses explicit event-wake configuration and rejects unsafe values", () => {
@@ -154,6 +183,9 @@ test("default configuration keeps event wake disabled with private runtime paths
   assert.equal(config.eventWakeProbeRequestFile, path.join(runtime, "event-wake-probe-request.json"));
   assert.equal(config.eventWakeProbeResultFile, path.join(runtime, "event-wake-probe-result.json"));
   assert.equal(config.eventWakeProbeTtlMs, 300000);
+  assert.equal(config.configVersion, 2);
+  assert.equal(config.hookDeadlineMs, 14000);
+  assert.equal(config.stopSettleDelayMs, 3000);
 });
 
 test("setup rejects invalid event-wake options before filesystem mutation", async () => {
@@ -238,7 +270,7 @@ test("setup requires a present probe bound to the exact mode and runtime before 
       organizerHostId: "remote-control:env_123",
       maxPerMinute: 7,
     });
-    assert.deepEqual(once.excludeThreadIds, ["keep-excluded", "organizer-123"]);
+    assert.deepEqual(once.excludeThreadIds, ["keep-excluded", "old-organizer", "organizer-123"]);
     assert.deepEqual(once.unrelated, { keep: true });
     assert.equal((await stat(path.join(runtime, "releases", once.runtimeFingerprint, "scripts", "event-wake.mjs"))).isFile(), true);
 
@@ -254,7 +286,7 @@ test("setup requires a present probe bound to the exact mode and runtime before 
       organizerHostId: "remote-control:env_123",
       maxPerMinute: 7,
     });
-    assert.deepEqual(rerun.excludeThreadIds, ["keep-excluded", "organizer-123", "organizer-456"]);
+    assert.deepEqual(rerun.excludeThreadIds, ["keep-excluded", "old-organizer", "organizer-123", "organizer-456"]);
 
     await setup({ codexHome });
     assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), rerun);
@@ -275,6 +307,7 @@ test("source setup publishes immutable fingerprinted releases before changing ho
     assert.equal(first.runtimeFingerprint, firstFingerprint);
     assert.equal(first.releaseRoot, path.join(codexHome, "sidebar-flow", "releases", firstFingerprint));
     assert.equal((await lstat(first.releaseRoot)).isSymbolicLink(), false);
+    assert.equal(firstHooks.includes(first.configPath), true);
     for (const relativePath of sourceRuntimeFiles) {
       assert.equal((await stat(path.join(first.releaseRoot, relativePath))).isFile(), true);
     }
@@ -334,6 +367,51 @@ test("source setup refuses a symlinked releases root", async () => {
   }
 });
 
+test("setup and uninstall reject a symlinked runtime root without touching its target", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-runtime-link-home-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-runtime-link-outside-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const sentinel = path.join(outside, "sentinel.txt");
+  try {
+    await mkdir(path.join(outside, "scripts"), { recursive: true });
+    await writeFile(sentinel, "keep\n", { mode: 0o600 });
+    await symlink(outside, runtimeRoot);
+    await assert.rejects(
+      setupPluginForTest(codexHome),
+      (error) => error.code === "UNSAFE_RUNTIME_DIRECTORY",
+    );
+    await assert.rejects(
+      uninstall({ codexHome, mode: "plugin", purge: true }),
+      (error) => error.code === "UNSAFE_RUNTIME_DIRECTORY",
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "keep\n");
+    await assert.rejects(stat(path.join(outside, "config.json")), /ENOENT/);
+  } finally {
+    await rm(runtimeRoot, { force: true });
+    await rm(codexHome, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("setup rejects configured destinations that use built-in section names", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-invalid-sections-"));
+  const runtimeRoot = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtimeRoot, "config.json");
+  try {
+    await mkdir(runtimeRoot, { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      sections: { inProgress: "Pinned", forReview: "Review", forLater: "Later" },
+    })}\n`, { mode: 0o600 });
+    await assert.rejects(
+      setupPluginForTest(codexHome),
+      (error) => error.code === "INVALID_SECTION_CONFIG",
+    );
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).sections.inProgress, "Pinned");
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("upgrading a v0.1 configuration adds disabled event wake defaults", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-v01-upgrade-"));
   const runtime = path.join(codexHome, "sidebar-flow");
@@ -344,13 +422,61 @@ test("upgrading a v0.1 configuration adds disabled event wake defaults", async (
       installMode: "plugin",
       sections: { inProgress: "In Progress", forReview: "For Review", forLater: "For Later" },
       excludeThreadIds: [],
+      hookDeadlineMs: 9000,
+      stopSettleDelayMs: 500,
       custom: "preserved",
     })}\n`, { mode: 0o600 });
-    await setup({ codexHome, mode: "plugin" });
+    await setupPluginForTest(codexHome);
     const upgraded = JSON.parse(await readFile(configPath, "utf8"));
     assert.equal(upgraded.eventWake.enabled, false);
     assert.equal(upgraded.eventWake.organizerThreadId, null);
+    assert.equal(upgraded.configVersion, 2);
+    assert.equal(upgraded.hookDeadlineMs, 14000);
+    assert.equal(upgraded.stopSettleDelayMs, 3000);
     assert.equal(upgraded.custom, "preserved");
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("timing migration preserves explicit non-legacy overrides", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-custom-timing-upgrade-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  try {
+    await mkdir(runtime, { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      installMode: "plugin",
+      hookDeadlineMs: 18000,
+      stopSettleDelayMs: 4500,
+    })}\n`, { mode: 0o600 });
+    await setupPluginForTest(codexHome);
+    const upgraded = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(upgraded.configVersion, 2);
+    assert.equal(upgraded.hookDeadlineMs, 18000);
+    assert.equal(upgraded.stopSettleDelayMs, 4500);
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("setup preserves timing owned by a future config version", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-future-config-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  try {
+    await mkdir(runtime, { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      configVersion: 3,
+      installMode: "plugin",
+      hookDeadlineMs: 9000,
+      stopSettleDelayMs: 500,
+    })}\n`, { mode: 0o600 });
+    await setupPluginForTest(codexHome);
+    const upgraded = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(upgraded.configVersion, 3);
+    assert.equal(upgraded.hookDeadlineMs, 9000);
+    assert.equal(upgraded.stopSettleDelayMs, 500);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }
@@ -365,6 +491,10 @@ test("setup is idempotent and preserves unrelated hooks", () => {
   assert.equal(twice.hooks.Stop.length, 2);
   assert.equal(twice.hooks.UserPromptSubmit.length, 1);
   assert.equal(twice.hooks.Stop[0].hooks[0].command, "echo keep");
+  assert.equal(twice.hooks.UserPromptSubmit.at(-1).hooks[0].async, undefined);
+  assert.equal(twice.hooks.UserPromptSubmit.at(-1).hooks[0].timeout, 15);
+  assert.equal(twice.hooks.Stop.at(-1).hooks[0].async, true);
+  assert.equal(twice.hooks.Stop.at(-1).hooks[0].timeout, 20);
 });
 
 test("uninstall removes only Sidebar Flow hooks", () => {
@@ -461,7 +591,7 @@ test("plugin setup refuses the standard unmarked source Hook", async () => {
       hooks: { Stop: [{ hooks: [{ type: "command", command: `node '${legacyPath}'` }] }] },
     })}\n`, { mode: 0o600 });
     await assert.rejects(
-      setup({ codexHome, mode: "plugin" }),
+      setupPluginForTest(codexHome),
       (error) => error.code === "INSTALL_MODE_CONFLICT",
     );
   } finally {
@@ -500,7 +630,7 @@ test("setup fails closed on an unknown legacy Hook unless its exact path is auth
 test("plugin setup creates configuration without global hooks", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-plugin-"));
   try {
-    const result = await setup({ codexHome, mode: "plugin" });
+    const result = await setupPluginForTest(codexHome);
     assert.equal(result.mode, "plugin");
     const config = JSON.parse(await readFile(result.configPath, "utf8"));
     assert.equal(config.allowSocketDiscovery, false);
@@ -515,7 +645,7 @@ test("plugin setup creates configuration without global hooks", async () => {
 test("plugin to source migration requires uninstalling plugin mode first", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-plugin-source-"));
   try {
-    await setup({ codexHome, mode: "plugin" });
+    await setupPluginForTest(codexHome);
     await assert.rejects(setup({ codexHome, mode: "source" }), /installed in plugin mode/);
     await uninstall({ codexHome, mode: "plugin" });
     await setup({ codexHome, mode: "source" });
@@ -531,10 +661,10 @@ test("source to plugin migration removes source hooks before plugin setup", asyn
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-source-plugin-"));
   try {
     await setup({ codexHome, mode: "source" });
-    await assert.rejects(setup({ codexHome, mode: "plugin" }), /installed in source mode/);
+    await assert.rejects(setupPluginForTest(codexHome), /installed in source mode/);
     await assert.rejects(uninstall({ codexHome, mode: "plugin", purge: true }), /installed in source mode/);
     await uninstall({ codexHome, mode: "source" });
-    await setup({ codexHome, mode: "plugin" });
+    await setupPluginForTest(codexHome);
     const config = JSON.parse(await readFile(path.join(codexHome, "sidebar-flow", "config.json"), "utf8"));
     assert.equal(config.installMode, "plugin");
     assert.equal((await readFile(path.join(codexHome, "hooks.json"), "utf8")).includes("sidebar-hook.mjs"), false);

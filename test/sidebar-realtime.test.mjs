@@ -15,6 +15,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import {
+  confirmPlannedMove,
   parseDeclaredSocketPaths,
   planMoves,
   statusFromThreadRead,
@@ -91,6 +92,21 @@ assert.deepEqual(
   ],
 );
 
+for (const status of [
+  "needs-attention",
+  "needs_attention",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "canceled",
+]) {
+  const terminal = thread(`terminal-${status}`, status, "progress");
+  assert.deepEqual(
+    planMoves(snapshot([terminal]), config).map(({ threadId, sectionName }) => [threadId, sectionName]),
+    [[terminal.id, "For Review"]],
+  );
+}
+
 const completedBeforeObservation = thread("completed-before-observation", "completed", "chats");
 assert.deepEqual(
   planMoves(snapshot([completedBeforeObservation]), config, new Set([completedBeforeObservation.id])).map(
@@ -126,7 +142,10 @@ const hydrationSnapshot = snapshot([
 const hydratedSnapshot = await sidebarRealtime.hydrateCustomThreads(hydrationSnapshot, config, {
   readThread: async (threadId) => {
     if (threadId === "unreadable") throw new Error("remote host unavailable");
-    return { thread: { id: threadId, status: { type: "notLoaded" } }, turns: [{ status: "completed" }] };
+    return {
+      thread: { id: threadId, hostId: "local", kind: "codex", status: { type: "notLoaded" } },
+      turns: [{ status: "completed" }],
+    };
   },
 });
 assert.equal(
@@ -529,6 +548,18 @@ const remoteProjectMove = planMoves(snapshot([remoteProjectActive]), config)[0];
 assert.equal(remoteProjectMove.sectionName, "In Progress");
 assert.equal(remoteProjectMove.hostId, remoteHostId);
 
+const projectWithDirectCustom = thread("project-direct-custom", "active", "threads", {
+  projectId: "remote-project",
+  projectContainer: true,
+});
+const projectWithDirectCustomSnapshot = snapshot([projectWithDirectCustom]);
+projectWithDirectCustomSnapshot.sections.push({
+  sectionId: "other-custom",
+  name: "Other Custom",
+  itemKeys: [`codex:thread:${remoteHostId}:${projectWithDirectCustom.id}`],
+});
+assert.deepEqual(planMoves(projectWithDirectCustomSnapshot, config), []);
+
 const remoteProjectCompleted = thread("remote-project-completed", "completed", "threads", {
   hostId: remoteHostId,
   projectId: "remote-project",
@@ -543,6 +574,143 @@ assert.equal(
   "For Review",
 );
 
+const remoteProjectHydrationTasks = [
+  thread("remote-project-hydrate-active", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-hydration-project",
+    projectContainer: true,
+  }),
+  thread("remote-project-hydrate-completed", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-hydration-project",
+    projectContainer: true,
+  }),
+  thread("remote-project-hydrate-attention", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-hydration-project",
+    projectContainer: true,
+  }),
+];
+const remoteProjectHydrationCalls = [];
+const remoteProjectHydrated = await sidebarRealtime.hydrateCustomThreads(
+  snapshot(remoteProjectHydrationTasks),
+  config,
+  {
+    readThread: async (threadId, hostId) => {
+      remoteProjectHydrationCalls.push({ threadId, hostId });
+      if (threadId.endsWith("active")) {
+        return {
+          thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+          turns: [{ status: "inProgress" }],
+        };
+      }
+      if (threadId.endsWith("attention")) {
+        return {
+          thread: {
+            id: threadId,
+            hostId,
+            kind: "codex",
+            status: { type: "active", activeFlags: ["waitingOnUserInput"] },
+          },
+          turns: [{ status: "inProgress" }],
+        };
+      }
+      return {
+        thread: { id: threadId, hostId, kind: "codex", status: { type: "notLoaded" } },
+        turns: [{ status: "completed" }],
+      };
+    },
+  },
+);
+assert.deepEqual(
+  remoteProjectHydrationCalls,
+  remoteProjectHydrationTasks.map(({ id }) => ({ threadId: id, hostId: remoteHostId })),
+);
+assert.deepEqual(
+  remoteProjectHydrated.threads.map(({ status }) => status),
+  ["active", "completed", "needsattention"],
+);
+assert.deepEqual(
+  planMoves(
+    remoteProjectHydrated,
+    config,
+    new Set(remoteProjectHydrationTasks.map(({ id }) => managedIdentity(remoteHostId, id))),
+  ).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [
+    ["remote-project-hydrate-active", "In Progress"],
+    ["remote-project-hydrate-completed", "For Review"],
+    ["remote-project-hydrate-attention", "For Review"],
+  ],
+);
+
+const projectTerminalTransition = snapshot([
+  thread("remote-project-transition-completed", "active", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-transition-project",
+    projectContainer: true,
+  }),
+  thread("remote-project-transition-attention", "active", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-transition-project",
+    projectContainer: true,
+  }),
+]);
+const projectTerminalOutcome = await sidebarRealtime.hydrateSnapshotWithActivity(
+  projectTerminalTransition,
+  sidebarRealtime.normalizeManagedState(null, 10_000, 0),
+  config,
+  {
+    readThread: async (threadId, hostId) => threadId.endsWith("attention")
+      ? {
+          thread: {
+            id: threadId,
+            hostId,
+            kind: "codex",
+            status: { type: "active", activeFlags: ["waitingOnApproval"] },
+          },
+          turns: [{ status: "inProgress" }],
+        }
+      : {
+          thread: { id: threadId, hostId, kind: "codex", status: { type: "notLoaded" } },
+          turns: [{ status: "completed" }],
+        },
+  },
+);
+assert.deepEqual(
+  new Set(projectTerminalOutcome.managedState.managedThreadIds),
+  new Set(projectTerminalTransition.threads.map(({ id }) => managedIdentity(remoteHostId, id))),
+);
+assert.deepEqual(
+  planMoves(
+    projectTerminalOutcome.snapshot,
+    config,
+    new Set(projectTerminalOutcome.managedState.managedThreadIds),
+  ).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [
+    ["remote-project-transition-completed", "For Review"],
+    ["remote-project-transition-attention", "For Review"],
+  ],
+);
+
+const protectedProjectHydration = snapshot([
+  thread("remote-project-protected", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-protected-project",
+    projectContainer: true,
+  }),
+]);
+protectedProjectHydration.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
+  "codex:project:remote-protected-project",
+);
+let protectedProjectReads = 0;
+await sidebarRealtime.hydrateCustomThreads(protectedProjectHydration, config, {
+  readThread: async () => {
+    protectedProjectReads += 1;
+    throw new Error("protected Project must not be hydrated");
+  },
+});
+assert.equal(protectedProjectReads, 0);
+
 const remoteHydrationCalls = [];
 const remoteNotLoaded = thread("remote-not-loaded", "notLoaded", "progress", {
   hostId: remoteHostId,
@@ -551,12 +719,38 @@ const remoteNotLoaded = thread("remote-not-loaded", "notLoaded", "progress", {
 const remoteHydrated = await sidebarRealtime.hydrateCustomThreads(snapshot([remoteNotLoaded]), config, {
   readThread: async (threadId, hostId) => {
     remoteHydrationCalls.push({ threadId, hostId });
-    return { thread: { id: threadId, hostId, status: { type: "notLoaded" } }, turns: [{ status: "completed" }] };
+    return {
+      thread: { id: threadId, hostId, kind: "codex", status: { type: "notLoaded" } },
+      turns: [{ status: "completed" }],
+    };
   },
 });
 assert.deepEqual(remoteHydrationCalls, [{ threadId: remoteNotLoaded.id, hostId: remoteHostId }]);
 assert.equal(remoteHydrated.threads[0].status, "completed");
 assert.equal(planMoves(remoteHydrated, config)[0].hostId, remoteHostId);
+
+const wrongHostHydration = snapshot([thread("wrong-host-hydration", "notLoaded", "progress", {
+  hostId: remoteHostId,
+  sidebarItemKey: "codex:thread:local:wrong-host-hydration",
+})]);
+await sidebarRealtime.hydrateCustomThreads(wrongHostHydration, config, {
+  readThread: async (threadId) => ({
+    thread: { id: threadId, hostId: "local", kind: "codex", status: { type: "completed" } },
+    turns: [{ status: "completed" }],
+  }),
+});
+assert.equal(wrongHostHydration.threads[0].status, "notLoaded");
+assert.match(wrongHostHydration.hydrationErrors[0].error, /identity did not match/);
+
+const reviewNotLoaded = thread("review-not-loaded", "notLoaded", "review", { hostId: remoteHostId });
+const reviewHydrated = await sidebarRealtime.hydrateCustomThreads(snapshot([reviewNotLoaded]), config, {
+  readThread: async (threadId, hostId) => ({
+    thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+    turns: [{ status: "inProgress" }],
+  }),
+});
+assert.equal(reviewHydrated.threads[0].status, "active");
+assert.equal(planMoves(reviewHydrated, config)[0].sectionName, "In Progress");
 
 const remoteMissingFromList = snapshot([]);
 remoteMissingFromList.sections.find((section) => section.sectionId === "progress").itemKeys.push(
@@ -605,6 +799,66 @@ for (const protectedSection of ["pinned", "later"]) {
   assert.deepEqual(planMoves(protectedSnapshot, config), []);
 }
 
+const duplicateDirect = snapshot([thread("duplicate-direct", "active", "chats")]);
+duplicateDirect.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
+  "codex:thread:local:duplicate-direct",
+);
+assert.deepEqual(planMoves(duplicateDirect, config), []);
+
+const duplicateProject = snapshot([thread("duplicate-project", "active", "threads", {
+  projectId: "duplicate-project-parent",
+  projectContainer: true,
+})]);
+duplicateProject.sections.find((section) => section.sectionId === "later").itemKeys.push(
+  "codex:project:duplicate-project-parent",
+);
+assert.deepEqual(planMoves(duplicateProject, config), []);
+
+const duplicateHostId = snapshot([
+  thread("same-id-two-hosts", "active", "chats", { hostId: "local" }),
+  thread("same-id-two-hosts", "active", "chats", { hostId: remoteHostId }),
+]);
+assert.deepEqual(planMoves(duplicateHostId, config), []);
+
+const duplicateSameHostId = snapshot([
+  thread("same-id-same-host", "active", "chats", { hostId: "local" }),
+  thread("same-id-same-host", "active", "chats", { hostId: "local" }),
+]);
+assert.deepEqual(planMoves(duplicateSameHostId, config), []);
+
+assert.throws(
+  () => planMoves(snapshot([]), {
+    ...config,
+    sections: { inProgress: "Pinned", forReview: "For Review", forLater: "For Later" },
+  }),
+  (error) => error.code === "INVALID_SECTION_CONFIG",
+);
+
+const confirmSource = snapshot([thread("confirm-final-read", "active", "chats")]);
+const plannedConfirmation = planMoves(confirmSource, config)[0];
+let finalReads = 0;
+const rejectedConfirmation = await confirmPlannedMove({
+  listThreads: async () => structuredClone(confirmSource),
+  readThread: async (threadId, hostId) => {
+    finalReads += 1;
+    return {
+      thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+      turns: [{ status: "completed" }],
+    };
+  },
+}, plannedConfirmation, config);
+assert.equal(rejectedConfirmation, null);
+assert.equal(finalReads, 1);
+
+const acceptedConfirmation = await confirmPlannedMove({
+  listThreads: async () => structuredClone(confirmSource),
+  readThread: async (threadId, hostId) => ({
+    thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+    turns: [{ status: "inProgress" }],
+  }),
+}, plannedConfirmation, config);
+assert.deepEqual(acceptedConfirmation, plannedConfirmation);
+
 assert.deepEqual(planMoves(snapshot([thread("remote-active-idempotent", "active", "progress", {
   hostId: remoteHostId,
   sidebarItemKey: "codex:thread:local:remote-active-idempotent",
@@ -636,9 +890,25 @@ assert.equal(
   statusFromThreadRead({ thread: { status: { type: "notLoaded" } }, turns: [{ status: "completed" }] }),
   "completed",
 );
+for (const turnStatus of [
+  "needs-attention",
+  "needs_attention",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "canceled",
+]) {
+  assert.equal(
+    statusFromThreadRead({
+      thread: { status: { type: "notLoaded" } },
+      turns: [{ status: turnStatus }],
+    }),
+    "needsattention",
+  );
+}
 assert.equal(
-  statusFromThreadRead({ thread: { status: { type: "notLoaded" } }, turns: [{ status: "failed" }] }),
-  "needsattention",
+  statusFromThreadRead({ thread: { status: { type: "idle" } }, turns: [{ status: "inProgress" }] }),
+  "active",
 );
 for (const activeFlag of ["waitingOnApproval", "waitingOnUserInput"]) {
   assert.equal(
@@ -656,6 +926,7 @@ const attentionHydrated = await sidebarRealtime.hydrateCustomThreads(snapshot([a
     thread: {
       id: attentionTask.id,
       hostId: "local",
+      kind: "codex",
       status: { type: "active", activeFlags: ["waitingOnApproval"] },
     },
     turns: [{ status: "inProgress" }],
@@ -805,6 +1076,22 @@ assert.deepEqual(sendMessageCalls, [{
     threadId: "hook-target",
     hostId: remoteHostId,
     prompt: "hook prompt",
+  },
+}]);
+
+const moveCalls = [];
+const moveTools = new sidebarRealtime.AppTools(config);
+moveTools.call = async (name, args) => {
+  moveCalls.push({ name, args });
+  return { success: true, contentItems: [] };
+};
+await moveTools.moveThread(mismatchedMove);
+assert.deepEqual(moveCalls, [{
+  name: "move_thread_to_sidebar_section",
+  args: {
+    threadId: mismatchedMove.threadId,
+    hostId: remoteHostId,
+    sectionId: mismatchedMove.sectionId,
   },
 }]);
 

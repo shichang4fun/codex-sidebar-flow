@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ const sourceRuntimeFiles = [
   "scripts/runtime-integrity.mjs",
   "scripts/setup.mjs",
   "scripts/sidebar-hook.mjs",
+  "scripts/sidebar-policy.mjs",
   "scripts/sidebar-realtime.mjs",
   "scripts/uninstall.mjs",
 ];
@@ -52,4 +53,24 @@ test("runtime fingerprints cover the exact source and plugin execution chains", 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("release metadata uses one version", async () => {
+  const version = (await readFile("VERSION", "utf8")).trim();
+  const packageMetadata = JSON.parse(await readFile("package.json", "utf8"));
+  const pluginMetadata = JSON.parse(await readFile(".codex-plugin/plugin.json", "utf8"));
+  const changelog = await readFile("CHANGELOG.md", "utf8");
+  assert.equal(packageMetadata.version, version);
+  assert.equal(pluginMetadata.version, version);
+  assert.equal(changelog.includes(`## [${version}]`), true);
+});
+
+test("plugin runs Stop in the background while UserPromptSubmit stays synchronous", async () => {
+  const hookConfig = JSON.parse(await readFile("hooks/hooks.json", "utf8"));
+  const userPromptSubmit = hookConfig.hooks.UserPromptSubmit.at(-1).hooks.at(-1);
+  const stop = hookConfig.hooks.Stop.at(-1).hooks.at(-1);
+  assert.equal(userPromptSubmit.async, undefined);
+  assert.equal(userPromptSubmit.timeout, 15);
+  assert.equal(stop.async, true);
+  assert.equal(stop.timeout, 20);
 });

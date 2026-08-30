@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { lstat, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
+  buildAgentSelfMoveHookOutput,
   executeHookEvent,
   handleHook,
   isRetryableHookError,
@@ -31,6 +32,37 @@ function runtimeDefaultConfig(codexHome, installMode) {
   return defaultConfig(codexHome, installMode, TEST_RUNTIME_FINGERPRINTS[installMode]);
 }
 
+async function runHookProcess(codexHome, input, config, { includeConfigEnv = true } = {}) {
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  await writeJsonAtomic(configPath, config);
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.resolve("scripts/sidebar-hook.mjs")], {
+      cwd: path.resolve("."),
+      env: {
+        ...process.env,
+        HOME: codexHome,
+        CODEX_HOME: codexHome,
+        CODEX_APP_TOOLS_PIPE_PATH: path.join(codexHome, "missing-app-tools.sock"),
+        ...(includeConfigEnv ? { CODEX_SIDEBAR_FLOW_CONFIG: configPath } : {}),
+        [INSTALL_MODE_ENV]: "plugin",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) reject(new Error(`Hook process exited ${code}: ${stderr}`));
+      else resolve({ stdout, stderr });
+    });
+    child.stdin.end(`${JSON.stringify(input)}\n`);
+  });
+}
+
 async function withinTimeout(promise, timeoutMs, message) {
   let timer;
   try {
@@ -48,7 +80,10 @@ async function withinTimeout(promise, timeoutMs, message) {
 function generationProbeResultFile(config, probeId) {
   return `${config.eventWakeProbeResultFile}.result.${probeId}`;
 }
-const config = { excludeThreadIds: ["automation"] };
+const config = {
+  excludeThreadIds: ["automation"],
+  sections: { inProgress: "In Progress", forReview: "For Review", forLater: "For Later" },
+};
 const eventWakeConfig = {
   enabled: true,
   organizerThreadId: "organizer-thread",
@@ -113,6 +148,57 @@ assert.equal(
 );
 assert.equal(isRetryableHookError(new Error("Codex app tools pipe closed")), true);
 assert.equal(isRetryableHookError(new Error("Invalid lifecycle input")), false);
+
+{
+  const output = buildAgentSelfMoveHookOutput(
+    { session_id: "thread-1", hook_event_name: "UserPromptSubmit", prompt: "SECRET_PROMPT" },
+    {
+      excludeThreadIds: [],
+      sections: config.sections,
+      eventWake: { enabled: true, organizerThreadId: "organizer-thread" },
+    },
+  );
+  assert.equal(output.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  assert.match(output.hookSpecificOutput.additionalContext, /thread-1/);
+  assert.match(output.hookSpecificOutput.additionalContext, /list_threads/);
+  assert.match(output.hookSpecificOutput.additionalContext, /move_thread_to_sidebar_section/);
+  assert.match(output.hookSpecificOutput.additionalContext, /no direct membership and its parent Project is exactly in Projects/);
+  assert.match(output.hookSpecificOutput.additionalContext, /Neither the task nor its parent Project may have any Pinned/);
+  assert.match(output.hookSpecificOutput.additionalContext, /call read_thread for this exact thread ID and authoritative hostId/);
+  assert.match(output.hookSpecificOutput.additionalContext, /make at most one move of only this task/);
+  assert.equal(output.hookSpecificOutput.additionalContext.includes("SECRET_PROMPT"), false);
+
+  const localOnlyOutput = buildAgentSelfMoveHookOutput(
+    { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+    {
+      excludeThreadIds: [],
+      sections: config.sections,
+      eventWake: { enabled: false, organizerThreadId: null },
+    },
+  );
+  assert.equal(localOnlyOutput.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+}
+
+for (const [input, runtimeConfig] of [
+  [
+    { session_id: "thread-1", hook_event_name: "Stop" },
+    { excludeThreadIds: [], eventWake: { enabled: true, organizerThreadId: "organizer-thread" } },
+  ],
+  [
+    { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+    { excludeThreadIds: ["thread-1"], eventWake: { enabled: true, organizerThreadId: "organizer-thread" } },
+  ],
+  [
+    { session_id: "organizer-thread", hook_event_name: "UserPromptSubmit" },
+    { excludeThreadIds: [], eventWake: { enabled: true, organizerThreadId: "organizer-thread" } },
+  ],
+  [
+    { session_id: "bad\nthread", hook_event_name: "UserPromptSubmit" },
+    { excludeThreadIds: [], eventWake: { enabled: true, organizerThreadId: "organizer-thread" } },
+  ],
+]) {
+  assert.equal(buildAgentSelfMoveHookOutput(input, runtimeConfig), null);
+}
 
 {
   let created = 0;
@@ -356,7 +442,7 @@ for (const threads of [
   assert.equal(result.eventEnvelope, null);
 }
 
-for (const event of ["UserPromptSubmit", "Stop"]) {
+for (const event of ["UserPromptSubmit"]) {
   let moved = false;
   const result = await executeHookEvent(
     { session_id: "thread-1", hook_event_name: event },
@@ -379,6 +465,415 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
   assert.equal(moved, false, `${event} must not commit before sibling Hook outcomes are known`);
   assert.equal(result.move, null);
   assert.deepEqual(result.managedRemoves, []);
+}
+
+{
+  const phases = [];
+  const lifecycleSnapshot = {
+    threads: [{ id: "thread-1", hostId: "local", kind: "codex", status: "idle" }],
+    sections: [
+      { sectionId: "pinned", name: "Pinned", itemKeys: [] },
+      { sectionId: "review", name: "For Review", itemKeys: [] },
+      {
+        sectionId: "progress",
+        name: "In Progress",
+        itemKeys: ["codex:thread:local:thread-1"],
+      },
+      { sectionId: "later", name: "For Later", itemKeys: [] },
+      { sectionId: "threads", name: "Projects", itemKeys: [] },
+      { sectionId: "chats", name: "Tasks", itemKeys: [] },
+    ],
+  };
+  const result = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "Stop" },
+    {
+      ...config,
+      stopSettleDelayMs: 500,
+      maxMovesPerRun: 10,
+      eventWake: { ...eventWakeConfig, enabled: false },
+    },
+    {
+      wait: async () => {},
+      createAppTools() {
+        return {
+          async listThreads() {
+            phases.push("list");
+            return structuredClone(lifecycleSnapshot);
+          },
+          async readThread(threadId, hostId) {
+            phases.push(`read:${threadId}:${hostId}`);
+            return {
+              thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+              turns: [],
+            };
+          },
+          async moveThread(move) {
+            phases.push(`move:${move.threadId}:${move.hostId}:${move.sectionId}`);
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.deepEqual(phases, [
+    "list",
+    "read:thread-1:local",
+    "move:thread-1:local:review",
+  ]);
+  assert.deepEqual(result.move, {
+    threadId: "thread-1",
+    hostId: "local",
+    sectionId: "review",
+    sectionName: "For Review",
+  });
+  assert.deepEqual(result.managedRemoves, ["local:thread-1"]);
+  assert.equal(result.eventEnvelope, null);
+}
+
+{
+  const phases = [];
+  const lifecycleSnapshot = {
+    threads: [],
+    sections: [
+      { sectionId: "pinned", name: "Pinned", itemKeys: [] },
+      { sectionId: "review", name: "For Review", itemKeys: [] },
+      {
+        sectionId: "progress",
+        name: "In Progress",
+        itemKeys: ["codex:thread:local:thread-1"],
+      },
+      { sectionId: "later", name: "For Later", itemKeys: [] },
+      { sectionId: "threads", name: "Projects", itemKeys: [] },
+      { sectionId: "chats", name: "Tasks", itemKeys: [] },
+    ],
+  };
+  const result = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "Stop" },
+    {
+      ...config,
+      stopSettleDelayMs: 0,
+      maxMovesPerRun: 10,
+      eventWake: { ...eventWakeConfig, enabled: false },
+    },
+    {
+      wait: async () => {},
+      createAppTools() {
+        return {
+          async listThreads() {
+            phases.push("list");
+            return structuredClone(lifecycleSnapshot);
+          },
+          async readThread(threadId, hostId) {
+            phases.push(`read:${threadId}:${hostId}`);
+            return {
+              thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+              turns: [],
+            };
+          },
+          async moveThread(move) {
+            phases.push(`move:${move.threadId}:${move.hostId}:${move.sectionId}`);
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.deepEqual(phases, [
+    "list",
+    "read:thread-1:local",
+    "read:thread-1:local",
+    "move:thread-1:local:review",
+  ]);
+  assert.deepEqual(result.move, {
+    threadId: "thread-1",
+    hostId: "local",
+    sectionId: "review",
+    sectionName: "For Review",
+  });
+}
+
+{
+  const phases = [];
+  const lifecycleSnapshot = {
+    threads: [{
+      id: "other-thread",
+      hostId: "remote-control:env_remote",
+      kind: "codex",
+      status: "idle",
+    }],
+    sections: [
+      { sectionId: "pinned", name: "Pinned", itemKeys: [] },
+      { sectionId: "review", name: "For Review", itemKeys: [] },
+      {
+        sectionId: "progress",
+        name: "In Progress",
+        itemKeys: ["codex:thread:local:thread-1"],
+      },
+      { sectionId: "later", name: "For Later", itemKeys: [] },
+      { sectionId: "threads", name: "Projects", itemKeys: [] },
+      { sectionId: "chats", name: "Tasks", itemKeys: [] },
+    ],
+  };
+  const result = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "Stop" },
+    { ...config, stopSettleDelayMs: 0, eventWake: { ...eventWakeConfig, enabled: false } },
+    {
+      wait: async () => {},
+      createAppTools() {
+        return {
+          async listThreads() {
+            phases.push("list");
+            return structuredClone(lifecycleSnapshot);
+          },
+          async readThread(threadId, hostId) {
+            phases.push(`read:${threadId}:${hostId}`);
+            if (hostId === "local") return { thread: null, turns: [] };
+            return {
+              thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+              turns: [],
+            };
+          },
+          async moveThread(move) {
+            phases.push(`move:${move.threadId}:${move.hostId}:${move.sectionId}`);
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.deepEqual(phases, [
+    "list",
+    "read:thread-1:remote-control:env_remote",
+    "read:thread-1:local",
+    "read:thread-1:remote-control:env_remote",
+    "move:thread-1:remote-control:env_remote:review",
+  ]);
+  assert.equal(result.move?.hostId, "remote-control:env_remote");
+}
+
+{
+  const reads = [];
+  const result = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "Stop" },
+    { ...config, stopSettleDelayMs: 0, eventWake: { ...eventWakeConfig, enabled: false } },
+    {
+      wait: async () => {},
+      createAppTools() {
+        return {
+          async listThreads() {
+            return {
+              threads: [{
+                id: "other-thread",
+                hostId: "remote-control:env_remote",
+                kind: "codex",
+                status: "idle",
+              }],
+              sections: [{
+                sectionId: "progress",
+                name: "In Progress",
+                itemKeys: ["codex:thread:local:thread-1"],
+              }],
+            };
+          },
+          async readThread(threadId, hostId) {
+            reads.push(hostId);
+            return {
+              thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+              turns: [],
+            };
+          },
+          async moveThread() {
+            assert.fail("duplicate IDs confirmed on multiple hosts must fail closed");
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.deepEqual(reads, ["remote-control:env_remote", "local"]);
+  assert.equal(result.move, null);
+}
+
+{
+  let created = 0;
+  const reads = [];
+  const moves = [];
+  const lifecycleSnapshot = {
+    threads: [],
+    sections: [
+      { sectionId: "pinned", name: "Pinned", itemKeys: [] },
+      { sectionId: "review", name: "For Review", itemKeys: [] },
+      {
+        sectionId: "progress",
+        name: "In Progress",
+        itemKeys: ["codex:thread:local:thread-1"],
+      },
+      { sectionId: "later", name: "For Later", itemKeys: [] },
+      { sectionId: "threads", name: "Projects", itemKeys: [] },
+      { sectionId: "chats", name: "Tasks", itemKeys: [] },
+    ],
+  };
+  const result = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "Stop" },
+    { ...config, stopSettleDelayMs: 0, eventWake: { ...eventWakeConfig, enabled: false } },
+    {
+      wait: async () => {},
+      createAppTools() {
+        created += 1;
+        const currentAttempt = created;
+        return {
+          async listThreads() {
+            return structuredClone(lifecycleSnapshot);
+          },
+          async readThread(threadId, hostId) {
+            reads.push({ currentAttempt, hostId });
+            if (currentAttempt === 1) {
+              const error = new Error("socket reset during candidate hydration");
+              error.code = "ECONNRESET";
+              throw error;
+            }
+            return {
+              thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+              turns: [],
+            };
+          },
+          async moveThread(move) {
+            moves.push(move);
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.equal(result.attempts, 2);
+  assert.equal(created, 2);
+  assert.deepEqual(reads, [
+    { currentAttempt: 1, hostId: "local" },
+    { currentAttempt: 2, hostId: "local" },
+    { currentAttempt: 2, hostId: "local" },
+  ]);
+  assert.equal(moves.length, 1);
+}
+
+{
+  let created = 0;
+  const moves = [];
+  await assert.rejects(
+    executeHookEvent(
+      { session_id: "thread-1", hook_event_name: "Stop" },
+      { ...config, stopSettleDelayMs: 0, eventWake: { ...eventWakeConfig, enabled: false } },
+      {
+        wait: async () => {},
+        createAppTools() {
+          created += 1;
+          return {
+            async listThreads() {
+              return {
+                threads: [{
+                  id: "other-thread",
+                  hostId: "remote-control:env_remote",
+                  kind: "codex",
+                  status: "idle",
+                }],
+                sections: [{
+                  sectionId: "progress",
+                  name: "In Progress",
+                  itemKeys: ["codex:thread:local:thread-1"],
+                }],
+              };
+            },
+            async readThread(threadId, hostId) {
+              if (hostId === "local") {
+                const error = new Error("socket reset before ambiguity was excluded");
+                error.code = "ECONNRESET";
+                throw error;
+              }
+              return {
+                thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+                turns: [],
+              };
+            },
+            async moveThread(move) {
+              moves.push(move);
+            },
+            reset() {},
+          };
+        },
+      },
+    ),
+    (error) => error.code === "ECONNRESET" && error.hookAttempts === 2,
+  );
+  assert.equal(created, 2);
+  assert.deepEqual(moves, []);
+}
+
+{
+  const phases = [];
+  const result = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "Stop" },
+    {
+      ...config,
+      stopSettleDelayMs: 500,
+      maxMovesPerRun: 10,
+      eventWake: eventWakeConfig,
+    },
+    {
+      wait: async (delayMs) => {
+        phases.push(`wait:${delayMs}`);
+      },
+      createAppTools() {
+        return {
+          async listThreads() {
+            phases.push("list");
+            return {
+              threads: [{
+                id: "thread-1",
+                hostId: "local",
+                kind: "codex",
+                status: "idle",
+                activeFlags: [],
+              }],
+              sections: [
+                { sectionId: "pinned", name: "Pinned", itemKeys: [] },
+                { sectionId: "review", name: "For Review", itemKeys: [] },
+                {
+                  sectionId: "progress",
+                  name: "In Progress",
+                  itemKeys: ["codex:thread:local:thread-1"],
+                },
+                { sectionId: "later", name: "For Later", itemKeys: [] },
+                { sectionId: "threads", name: "Projects", itemKeys: [] },
+                { sectionId: "chats", name: "Tasks", itemKeys: [] },
+              ],
+            };
+          },
+          async readThread(threadId, hostId) {
+            phases.push(`read:${threadId}:${hostId}`);
+            return {
+              thread: {
+                id: threadId,
+                hostId,
+                kind: "codex",
+                status: { type: "idle" },
+              },
+              turns: [{ id: "turn-1", status: "inProgress", completedAt: null }],
+            };
+          },
+          async moveThread(move) {
+            phases.push(`move:${move.threadId}:${move.hostId}:${move.sectionId}`);
+          },
+          reset() {},
+        };
+      },
+    },
+  );
+  assert.deepEqual(phases, [
+    "wait:500",
+    "list",
+    "read:thread-1:local",
+  ]);
+  assert.equal(result.move, null);
+  assert.equal(result.eventEnvelope.event, "Stop");
 }
 
 {
@@ -641,6 +1136,163 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
 }
 
 {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-agent-fallback-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const hookLogFile = path.join(codexHome, "sidebar-flow", "hook.log");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "plugin";
+  try {
+    await writeJsonAtomic(configPath, {
+      ...runtimeDefaultConfig(codexHome, "plugin"),
+      hookLogFile,
+      eventWake: {
+        ...eventWakeConfig,
+        enabled: false,
+        wakeStateFile: path.join(codexHome, "sidebar-flow", "wake.json"),
+      },
+    });
+    const output = await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit", prompt: "SECRET_PROMPT" },
+      configPath,
+      {
+        async wake() {
+          assert.fail("local fallback must not wake the organizer when event wake is disabled");
+        },
+        async execute(_input, _config, options) {
+          assert.equal(options.attempts, 1);
+          const error = new Error("Codex app tools pipe closed");
+          error.code = "EPIPE";
+          error.hookAttempts = 1;
+          throw error;
+        },
+      },
+    );
+    assert.equal(output.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.equal(output.hookSpecificOutput.additionalContext.includes("SECRET_PROMPT"), false);
+    const record = JSON.parse((await readFile(hookLogFile, "utf8")).trim());
+    assert.equal(record.agentFallback, true);
+    assert.equal(record.toolsListSucceeded, false);
+    assert.equal(record.errorCode, "EPIPE");
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-fallback-guards-"));
+  const configPath = path.join(codexHome, "sidebar-flow", "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "plugin";
+  try {
+    await writeJsonAtomic(configPath, {
+      ...runtimeDefaultConfig(codexHome, "plugin"),
+      eventWake: eventWakeConfig,
+    });
+    await assert.rejects(
+      handleHook(
+        { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+        configPath,
+        {
+          async execute() {
+            const error = new Error("Invalid app tool response");
+            error.code = "APP_TOOL_ERROR";
+            throw error;
+          },
+        },
+      ),
+      (error) => error.code === "APP_TOOL_ERROR",
+    );
+
+    await assert.rejects(
+      handleHook(
+        { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+        configPath,
+        {
+          claimProbe: async () => ({ status: "claimed" }),
+          inspectCapability: async () => true,
+          writeProbeResult: async () => true,
+          releaseProbeClaim: async () => true,
+          createAppTools: () => ({ reset() {} }),
+          async execute() {
+            const error = new Error("Codex app tools pipe closed");
+            error.code = "EPIPE";
+            throw error;
+          },
+        },
+      ),
+      (error) => error.code === "EPIPE",
+    );
+
+    let excludedExecutions = 0;
+    let excludedStateLoads = 0;
+    assert.equal(await handleHook(
+      { session_id: "organizer-thread", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        async execute() { excludedExecutions += 1; },
+        async loadState() { excludedStateLoads += 1; },
+      },
+    ), null);
+    assert.equal(excludedExecutions, 0);
+    assert.equal(excludedStateLoads, 0);
+
+    let stateUpdates = 0;
+    await handleHook(
+      { session_id: "thread-1", hook_event_name: "Stop" },
+      configPath,
+      {
+        async execute() {
+          return {
+            attempts: 1,
+            managedAdds: [],
+            managedRemoves: [],
+            observedIdentities: [],
+            eventEnvelope: null,
+          };
+        },
+        async updateManaged() { stateUpdates += 1; },
+      },
+    );
+    assert.equal(stateUpdates, 0);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-process-output-"));
+  try {
+    const runtimeConfig = {
+      ...runtimeDefaultConfig(codexHome, "plugin"),
+      eventWake: eventWakeConfig,
+    };
+    const fallback = await runHookProcess(
+      codexHome,
+      { session_id: "thread-process", hook_event_name: "UserPromptSubmit", prompt: "PROCESS_SECRET" },
+      runtimeConfig,
+      { includeConfigEnv: false },
+    );
+    const output = JSON.parse(fallback.stdout.trim());
+    assert.equal(output.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.equal(output.hookSpecificOutput.additionalContext.includes("PROCESS_SECRET"), false);
+    assert.equal(fallback.stdout.trim().split("\n").length, 1);
+
+    const noOutput = await runHookProcess(
+      codexHome,
+      { session_id: "thread-process", hook_event_name: "Notification" },
+      runtimeConfig,
+    );
+    assert.deepEqual(JSON.parse(noOutput.stdout.trim()), {});
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+{
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-hook-wake-order-"));
   const configPath = path.join(codexHome, "sidebar-flow", "config.json");
   const stateFile = path.join(codexHome, "sidebar-flow", "state.json");
@@ -692,11 +1344,43 @@ for (const event of ["UserPromptSubmit", "Stop"]) {
     assert.deepEqual(wakeCalls[0].persisted.knownThreadIdentities, ["local:thread-1"]);
     const records = (await readFile(hookLogFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(records.at(-1).wakeStatus, "sent");
+    assert.equal(records.at(-1).observationOnly, true);
     assert.equal("wakeErrorCode" in records.at(-1), false);
     for (const field of ["threadId", "execPath", "pipeBasename", "socketPath"]) {
       assert.equal(Object.hasOwn(records.at(-1), field), false, field);
     }
     assert.equal(JSON.stringify(records.at(-1)).includes("secret-app-tools.sock"), false);
+
+    await handleHook(
+      { session_id: "thread-2", hook_event_name: "Stop" },
+      configPath,
+      {
+        async execute() {
+          return {
+            attempts: 1,
+            move: {
+              threadId: "thread-2",
+              hostId: "local",
+              sectionId: "review",
+              sectionName: "For Review",
+            },
+            moves: [{
+              threadId: "thread-2",
+              hostId: "local",
+              sectionId: "review",
+              sectionName: "For Review",
+            }],
+            managedAdds: [],
+            managedRemoves: ["local:thread-2"],
+            observedIdentities: [],
+            eventEnvelope: null,
+          };
+        },
+        async updateManaged() {},
+      },
+    );
+    const moveRecord = JSON.parse((await readFile(hookLogFile, "utf8")).trim().split("\n").at(-1));
+    assert.equal(moveRecord.observationOnly, false);
 
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];

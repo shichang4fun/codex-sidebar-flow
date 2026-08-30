@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 export const SOURCE_RUNTIME_FILES = Object.freeze([
@@ -8,6 +8,7 @@ export const SOURCE_RUNTIME_FILES = Object.freeze([
   "scripts/runtime-integrity.mjs",
   "scripts/setup.mjs",
   "scripts/sidebar-hook.mjs",
+  "scripts/sidebar-policy.mjs",
   "scripts/sidebar-realtime.mjs",
   "scripts/uninstall.mjs",
 ]);
@@ -53,4 +54,35 @@ export async function computeRuntimeFingerprint(root, mode) {
     hash.update("\0");
   }
   return hash.digest("hex");
+}
+
+function unsafeDirectory(label) {
+  const error = new Error(`${label} must be a real directory, not a symlink`);
+  error.code = "UNSAFE_RUNTIME_DIRECTORY";
+  return error;
+}
+
+export async function ensureRealDirectory(directory, { create = false, label = "Directory" } = {}) {
+  let metadata;
+  try {
+    metadata = await lstat(directory);
+  } catch (error) {
+    if (error.code !== "ENOENT" || !create) throw error;
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    metadata = await lstat(directory);
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw unsafeDirectory(label);
+  return { dev: metadata.dev, ino: metadata.ino };
+}
+
+export async function revalidateRealDirectory(directory, identity, label = "Directory") {
+  const metadata = await lstat(directory).catch(() => null);
+  if (
+    metadata == null
+    || metadata.isSymbolicLink()
+    || !metadata.isDirectory()
+    || metadata.dev !== identity?.dev
+    || metadata.ino !== identity?.ino
+  ) throw unsafeDirectory(label);
+  return identity;
 }

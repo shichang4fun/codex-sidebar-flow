@@ -7,7 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AppTools } from "./sidebar-realtime.mjs";
-import { computeRuntimeFingerprint, isRuntimeFingerprint } from "./runtime-integrity.mjs";
+import { computeRuntimeFingerprint, ensureRealDirectory, isRuntimeFingerprint } from "./runtime-integrity.mjs";
+import { resolveConfiguredSections, validateSectionNames } from "./sidebar-policy.mjs";
 import {
   detectNodeExecutable,
   findOwnedSidebarHookPaths,
@@ -274,6 +275,10 @@ function publicProbeResult(value) {
 }
 
 async function writeProbeJsonAtomic(filePath, value) {
+  await ensureRealDirectory(path.dirname(filePath), {
+    create: true,
+    label: "Sidebar Flow probe directory",
+  });
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   let handle;
   try {
@@ -655,8 +660,12 @@ export function inspectInstallation({
       ? "No unowned legacy sidebar Hooks detected"
       : `Unowned legacy sidebar Hooks detected: ${legacyHookConflicts.join(", ")}`,
   });
-  const names = Object.values(config?.sections ?? {});
-  const configValid = names.length === 3 && names.every(Boolean) && new Set(names).size === 3;
+  let configValid = true;
+  try {
+    validateSectionNames(config?.sections);
+  } catch {
+    configValid = false;
+  }
   checks.push({
     level: configValid ? "ok" : "error",
     name: "config",
@@ -698,6 +707,7 @@ export function inspectInstallation({
       "hooks",
       "launcher",
       "sidebarHook",
+      "sidebarPolicy",
       "sidebarRealtime",
       "eventWake",
       "setup",
@@ -769,8 +779,8 @@ export function inspectInstallation({
     capabilityLevel = "error";
     capabilityMessage = "Capability probe is armed and pending the next lifecycle Hook";
   } else if (eventWakeProbe?.status === "expired") {
-    capabilityLevel = "error";
-    capabilityMessage = "Capability probe expired before a lifecycle Hook consumed it";
+    capabilityLevel = "warning";
+    capabilityMessage = "Capability probe is stale; re-arm it to reverify the current runtime";
   }
   checks.push({
     level: capabilityLevel,
@@ -814,6 +824,7 @@ export async function inspectPluginBundle(pluginRoot, { enabledContext = false }
     hooks: "hooks/hooks.json",
     launcher: "scripts/plugin-hook.sh",
     sidebarHook: "scripts/sidebar-hook.mjs",
+    sidebarPolicy: "scripts/sidebar-policy.mjs",
     sidebarRealtime: "scripts/sidebar-realtime.mjs",
     eventWake: "scripts/event-wake.mjs",
     setup: "scripts/setup.mjs",
@@ -869,11 +880,8 @@ async function main(argv = process.argv.slice(2)) {
     try {
       appTools = new AppTools({ ...config, actorThreadId: "sidebar-flow-doctor", quiet: true });
       const snapshot = await appTools.listThreads();
-      const sectionNames = new Set((snapshot.sections ?? []).map((section) => section.name));
-      const missing = Object.values(config.sections ?? {}).filter((name) => !sectionNames.has(name));
-      runtimeProbe = missing.length === 0
-        ? { ok: true, message: "tools/list succeeded and configured sections exist" }
-        : { ok: false, message: `Configured sections are missing: ${missing.join(", ")}` };
+      resolveConfiguredSections(snapshot.sections ?? [], config.sections);
+      runtimeProbe = { ok: true, message: "tools/list succeeded and configured custom sections exist" };
     } catch (error) {
       runtimeProbe = { ok: false, message: `Runtime probe failed: ${error.code ?? "APP_TOOLS_UNAVAILABLE"}` };
     } finally {

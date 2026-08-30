@@ -8,13 +8,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   computeRuntimeFingerprint,
+  ensureRealDirectory,
   isRuntimeFingerprint,
+  revalidateRealDirectory,
   RUNTIME_FILES,
 } from "./runtime-integrity.mjs";
+import { validateSectionNames } from "./sidebar-policy.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const HOOK_MARKER = "CODEX_SIDEBAR_FLOW_OWNER=codex-sidebar-flow-v1";
 export const INSTALL_MODE_ENV = "CODEX_SIDEBAR_FLOW_INSTALL_MODE";
+export const CURRENT_CONFIG_VERSION = 2;
+export const DEFAULT_HOOK_DEADLINE_MS = 14000;
+export const DEFAULT_STOP_SETTLE_DELAY_MS = 3000;
 const SAFE_IDENTIFIER_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
 
 function quote(value) {
@@ -31,8 +37,12 @@ export function detectNodeExecutable() {
   return candidates.find((candidate) => existsSync(candidate)) ?? process.execPath;
 }
 
-export function hookCommand(root = ROOT, nodeExecutable = detectNodeExecutable()) {
-  return `exec /usr/bin/env -u FORCE_COLOR ${HOOK_MARKER} ${INSTALL_MODE_ENV}=source ${quote(nodeExecutable)} ${quote(path.join(root, "scripts", "sidebar-hook.mjs"))}`;
+export function hookCommand(
+  root = ROOT,
+  nodeExecutable = detectNodeExecutable(),
+  configPath = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "sidebar-flow", "config.json"),
+) {
+  return `exec /usr/bin/env -u FORCE_COLOR ${HOOK_MARKER} ${INSTALL_MODE_ENV}=source CODEX_SIDEBAR_FLOW_CONFIG=${quote(configPath)} ${quote(nodeExecutable)} ${quote(path.join(root, "scripts", "sidebar-hook.mjs"))}`;
 }
 
 function normalizeLegacyHookPaths(paths = []) {
@@ -118,7 +128,13 @@ export function installHooks(existing = {}, command = hookCommand(), legacyHookP
   result.hooks ??= {};
   for (const event of ["UserPromptSubmit", "Stop"]) {
     const matchers = removeOwnedHandlers(result.hooks[event], legacyHookPaths);
-    matchers.push({ hooks: [{ type: "command", command, timeout: 15 }] });
+    const handler = {
+      type: "command",
+      command,
+      timeout: event === "Stop" ? 20 : 15,
+      ...(event === "Stop" ? { async: true } : {}),
+    };
+    matchers.push({ hooks: [handler] });
     result.hooks[event] = matchers;
   }
   return result;
@@ -145,7 +161,7 @@ async function readJson(filePath, fallback) {
 
 export async function writeJsonAtomic(filePath, value) {
   const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await ensureRealDirectory(directory, { create: true, label: "JSON parent directory" });
   await chmod(directory, 0o700);
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
@@ -176,6 +192,7 @@ export function defaultConfig(codexHome, installMode = null, runtimeFingerprint 
   }
   const runtime = path.join(codexHome, "sidebar-flow");
   return {
+    configVersion: CURRENT_CONFIG_VERSION,
     ...(installMode == null ? {} : { installMode }),
     ...(runtimeFingerprint == null ? {} : { runtimeFingerprint }),
     actorThreadId: "codex-sidebar-flow",
@@ -207,8 +224,8 @@ export function defaultConfig(codexHome, installMode = null, runtimeFingerprint 
     discoveryTimeoutMs: 6000,
     maxSocketCandidates: 8,
     allowSocketDiscovery: false,
-    hookDeadlineMs: 9000,
-    stopSettleDelayMs: 500,
+    hookDeadlineMs: DEFAULT_HOOK_DEADLINE_MS,
+    stopSettleDelayMs: DEFAULT_STOP_SETTLE_DELAY_MS,
   };
 }
 
@@ -291,6 +308,16 @@ export async function setup({
     error.code = "INVALID_CODEX_HOME";
     throw error;
   }
+  const runtimeCodexHome = dependencies.runtimeCodexHome
+    ?? process.env.CODEX_HOME
+    ?? path.join(os.homedir(), ".codex");
+  if (mode === "plugin" && path.resolve(codexHome) !== path.resolve(runtimeCodexHome)) {
+    const error = new Error(
+      "Plugin setup must use the CODEX_HOME inherited by the plugin runtime; set CODEX_HOME before setup instead of passing a different path",
+    );
+    error.code = "PLUGIN_CODEX_HOME_MISMATCH";
+    throw error;
+  }
   if (enableEventWake && organizerThreadId == null) {
     throw invalidArgument("--enable-event-wake requires --organizer-thread-id");
   }
@@ -312,6 +339,13 @@ export async function setup({
   const backupPath = `${hooksPath}.sidebar-flow.bak`;
   const configPath = path.join(runtimeRoot, "config.json");
   const sourceRoot = dependencies.sourceRoot ?? ROOT;
+  const runtimeRootIdentity = await ensureRealDirectory(runtimeRoot, {
+    create: !dryRun,
+    label: "Sidebar Flow runtime root",
+  }).catch((error) => {
+    if (dryRun && error.code === "ENOENT") return null;
+    throw error;
+  });
   const runtimeFingerprint = await computeRuntimeFingerprint(sourceRoot, mode);
   const releaseRoot = mode === "source"
     ? path.join(runtimeRoot, "releases", runtimeFingerprint)
@@ -376,6 +410,25 @@ export async function setup({
     installMode: mode,
     runtimeFingerprint,
   };
+  const existingConfigVersion = Number.isInteger(existingConfig?.configVersion)
+    ? existingConfig.configVersion
+    : 0;
+  if (existingConfig != null && existingConfigVersion < CURRENT_CONFIG_VERSION) {
+    if (existingConfig.hookDeadlineMs == null || existingConfig.hookDeadlineMs === 9000) {
+      config.hookDeadlineMs = DEFAULT_HOOK_DEADLINE_MS;
+    }
+    if (existingConfig.stopSettleDelayMs == null || existingConfig.stopSettleDelayMs === 500) {
+      config.stopSettleDelayMs = DEFAULT_STOP_SETTLE_DELAY_MS;
+    }
+    config.configVersion = CURRENT_CONFIG_VERSION;
+  }
+  config.sections = validateSectionNames(config.sections);
+  if (config.eventWake?.organizerThreadId != null) {
+    config.excludeThreadIds = [...new Set([
+      ...(Array.isArray(config.excludeThreadIds) ? config.excludeThreadIds : []),
+      config.eventWake.organizerThreadId,
+    ])];
+  }
   if (enableEventWake) {
     const { readEventWakeProbeResult } = await import("./doctor.mjs");
     const capability = await readEventWakeProbeResult(config, { runtimeRoot });
@@ -397,16 +450,21 @@ export async function setup({
     ])];
   }
   const hooks = mode === "source"
-    ? installHooks(existingHooks, hookCommand(releaseRoot), ownedLegacyHookPaths)
+    ? installHooks(existingHooks, hookCommand(releaseRoot, detectNodeExecutable(), configPath), ownedLegacyHookPaths)
     : null;
   if (!dryRun) {
+    await revalidateRealDirectory(runtimeRoot, runtimeRootIdentity, "Sidebar Flow runtime root");
     if (mode === "source") {
       await publishSourceRelease(runtimeRoot, sourceRoot, runtimeFingerprint, dependencies);
+      await revalidateRealDirectory(runtimeRoot, runtimeRootIdentity, "Sidebar Flow runtime root");
       if (existsSync(hooksPath)) await writePrivateBackup(hooksPath, backupPath);
     }
     await writeJsonAtomic(configPath, config);
     if (mode === "source") await writeJsonAtomic(hooksPath, hooks);
-    if (mode === "plugin") await rm(runtimeScripts, { recursive: true, force: true });
+    if (mode === "plugin") {
+      await revalidateRealDirectory(runtimeRoot, runtimeRootIdentity, "Sidebar Flow runtime root");
+      await rm(runtimeScripts, { recursive: true, force: true });
+    }
   }
   return {
     mode,
@@ -486,6 +544,9 @@ export function parseSetupArgs(argv) {
   }
   if (result.enableEventWake && result.organizerThreadId == null) {
     throw invalidArgument("--enable-event-wake requires --organizer-thread-id");
+  }
+  if (result.mode === "plugin" && result.codexHome != null) {
+    throw invalidArgument("Plugin setup cannot use --codex-home; set CODEX_HOME for the plugin runtime instead");
   }
   return result;
 }

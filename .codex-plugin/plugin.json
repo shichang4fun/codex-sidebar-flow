@@ -1,6 +1,6 @@
 {
   "name": "codex-sidebar-flow",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Observe lifecycle identity and reconcile Codex sidebar task state.",
   "author": {
     "name": "shichang4fun"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Codex Sidebar Flow",
     "shortDescription": "Keep review and active tasks organized.",
-    "longDescription": "Uses observation-only lifecycle hooks plus deterministic observed-state reconciliation through an experimental macOS Desktop adapter.",
+    "longDescription": "Uses lifecycle hooks plus deterministic observed-state reconciliation through an experimental macOS Desktop adapter.",
     "developerName": "shichang4fun",
     "category": "Productivity",
     "capabilities": ["lifecycle observation", "sidebar reconciliation"],

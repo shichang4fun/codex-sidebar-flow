@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1] - 2026-08-31
+
+### Fixed
+
+- Allow an unpinned child task of a Pinned Project to move independently while the Project object remains pinned.
+- Keep direct Pinned and For Later task membership, parent Projects in For Later or custom sections, ambiguity, exclusions, and Project objects fail-closed.
+- Align agent-native transitions, Hook fallback, event wake, heartbeat recovery, documentation, and regression coverage with the same Project-container policy.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added

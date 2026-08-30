@@ -573,7 +573,11 @@ test("agent transitions are opt-in, idempotent, and uninstall preserves user ins
     assert.equal(managed.includes("exactly one non-built-in custom section"), true);
     assert.equal(managed.includes("three section IDs to be distinct"), true);
     assert.equal(
-      managed.includes("no direct membership is eligible through its parent Project only when that Project has exactly one membership and it is the built-in Projects section"),
+      managed.includes("no direct membership is eligible through its parent Project only when that Project has exactly one membership and it is the built-in Projects or Pinned section"),
+      true,
+    );
+    assert.equal(
+      managed.includes("A single Pinned parent Project is only an identity anchor"),
       true,
     );
     assert.equal((await stat(agentsPath)).mode & 0o777, 0o644);

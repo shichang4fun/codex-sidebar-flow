@@ -99,6 +99,7 @@ test("renderEventWakePrompt is fixed, targeted, and never interpolates task cont
   assert.equal(prompt.includes("at most one move"), true);
   assert.equal(prompt.includes("authoritative hostId from confirmed task state"), true);
   assert.equal(prompt.includes("Pinned"), true);
+  assert.equal(prompt.includes("A Pinned parent Project remains pinned but does not by itself protect an unpinned child task"), true);
   assert.equal(prompt.includes("For Later"), true);
   assert.equal(prompt.includes("archived"), true);
   assert.equal(prompt.includes("non-Codex"), true);

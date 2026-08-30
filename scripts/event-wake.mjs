@@ -106,7 +106,7 @@ export function renderEventWakePrompt(envelope, config) {
     "Immediately before any move, call `read_thread` for the exact envelope threadId on the envelope hostId; require the returned thread ID and host ID to match, then re-evaluate structured status, attention, host, kind, and latest listed membership with no intervening tool call.",
     "This final read reduces the platform time-of-check/time-of-use window but does not make the move atomic or compare-and-swap.",
     `The configured custom sections are inProgress=${inProgressName}, forReview=${forReviewName}, and protected forLater=${forLaterName}; use only their real section IDs from list_threads.`,
-    `Never move Pinned, ${forLaterName}, archived, non-Codex, Project objects, or the excluded organizer task.`,
+    `Never move a task directly in Pinned or ${forLaterName}, archived or non-Codex tasks, Project objects, or the excluded organizer task. A Pinned parent Project remains pinned but does not by itself protect an unpinned child task; a parent Project in ${forLaterName} or another custom section blocks the child move.`,
     `For \`UserPromptSubmit\`, confirm the exact target is active and has no attention flags before moving an eligible task from Tasks, ${forReviewName}, or an eligible Project task to ${inProgressName}.`,
     `For \`Stop\`, confirm the exact target is idle, completed, failed, or needs-attention before moving an eligible task from Tasks, ${inProgressName}, or an eligible Project task to ${forReviewName}.`,
     "Fail closed on ambiguity, missing authoritative host data, or any tool error.",

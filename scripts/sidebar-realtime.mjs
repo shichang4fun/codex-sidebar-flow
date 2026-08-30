@@ -1072,14 +1072,21 @@ export function sidebarMembershipForThread(sections, thread) {
   };
 }
 
-export function membershipIsProtected(membership, protectedSectionIds) {
+export function membershipIsProtected(
+  membership,
+  protectedSectionIds,
+  { allowedProjectSectionIds = new Set() } = {},
+) {
   if (membership == null) return false;
-  return [
-    ...(membership.directMemberships ?? [membership.direct]),
-    ...(membership.projectMemberships ?? [membership.project]),
-  ].some((item) =>
+  const directProtected = (membership.directMemberships ?? [membership.direct]).some((item) =>
     item != null &&
     protectedSectionIds.has(item.sectionId),
+  );
+  if (directProtected) return true;
+  return (membership.projectMemberships ?? [membership.project]).some((item) =>
+    item != null
+    && protectedSectionIds.has(item.sectionId)
+    && !allowedProjectSectionIds.has(item.sectionId),
   );
 }
 
@@ -1114,6 +1121,11 @@ export async function hydrateCustomThreads(snapshot, config, appTools, knownHost
   const protectedSectionIds = new Set([
     pinned?.sectionId,
     configuredSections.forLater.sectionId,
+  ].filter(Boolean));
+  const allowedProjectSectionIds = new Set([pinned?.sectionId].filter(Boolean));
+  const eligibleProjectSectionIds = new Set([
+    projects?.sectionId,
+    pinned?.sectionId,
   ].filter(Boolean));
   const excludedIds = new Set([
     ...(config.excludeThreadIds ?? []),
@@ -1190,8 +1202,8 @@ export async function hydrateCustomThreads(snapshot, config, appTools, knownHost
       membership == null
       || membership.ambiguous === true
       || membership.viaProject !== true
-      || membership.sectionId !== projects?.sectionId
-      || membershipIsProtected(membership, protectedSectionIds)
+      || !eligibleProjectSectionIds.has(membership.sectionId)
+      || membershipIsProtected(membership, protectedSectionIds, { allowedProjectSectionIds })
     ) continue;
     scheduleRead({
       parsed: { threadId: thread.id, hostId: thread.hostId },
@@ -1288,6 +1300,8 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
     "canceled",
   ]);
   const moves = [];
+  const eligibleProjectSectionIds = new Set([projects.sectionId, pinned.sectionId]);
+  const allowedProjectSectionIds = new Set([pinned.sectionId]);
 
   for (const thread of snapshot.threads ?? []) {
     if (
@@ -1301,9 +1315,18 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
 
     const membership = sidebarMembershipForThread(sections, thread);
     if (membership?.ambiguous === true) continue;
+    if (
+      (membership?.projectMemberships ?? []).some(
+        ({ sectionId }) => !eligibleProjectSectionIds.has(sectionId),
+      )
+    ) continue;
     const currentSectionId = membership?.sectionId;
     if (currentSectionId == null) continue;
-    if (membershipIsProtected(membership, new Set([pinned.sectionId, forLater.sectionId]))) continue;
+    if (membershipIsProtected(
+      membership,
+      new Set([pinned.sectionId, forLater.sectionId]),
+      { allowedProjectSectionIds },
+    )) continue;
 
     const status = normalizedThreadStatus(thread);
     let destination = null;
@@ -1311,7 +1334,7 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
       if (
         currentSectionId === tasks.sectionId ||
         currentSectionId === forReview.sectionId ||
-        (membership.viaProject && currentSectionId === projects.sectionId)
+        (membership.viaProject && eligibleProjectSectionIds.has(currentSectionId))
       ) {
         destination = inProgress;
       }
@@ -1320,7 +1343,10 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
       const managed = managedThreadIds.has(identity) || managedThreadIds.has(thread.id);
       if (
         currentSectionId === inProgress.sectionId ||
-        ([tasks.sectionId, projects.sectionId].includes(currentSectionId) && managed)
+        ((
+          currentSectionId === tasks.sectionId
+          || (membership.viaProject && eligibleProjectSectionIds.has(currentSectionId))
+        ) && managed)
       ) {
         destination = forReview;
       }

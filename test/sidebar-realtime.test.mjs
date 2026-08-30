@@ -692,24 +692,38 @@ assert.deepEqual(
   ],
 );
 
-const protectedProjectHydration = snapshot([
-  thread("remote-project-protected", "notLoaded", "threads", {
+const pinnedProjectHydration = snapshot([
+  thread("remote-project-pinned", "notLoaded", "threads", {
     hostId: remoteHostId,
-    projectId: "remote-protected-project",
+    projectId: "remote-pinned-project",
     projectContainer: true,
   }),
 ]);
-protectedProjectHydration.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
-  "codex:project:remote-protected-project",
+pinnedProjectHydration.sections.find((section) => section.sectionId === "threads").itemKeys = [];
+pinnedProjectHydration.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
+  "codex:project:remote-pinned-project",
 );
-let protectedProjectReads = 0;
-await sidebarRealtime.hydrateCustomThreads(protectedProjectHydration, config, {
-  readThread: async () => {
-    protectedProjectReads += 1;
-    throw new Error("protected Project must not be hydrated");
+const pinnedProjectReads = [];
+const pinnedProjectHydrated = await sidebarRealtime.hydrateCustomThreads(pinnedProjectHydration, config, {
+  readThread: async (threadId, hostId) => {
+    pinnedProjectReads.push({ threadId, hostId });
+    return {
+      thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+      turns: [{ status: "inProgress" }],
+    };
   },
 });
-assert.equal(protectedProjectReads, 0);
+assert.deepEqual(pinnedProjectReads, [{ threadId: "remote-project-pinned", hostId: remoteHostId }]);
+assert.deepEqual(
+  planMoves(pinnedProjectHydrated, config).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [["remote-project-pinned", "In Progress"]],
+);
+assert.equal(
+  pinnedProjectHydrated.sections.find((section) => section.sectionId === "pinned").itemKeys.includes(
+    "codex:project:remote-pinned-project",
+  ),
+  true,
+);
 
 const remoteHydrationCalls = [];
 const remoteNotLoaded = thread("remote-not-loaded", "notLoaded", "progress", {
@@ -788,15 +802,47 @@ const hostlessHydrated = await sidebarRealtime.hydrateCustomThreads(hostlessMiss
 assert.deepEqual(hostlessCalls, []);
 assert.match(hostlessHydrated.hydrationErrors[0].error, /no authoritative hostId/);
 
+const pinnedParentChild = thread("pinned-parent-child", "idle", "progress", {
+  projectId: "project-pinned",
+});
+const pinnedParentSnapshot = snapshot([pinnedParentChild]);
+pinnedParentSnapshot.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
+  `codex:project:${pinnedParentChild.projectId}`,
+);
+assert.deepEqual(
+  planMoves(pinnedParentSnapshot, config).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [["pinned-parent-child", "For Review"]],
+);
+
+const laterParentChild = thread("later-parent-child", "idle", "progress", {
+  projectId: "project-later",
+});
+const laterParentSnapshot = snapshot([laterParentChild]);
+laterParentSnapshot.sections.find((section) => section.sectionId === "later").itemKeys.push(
+  `codex:project:${laterParentChild.projectId}`,
+);
+assert.deepEqual(planMoves(laterParentSnapshot, config), []);
+
 for (const protectedSection of ["pinned", "later"]) {
-  const child = thread(`protected-parent-${protectedSection}`, "idle", "progress", {
-    projectId: `project-${protectedSection}`,
+  for (const status of ["active", "idle"]) {
+    const directProtected = thread(`direct-${protectedSection}-${status}`, status, protectedSection);
+    assert.deepEqual(planMoves(snapshot([directProtected]), config), []);
+  }
+}
+
+for (const [id, status, section] of [
+  ["direct-tasks-custom-parent", "active", "chats"],
+  ["direct-progress-custom-parent", "idle", "progress"],
+  ["direct-review-custom-parent", "active", "review"],
+]) {
+  const child = thread(id, status, section, { projectId: `${id}-parent` });
+  const customParentSnapshot = snapshot([child]);
+  customParentSnapshot.sections.push({
+    sectionId: `${id}-custom`,
+    name: `${id} Custom`,
+    itemKeys: [`codex:project:${child.projectId}`],
   });
-  const protectedSnapshot = snapshot([child]);
-  protectedSnapshot.sections.find((section) => section.sectionId === protectedSection).itemKeys.push(
-    `codex:project:${child.projectId}`,
-  );
-  assert.deepEqual(planMoves(protectedSnapshot, config), []);
+  assert.deepEqual(planMoves(customParentSnapshot, config), []);
 }
 
 const duplicateDirect = snapshot([thread("duplicate-direct", "active", "chats")]);
@@ -858,6 +904,22 @@ const acceptedConfirmation = await confirmPlannedMove({
   }),
 }, plannedConfirmation, config);
 assert.deepEqual(acceptedConfirmation, plannedConfirmation);
+
+const customParentConfirmationSource = structuredClone(confirmSource);
+customParentConfirmationSource.threads[0].projectId = "confirm-custom-parent";
+customParentConfirmationSource.sections.push({
+  sectionId: "confirm-custom-parent-section",
+  name: "Confirm Custom Parent",
+  itemKeys: ["codex:project:confirm-custom-parent"],
+});
+const rejectedCustomParentConfirmation = await confirmPlannedMove({
+  listThreads: async () => structuredClone(customParentConfirmationSource),
+  readThread: async (threadId, hostId) => ({
+    thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+    turns: [{ status: "inProgress" }],
+  }),
+}, plannedConfirmation, config);
+assert.equal(rejectedCustomParentConfirmation, null);
 
 assert.deepEqual(planMoves(snapshot([thread("remote-active-idempotent", "active", "progress", {
   hostId: remoteHostId,

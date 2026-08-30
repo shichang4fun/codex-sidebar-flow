@@ -41,7 +41,11 @@ test("heartbeat prompt enforces audited allowlist, protections, and fail-closed 
     true,
   );
   assert.equal(
-    prompt.includes('Never move Pinned, "For Later", archived, non-Codex, Project objects, or an excluded task ID.'),
+    prompt.includes('Never move a task directly in Pinned or "For Later", archived or non-Codex tasks, Project objects, or an excluded task ID.'),
+    true,
+  );
+  assert.equal(
+    prompt.includes("A Pinned parent Project remains pinned but does not by itself protect an unpinned child task"),
     true,
   );
   assert.equal(prompt.includes("Move Pinned"), false);

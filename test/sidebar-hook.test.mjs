@@ -117,6 +117,54 @@ function snapshot({ hostId = "local", kind = "codex", includeThread = true } = {
   };
 }
 
+{
+  const bridgeConfig = {
+    ...config,
+    eventWake: {
+      ...eventWakeConfig,
+      organizerHostId: null,
+      routingMode: "controller-bridge",
+    },
+  };
+  for (const event of ["UserPromptSubmit", "Stop"]) {
+    const waits = [];
+    const result = await executeHookEvent(
+      { session_id: "thread-1", hook_event_name: event, host_id: "local" },
+      bridgeConfig,
+      {
+        createAppTools() {
+          assert.fail("controller bridge must not read or mutate the remote sidebar");
+        },
+        wait: async (delayMs) => waits.push(delayMs),
+      },
+    );
+    assert.deepEqual(result.eventEnvelope, {
+      protocol: "codex-sidebar-flow/bridge-v1",
+      event,
+      threadId: "thread-1",
+    });
+    assert.equal(result.attempts, 0);
+    assert.deepEqual(result.moves, []);
+    assert.deepEqual(result.observedIdentities, []);
+    assert.deepEqual(waits, event === "Stop" ? [3000] : []);
+  }
+  assert.equal(
+    buildAgentSelfMoveHookOutput(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      bridgeConfig,
+    ),
+    null,
+  );
+
+  const invalidRoute = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+    { ...bridgeConfig, eventWake: { ...bridgeConfig.eventWake, routingMode: "invalid" } },
+    { createAppTools: () => assert.fail("invalid routing must fail closed") },
+  );
+  assert.equal(invalidRoute.eventEnvelope, null);
+  assert.deepEqual(invalidRoute.moves, []);
+}
+
 assert.deepEqual(
   managedMutationFromLifecycle(
     snapshot({ hostId: "remote-control:env_remote_test" }),

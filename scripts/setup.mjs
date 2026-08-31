@@ -20,7 +20,8 @@ export const HOOK_MARKER = "CODEX_SIDEBAR_FLOW_OWNER=codex-sidebar-flow-v1";
 export const AGENT_TRANSITIONS_START = "<!-- CODEX_SIDEBAR_FLOW_AGENT_TRANSITIONS_START -->";
 export const AGENT_TRANSITIONS_END = "<!-- CODEX_SIDEBAR_FLOW_AGENT_TRANSITIONS_END -->";
 export const INSTALL_MODE_ENV = "CODEX_SIDEBAR_FLOW_INSTALL_MODE";
-export const CURRENT_CONFIG_VERSION = 3;
+export const CURRENT_CONFIG_VERSION = 4;
+const EVENT_WAKE_ROUTING_MODES = new Set(["host-bound", "controller-bridge"]);
 export const DEFAULT_HOOK_DEADLINE_MS = 14000;
 export const DEFAULT_STOP_SETTLE_DELAY_MS = 3000;
 const SAFE_IDENTIFIER_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
@@ -371,6 +372,7 @@ export function defaultConfig(codexHome, installMode = null, runtimeFingerprint 
       enabled: false,
       organizerThreadId: null,
       organizerHostId: "local",
+      routingMode: "host-bound",
       maxPerMinute: 20,
     },
     agentTransitions: {
@@ -468,6 +470,7 @@ export async function setup({
   enableEventWake = false,
   organizerThreadId,
   organizerHostId,
+  eventWakeRoutingMode,
   eventWakeMaxPerMinute,
   agentTransitionsEnabled,
 } = {}, dependencies = {}) {
@@ -495,6 +498,15 @@ export async function setup({
   }
   if (organizerHostId != null && !isSafeIdentifier(organizerHostId)) {
     throw invalidArgument("Invalid organizerHostId");
+  }
+  if (eventWakeRoutingMode != null && !EVENT_WAKE_ROUTING_MODES.has(eventWakeRoutingMode)) {
+    throw invalidArgument("Invalid eventWakeRoutingMode");
+  }
+  if (eventWakeRoutingMode === "controller-bridge" && organizerHostId != null) {
+    throw invalidArgument("controller-bridge must omit --organizer-host-id");
+  }
+  if (eventWakeRoutingMode === "controller-bridge" && agentTransitionsEnabled === true) {
+    throw invalidArgument("controller-bridge requires agent transitions to be disabled");
   }
   if (
     eventWakeMaxPerMinute != null
@@ -611,13 +623,26 @@ export async function setup({
       error.code = "CAPABILITY_PROBE_REQUIRED";
       throw error;
     }
+    const routingMode = eventWakeRoutingMode
+      ?? config.eventWake.routingMode
+      ?? "host-bound";
+    if (routingMode === "controller-bridge" && organizerHostId != null) {
+      throw invalidArgument("controller-bridge must omit --organizer-host-id");
+    }
+    if (routingMode === "controller-bridge" && agentTransitionsEnabled === true) {
+      throw invalidArgument("controller-bridge requires agent transitions to be disabled");
+    }
     config.eventWake = {
       ...config.eventWake,
       enabled: true,
       organizerThreadId,
-      organizerHostId: organizerHostId ?? config.eventWake.organizerHostId ?? "local",
+      organizerHostId: routingMode === "controller-bridge"
+        ? null
+        : (organizerHostId ?? config.eventWake.organizerHostId ?? "local"),
+      routingMode,
       maxPerMinute: eventWakeMaxPerMinute ?? config.eventWake.maxPerMinute ?? 20,
     };
+    if (routingMode === "controller-bridge") config.agentTransitions.enabled = false;
     config.excludeThreadIds = [...new Set([
       ...(Array.isArray(config.excludeThreadIds) ? config.excludeThreadIds : []),
       organizerThreadId,
@@ -737,6 +762,13 @@ export function parseSetupArgs(argv) {
     } else if (argv[index] === "--organizer-host-id") {
       result.organizerHostId = identifierOptionValue(argv, index, "--organizer-host-id");
       index += 1;
+    } else if (argv[index] === "--event-wake-routing-mode") {
+      const value = optionValue(argv, index, "--event-wake-routing-mode");
+      if (!EVENT_WAKE_ROUTING_MODES.has(value)) {
+        throw invalidArgument("--event-wake-routing-mode must be host-bound or controller-bridge");
+      }
+      result.eventWakeRoutingMode = value;
+      index += 1;
     } else if (argv[index] === "--event-wake-max-per-minute") {
       const value = optionValue(argv, index, "--event-wake-max-per-minute");
       if (!/^\d+$/.test(value) || Number(value) <= 0 || !Number.isSafeInteger(Number(value))) {
@@ -749,6 +781,12 @@ export function parseSetupArgs(argv) {
   }
   if (result.enableEventWake && result.organizerThreadId == null) {
     throw invalidArgument("--enable-event-wake requires --organizer-thread-id");
+  }
+  if (result.eventWakeRoutingMode === "controller-bridge" && result.organizerHostId != null) {
+    throw invalidArgument("controller-bridge must omit --organizer-host-id");
+  }
+  if (result.eventWakeRoutingMode === "controller-bridge" && result.agentTransitionsEnabled === true) {
+    throw invalidArgument("controller-bridge requires agent transitions to be disabled");
   }
   if (result.mode === "plugin" && result.codexHome != null) {
     throw invalidArgument("Plugin setup cannot use --codex-home; set CODEX_HOME for the plugin runtime instead");

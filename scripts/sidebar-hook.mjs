@@ -103,15 +103,31 @@ function authoritativeEventEnvelope(snapshot, input, config) {
   if ((config.excludeThreadIds ?? []).includes(threadId)) return null;
   if (threadId === config?.eventWake?.organizerThreadId) return null;
 
+  const routingMode = config?.eventWake?.routingMode ?? "host-bound";
+  if (routingMode === "controller-bridge") {
+    try {
+      return normalizeLifecycleEnvelope({ event, threadId });
+    } catch {
+      return null;
+    }
+  }
+
   const thread = selectLifecycleThread(snapshot, input).thread;
   if (thread == null || thread.kind !== "codex" || typeof thread.hostId !== "string" || thread.hostId.length === 0) {
     return null;
   }
-  return normalizeLifecycleEnvelope({
-    event,
-    threadId: thread.id,
-    hostId: thread.hostId,
-  });
+  return normalizeLifecycleEnvelope({ event, threadId: thread.id, hostId: thread.hostId });
+}
+
+function controllerBridgeEnabled(config) {
+  return config?.eventWake?.enabled === true
+    && config?.eventWake?.routingMode === "controller-bridge";
+}
+
+function invalidEventWakeRouting(config) {
+  if (config?.eventWake?.enabled !== true) return false;
+  const routingMode = config.eventWake.routingMode ?? "host-bound";
+  return !["host-bound", "controller-bridge"].includes(routingMode);
 }
 
 async function readHookInput() {
@@ -343,6 +359,18 @@ export async function executeHookEvent(
   } = {},
 ) {
   let lastError;
+  if (invalidEventWakeRouting(config)) {
+    return {
+      move: null,
+      moves: [],
+      managedState,
+      managedAdds: [],
+      managedRemoves: [],
+      observedIdentities: [],
+      eventEnvelope: null,
+      attempts: 0,
+    };
+  }
   if (input?.hook_event_name === "Stop") {
     const settleDelayMs = config.stopSettleDelayMs ?? DEFAULT_STOP_SETTLE_DELAY_MS;
     const availableMs = remainingDeadlineMs(deadlineAt, now);
@@ -361,6 +389,18 @@ export async function executeHookEvent(
       };
     }
   }
+  if (controllerBridgeEnabled(config)) {
+    return {
+      move: null,
+      moves: [],
+      managedState,
+      managedAdds: [],
+      managedRemoves: [],
+      observedIdentities: [],
+      eventEnvelope: authoritativeEventEnvelope(null, input, config),
+      attempts: 0,
+    };
+  }
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const requiredTools = input?.hook_event_name === "Stop"
       ? STOP_REQUIRED_TOOLS
@@ -376,13 +416,7 @@ export async function executeHookEvent(
       const mutation = managedMutationFromLifecycle(snapshot, input, config);
       if (mutation?.action === "observe") observedIdentities.push(mutation.identity);
       const committed = await commitStopMove(
-        snapshot,
-        input,
-        config,
-        appTools,
-        managedState,
-        deadlineAt,
-        now,
+        snapshot, input, config, appTools, managedState, deadlineAt, now,
       );
       if (committed != null) {
         return {
@@ -487,6 +521,7 @@ function runtimeEventWakeConfig(config) {
     ...(config.eventWake ?? {}),
     wakeStateFile: config.wakeStateFile ?? config.eventWake?.wakeStateFile,
     excludeThreadIds: config.excludeThreadIds ?? [],
+    listLimit: config.listLimit,
     sections: config.sections,
   };
 }
@@ -501,6 +536,7 @@ export function buildAgentSelfMoveHookOutput(input, config) {
   }
   if (
     input?.hook_event_name !== "UserPromptSubmit"
+    || controllerBridgeEnabled(config)
     || typeof threadId !== "string"
     || !LIFECYCLE_ID_PATTERN.test(threadId)
     || threadId.startsWith("-")

@@ -164,6 +164,17 @@ test("setup parses explicit event-wake configuration and rejects unsafe values",
     organizerHostId: "remote-control:env_123",
     eventWakeMaxPerMinute: 7,
   });
+  assert.deepEqual(parseSetupArgs([
+    "--enable-event-wake",
+    "--organizer-thread-id", "organizer-123",
+    "--event-wake-routing-mode", "controller-bridge",
+  ]), {
+    dryRun: false,
+    migrateLegacyHookPaths: [],
+    enableEventWake: true,
+    organizerThreadId: "organizer-123",
+    eventWakeRoutingMode: "controller-bridge",
+  });
   for (const argv of [
     ["--enable-event-wake"],
     ["--enable-event-wake", "--organizer-thread-id", "--plugin"],
@@ -171,8 +182,11 @@ test("setup parses explicit event-wake configuration and rejects unsafe values",
     ["--enable-event-wake", "--organizer-thread-id", "organizer", "--organizer-host-id", "bad host"],
     ["--enable-event-wake", "--organizer-thread-id", "organizer", "--event-wake-max-per-minute", "0"],
     ["--enable-event-wake", "--organizer-thread-id", "organizer", "--event-wake-max-per-minute", "1.5"],
+    ["--enable-event-wake", "--organizer-thread-id", "organizer", "--event-wake-routing-mode", "invalid"],
+    ["--enable-event-wake", "--organizer-thread-id", "organizer", "--event-wake-routing-mode", "controller-bridge", "--organizer-host-id", "local"],
+    ["--enable-event-wake", "--organizer-thread-id", "organizer", "--event-wake-routing-mode", "controller-bridge", "--enable-agent-transitions"],
   ]) {
-    assert.throws(() => parseSetupArgs(argv), /organizer|requires|invalid|positive integer/i);
+    assert.throws(() => parseSetupArgs(argv), /organizer|requires|invalid|positive integer|must be/i);
   }
 });
 
@@ -184,13 +198,14 @@ test("default configuration keeps event wake disabled with private runtime paths
     enabled: false,
     organizerThreadId: null,
     organizerHostId: "local",
+    routingMode: "host-bound",
     maxPerMinute: 20,
   });
   assert.equal(config.wakeStateFile, path.join(runtime, "wake-state.json"));
   assert.equal(config.eventWakeProbeRequestFile, path.join(runtime, "event-wake-probe-request.json"));
   assert.equal(config.eventWakeProbeResultFile, path.join(runtime, "event-wake-probe-result.json"));
   assert.equal(config.eventWakeProbeTtlMs, 300000);
-  assert.equal(config.configVersion, 3);
+  assert.equal(config.configVersion, 4);
   assert.equal(config.hookDeadlineMs, 14000);
   assert.equal(config.stopSettleDelayMs, 3000);
 });
@@ -275,6 +290,7 @@ test("setup requires a present probe bound to the exact mode and runtime before 
       enabled: true,
       organizerThreadId: "organizer-123",
       organizerHostId: "remote-control:env_123",
+      routingMode: "host-bound",
       maxPerMinute: 7,
     });
     assert.deepEqual(once.excludeThreadIds, ["keep-excluded", "old-organizer", "organizer-123"]);
@@ -291,12 +307,32 @@ test("setup requires a present probe bound to the exact mode and runtime before 
       enabled: true,
       organizerThreadId: "organizer-456",
       organizerHostId: "remote-control:env_123",
+      routingMode: "host-bound",
       maxPerMinute: 7,
     });
     assert.deepEqual(rerun.excludeThreadIds, ["keep-excluded", "old-organizer", "organizer-123", "organizer-456"]);
 
+    await setup({
+      codexHome,
+      enableEventWake: true,
+      organizerThreadId: "organizer-controller",
+      eventWakeRoutingMode: "controller-bridge",
+    });
+    const bridged = JSON.parse(await readFile(configPath, "utf8"));
+    assert.deepEqual(bridged.eventWake, {
+      enabled: true,
+      organizerThreadId: "organizer-controller",
+      organizerHostId: null,
+      routingMode: "controller-bridge",
+      maxPerMinute: 7,
+    });
+    assert.equal(bridged.agentTransitions.enabled, false);
+    assert.deepEqual(bridged.excludeThreadIds, [
+      "keep-excluded", "old-organizer", "organizer-123", "organizer-456", "organizer-controller",
+    ]);
+
     await setup({ codexHome });
-    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), rerun);
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), bridged);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }
@@ -437,7 +473,7 @@ test("upgrading a v0.1 configuration adds disabled event wake defaults", async (
     const upgraded = JSON.parse(await readFile(configPath, "utf8"));
     assert.equal(upgraded.eventWake.enabled, false);
     assert.equal(upgraded.eventWake.organizerThreadId, null);
-    assert.equal(upgraded.configVersion, 3);
+    assert.equal(upgraded.configVersion, 4);
     assert.equal(upgraded.hookDeadlineMs, 14000);
     assert.equal(upgraded.stopSettleDelayMs, 3000);
     assert.equal(upgraded.custom, "preserved");
@@ -459,7 +495,7 @@ test("timing migration preserves explicit non-legacy overrides", async () => {
     })}\n`, { mode: 0o600 });
     await setupPluginForTest(codexHome);
     const upgraded = JSON.parse(await readFile(configPath, "utf8"));
-    assert.equal(upgraded.configVersion, 3);
+    assert.equal(upgraded.configVersion, 4);
     assert.equal(upgraded.hookDeadlineMs, 18000);
     assert.equal(upgraded.stopSettleDelayMs, 4500);
   } finally {
@@ -474,14 +510,14 @@ test("setup preserves timing owned by a future config version", async () => {
   try {
     await mkdir(runtime, { recursive: true });
     await writeFile(configPath, `${JSON.stringify({
-      configVersion: 3,
+      configVersion: 5,
       installMode: "plugin",
       hookDeadlineMs: 9000,
       stopSettleDelayMs: 500,
     })}\n`, { mode: 0o600 });
     await setupPluginForTest(codexHome);
     const upgraded = JSON.parse(await readFile(configPath, "utf8"));
-    assert.equal(upgraded.configVersion, 3);
+    assert.equal(upgraded.configVersion, 5);
     assert.equal(upgraded.hookDeadlineMs, 9000);
     assert.equal(upgraded.stopSettleDelayMs, 500);
   } finally {

@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2] - 2026-08-31
+
+### Fixed
+
+- Route remote lifecycle events to the controlling Mac without a host override, then resolve the unique task ID to the controller-visible `remote-control:*` host before any read or move.
+- Disable remote self-moves in controller-bridge mode so remote Hooks cannot update only the remote machine's local sidebar database and falsely appear centrally reconciled.
+- Keep host-bound event wake available as an explicit compatibility mode and fail closed on route/envelope mismatches or duplicate cross-host task IDs.
+
 ## [0.3.1] - 2026-08-31
 
 ### Fixed

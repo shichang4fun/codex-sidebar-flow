@@ -1,6 +1,6 @@
 {
   "name": "codex-sidebar-flow",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Agent-assisted multi-host Codex Desktop sidebar lifecycle organization.",
   "type": "module",
   "engines": { "node": ">=20" },

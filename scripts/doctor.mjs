@@ -774,11 +774,19 @@ export function inspectInstallation({
   });
   const wake = config?.eventWake;
   const eventWakeEnabled = wake?.enabled === true;
+  const wakeRoutingMode = wake?.routingMode ?? "host-bound";
+  const wakeRouteValid = wakeRoutingMode === "host-bound"
+    ? isSafeIdentifier(wake?.organizerHostId)
+    : wakeRoutingMode === "controller-bridge" && wake?.organizerHostId == null;
   const eventWakeValid = !eventWakeEnabled || (
     isSafeIdentifier(wake.organizerThreadId)
-    && isSafeIdentifier(wake.organizerHostId)
+    && wakeRouteValid
+    && (wakeRoutingMode !== "controller-bridge" || config?.agentTransitions?.enabled !== true)
     && Number.isInteger(wake.maxPerMinute)
     && wake.maxPerMinute > 0
+    && Number.isInteger(config.listLimit)
+    && config.listLimit >= 1
+    && config.listLimit <= 200
     && Array.isArray(config.excludeThreadIds)
     && config.excludeThreadIds.includes(wake.organizerThreadId)
     && isBoundedAbsolutePath(config.wakeStateFile)

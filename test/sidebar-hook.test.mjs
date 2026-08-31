@@ -156,6 +156,31 @@ function snapshot({ hostId = "local", kind = "codex", includeThread = true } = {
     null,
   );
 
+  const dormantBridgeConfig = {
+    ...bridgeConfig,
+    eventWake: { ...bridgeConfig.eventWake, enabled: false },
+  };
+  for (const event of ["UserPromptSubmit", "Stop"]) {
+    const dormant = await executeHookEvent(
+      { session_id: "thread-1", hook_event_name: event },
+      dormantBridgeConfig,
+      {
+        createAppTools: () => assert.fail("dormant controller bridge must not access the remote sidebar"),
+        wait: async () => assert.fail("dormant controller bridge must not delay or dispatch"),
+      },
+    );
+    assert.equal(dormant.eventEnvelope, null);
+    assert.deepEqual(dormant.moves, []);
+    assert.equal(dormant.attempts, 0);
+  }
+  assert.equal(
+    buildAgentSelfMoveHookOutput(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      dormantBridgeConfig,
+    ),
+    null,
+  );
+
   const invalidRoute = await executeHookEvent(
     { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
     { ...bridgeConfig, eventWake: { ...bridgeConfig.eventWake, routingMode: "invalid" } },

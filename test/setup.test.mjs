@@ -482,6 +482,40 @@ test("upgrading a v0.1 configuration adds disabled event wake defaults", async (
   }
 });
 
+test("runtime fingerprint changes keep a controller bridge dormant without re-enabling remote transitions", async () => {
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-bridge-binding-change-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  try {
+    await mkdir(runtime, { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      configVersion: 4,
+      installMode: "source",
+      runtimeFingerprint: "b".repeat(64),
+      sections: { inProgress: "In Progress", forReview: "For Review", forLater: "For Later" },
+      excludeThreadIds: ["organizer-controller"],
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-controller",
+        organizerHostId: null,
+        routingMode: "controller-bridge",
+        maxPerMinute: 20,
+      },
+      agentTransitions: { enabled: false },
+    })}\n`, { mode: 0o600 });
+
+    await setup({ codexHome });
+    const upgraded = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(upgraded.eventWake.enabled, false);
+    assert.equal(upgraded.eventWake.routingMode, "controller-bridge");
+    assert.equal(upgraded.eventWake.organizerHostId, null);
+    assert.equal(upgraded.agentTransitions.enabled, false);
+    assert.notEqual(upgraded.runtimeFingerprint, "b".repeat(64));
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("timing migration preserves explicit non-legacy overrides", async () => {
   const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-custom-timing-upgrade-"));
   const runtime = path.join(codexHome, "sidebar-flow");

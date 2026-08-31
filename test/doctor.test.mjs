@@ -364,6 +364,12 @@ test("doctor validates event-wake configuration and reports capability separatel
     eventWakeProbe: { status: "present", checkedAt: 100 },
   });
   assert.equal(bridgeChecks.find((check) => check.name === "event-wake-config").level, "ok");
+  const dormantBridgeChecks = inspectInstallation({
+    config: { ...bridged, eventWake: { ...bridged.eventWake, enabled: false } },
+    mode: "plugin",
+    runtimeRoot: path.join(codexHome, "sidebar-flow"),
+  });
+  assert.equal(dormantBridgeChecks.find((check) => check.name === "event-wake-config").level, "ok");
 
   for (const invalid of [
     { ...enabled, excludeThreadIds: [] },
@@ -371,6 +377,7 @@ test("doctor validates event-wake configuration and reports capability separatel
     { ...enabled, eventWake: { ...enabled.eventWake, organizerHostId: "bad host" } },
     { ...bridged, eventWake: { ...bridged.eventWake, organizerHostId: "local" } },
     { ...bridged, agentTransitions: { enabled: true } },
+    { ...bridged, eventWake: { ...bridged.eventWake, enabled: false }, agentTransitions: { enabled: true } },
     { ...bridged, listLimit: 0 },
     { ...enabled, eventWake: { ...enabled.eventWake, maxPerMinute: 0 } },
     { ...enabled, wakeStateFile: "relative.json" },

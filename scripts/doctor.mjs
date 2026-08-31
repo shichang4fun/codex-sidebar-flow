@@ -778,10 +778,10 @@ export function inspectInstallation({
   const wakeRouteValid = wakeRoutingMode === "host-bound"
     ? isSafeIdentifier(wake?.organizerHostId)
     : wakeRoutingMode === "controller-bridge" && wake?.organizerHostId == null;
-  const eventWakeValid = !eventWakeEnabled || (
+  const dormantRouteValid = wakeRouteValid
+    && (wakeRoutingMode !== "controller-bridge" || config?.agentTransitions?.enabled !== true);
+  const eventWakeValid = dormantRouteValid && (!eventWakeEnabled || (
     isSafeIdentifier(wake.organizerThreadId)
-    && wakeRouteValid
-    && (wakeRoutingMode !== "controller-bridge" || config?.agentTransitions?.enabled !== true)
     && Number.isInteger(wake.maxPerMinute)
     && wake.maxPerMinute > 0
     && Number.isInteger(config.listLimit)
@@ -791,7 +791,7 @@ export function inspectInstallation({
     && config.excludeThreadIds.includes(wake.organizerThreadId)
     && isBoundedAbsolutePath(config.wakeStateFile)
     && validProbeConfig(config, runtimeRoot)
-  );
+  ));
   checks.push({
     level: eventWakeValid ? "ok" : "error",
     name: "event-wake-config",

@@ -119,13 +119,16 @@ function authoritativeEventEnvelope(snapshot, input, config) {
   return normalizeLifecycleEnvelope({ event, threadId: thread.id, hostId: thread.hostId });
 }
 
+function controllerBridgeConfigured(config) {
+  return config?.eventWake?.routingMode === "controller-bridge";
+}
+
 function controllerBridgeEnabled(config) {
-  return config?.eventWake?.enabled === true
-    && config?.eventWake?.routingMode === "controller-bridge";
+  return controllerBridgeConfigured(config) && config?.eventWake?.enabled === true;
 }
 
 function invalidEventWakeRouting(config) {
-  if (config?.eventWake?.enabled !== true) return false;
+  if (config?.eventWake == null) return false;
   const routingMode = config.eventWake.routingMode ?? "host-bound";
   return !["host-bound", "controller-bridge"].includes(routingMode);
 }
@@ -371,6 +374,18 @@ export async function executeHookEvent(
       attempts: 0,
     };
   }
+  if (controllerBridgeConfigured(config) && !controllerBridgeEnabled(config)) {
+    return {
+      move: null,
+      moves: [],
+      managedState,
+      managedAdds: [],
+      managedRemoves: [],
+      observedIdentities: [],
+      eventEnvelope: null,
+      attempts: 0,
+    };
+  }
   if (input?.hook_event_name === "Stop") {
     const settleDelayMs = config.stopSettleDelayMs ?? DEFAULT_STOP_SETTLE_DELAY_MS;
     const availableMs = remainingDeadlineMs(deadlineAt, now);
@@ -536,7 +551,7 @@ export function buildAgentSelfMoveHookOutput(input, config) {
   }
   if (
     input?.hook_event_name !== "UserPromptSubmit"
-    || controllerBridgeEnabled(config)
+    || controllerBridgeConfigured(config)
     || typeof threadId !== "string"
     || !LIFECYCLE_ID_PATTERN.test(threadId)
     || threadId.startsWith("-")

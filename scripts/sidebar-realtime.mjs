@@ -2,22 +2,51 @@
 
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { createReadStream, existsSync, realpathSync, watch } from "node:fs";
-import { open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants, createReadStream, existsSync, realpathSync, watch } from "node:fs";
+import { lstat, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { ensureRealDirectory } from "./runtime-integrity.mjs";
+import { resolveConfiguredSections, validateSectionNames } from "./sidebar-policy.mjs";
 
-const REQUIRED_TOOLS = ["list_threads", "move_thread_to_sidebar_section", "read_thread"];
+export const RECONCILER_TOOLS = [
+  "list_threads",
+  "read_thread",
+  "move_thread_to_sidebar_section",
+];
 const DEFAULT_SOCKET_DIR = "/tmp/codex-browser-use";
 const DEFAULT_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
+const MAX_MANAGED_LOCK_OWNER_BYTES = 4_096;
 const execFileAsync = promisify(execFile);
 
 function now() {
   return new Date().toISOString();
+}
+
+function cancellationError() {
+  const error = new Error("Wake deadline exceeded");
+  error.code = "WAKE_DEADLINE";
+  return error;
+}
+
+function isDispatchCancelled({ signal, canDispatch } = {}) {
+  if (signal?.aborted === true) return true;
+  if (typeof canDispatch === "function") {
+    try {
+      return canDispatch() === false;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function throwIfDispatchCancelled(options) {
+  if (isDispatchCancelled(options)) throw cancellationError();
 }
 
 function sessionDayDirectory(sessionsDir, date) {
@@ -43,6 +72,10 @@ function log(level, message, details = null) {
 
 async function writeHealth(config, state) {
   if (!config.healthFile) return;
+  await ensureRealDirectory(path.dirname(config.healthFile), {
+    create: true,
+    label: "Sidebar Flow health directory",
+  });
   const payload = {
     ...state,
     pid: process.pid,
@@ -65,25 +98,35 @@ export class NativePipeClient {
     this.connecting = null;
   }
 
-  async connect() {
+  async connect(options = {}) {
     if (this.socket != null && !this.socket.destroyed) return;
     if (this.connecting != null) return this.connecting;
+    throwIfDispatchCancelled(options);
 
     this.connecting = new Promise((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
       const timer = setTimeout(() => {
         fail(new Error(`Timed out connecting to ${path.basename(this.socketPath)}`));
       }, this.timeoutMs);
+      const abort = () => fail(cancellationError());
       const fail = (error) => {
         clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
         socket.destroy();
         reject(error);
       };
 
+      options.signal?.addEventListener?.("abort", abort, { once: true });
       socket.once("error", fail);
       socket.once("connect", () => {
         clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
         socket.off("error", fail);
+        if (isDispatchCancelled(options)) {
+          socket.destroy();
+          reject(cancellationError());
+          return;
+        }
         this.socket = socket;
         this.buffer = Buffer.alloc(0);
         socket.on("data", (chunk) => this.onData(chunk));
@@ -98,8 +141,10 @@ export class NativePipeClient {
     return this.connecting;
   }
 
-  async request(method, params, timeoutMs = this.timeoutMs) {
-    await this.connect();
+  async request(method, params, timeoutMs = this.timeoutMs, options = {}) {
+    throwIfDispatchCancelled(options);
+    await this.connect(options);
+    throwIfDispatchCancelled(options);
     const id = this.nextId++;
     const payload = Buffer.from(JSON.stringify({ id, jsonrpc: "2.0", method, params }), "utf8");
     const frame = Buffer.alloc(4 + payload.length);
@@ -109,24 +154,44 @@ export class NativePipeClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        options.signal?.removeEventListener?.("abort", abort);
         reject(new Error(`Timed out calling ${method}`));
       }, timeoutMs);
+      const abort = () => {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
+        reject(cancellationError());
+      };
 
       this.pending.set(id, {
         resolve: (value) => {
           clearTimeout(timer);
+          options.signal?.removeEventListener?.("abort", abort);
           resolve(value);
         },
         reject: (error) => {
           clearTimeout(timer);
+          options.signal?.removeEventListener?.("abort", abort);
           reject(error);
         },
       });
+      options.signal?.addEventListener?.("abort", abort, { once: true });
 
+      try {
+        throwIfDispatchCancelled(options);
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        options.signal?.removeEventListener?.("abort", abort);
+        reject(error);
+        return;
+      }
       this.socket.write(frame, (error) => {
         if (error == null) return;
         const pending = this.pending.get(id);
         this.pending.delete(id);
+        options.signal?.removeEventListener?.("abort", abort);
         pending?.reject(error);
       });
     });
@@ -195,14 +260,19 @@ export function promoteClientTimeout(client, requestTimeoutMs) {
   return client;
 }
 
-export async function keepHostAlive(host, timeoutMs = 5000) {
+export function hostHasRequiredTools(host, requiredTools = RECONCILER_TOOLS) {
+  const toolMap = host?.toolMap;
+  return requiredTools.every((name) => toolMap instanceof Map && toolMap.has(name));
+}
+
+export async function keepHostAlive(host, timeoutMs = 5000, requiredTools = RECONCILER_TOOLS) {
   const result = await host.client.request(
     "tools/list",
     { threadStartKind: "all" },
     timeoutMs,
   );
-  const names = new Set((result?.tools ?? []).map((tool) => tool.name));
-  if (!REQUIRED_TOOLS.every((name) => names.has(name))) {
+  const toolMap = new Map((result?.tools ?? []).map((tool) => [tool.name, tool]));
+  if (!hostHasRequiredTools({ ...host, toolMap }, requiredTools)) {
     throw new Error("Codex app tools keepalive lost required sidebar tools");
   }
 }
@@ -278,6 +348,10 @@ export async function loadManagedState(filePath, currentTime = Date.now(), grace
 }
 
 async function writeManagedStateFile(filePath, state) {
+  await ensureRealDirectory(path.dirname(filePath), {
+    create: true,
+    label: "Sidebar Flow state directory",
+  });
   const normalized = normalizeManagedState(state);
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(normalized)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -295,56 +369,149 @@ function processIsAlive(pid) {
   }
 }
 
-async function clearStaleLock(lockPath, staleAfterMs = 30000) {
-  const [contents, metadata] = await Promise.all([
-    readFile(lockPath, "utf8").catch(() => null),
-    stat(lockPath).catch(() => null),
+function sameFileIdentity(left, right) {
+  return left != null && right != null && left.dev === right.dev && left.ino === right.ino;
+}
+
+async function unlinkOwnedLock(lockPath, handle) {
+  if (handle == null) return false;
+  const [ownedStat, currentStat] = await Promise.all([
+    handle.stat().catch(() => null),
+    lstat(lockPath).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }),
   ]);
-  if (metadata == null) return true;
-  let owner = null;
-  try {
-    owner = JSON.parse(contents);
-  } catch {}
-  const createdAt = Number.isFinite(owner?.createdAt) ? owner.createdAt : metadata.mtimeMs;
-  const staleByAge = Date.now() - createdAt > staleAfterMs;
-  const ownerGone = Number.isInteger(owner?.pid) && !processIsAlive(owner.pid);
-  if (!staleByAge && !ownerGone) return false;
+  if (!sameFileIdentity(ownedStat, currentStat)) return false;
   await unlink(lockPath).catch((error) => {
     if (error.code !== "ENOENT") throw error;
   });
   return true;
 }
 
-async function withFileLock(lockPath, task, { attempts = 80, delayMs = 25, staleAfterMs = 30000 } = {}) {
+function normalizeLockOwner(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes("pid") || !keys.includes("createdAt")) return null;
+  if (!Number.isSafeInteger(value.pid) || value.pid <= 0) return null;
+  if (!Number.isSafeInteger(value.createdAt) || value.createdAt < 0) return null;
+  return value;
+}
+
+async function readLockOwner(handle, metadata) {
+  if (!metadata.isFile() || metadata.size > MAX_MANAGED_LOCK_OWNER_BYTES) return null;
+  const buffer = Buffer.alloc(MAX_MANAGED_LOCK_OWNER_BYTES + 1);
+  const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+  if (bytesRead > MAX_MANAGED_LOCK_OWNER_BYTES) return null;
+  let owner = null;
+  try {
+    owner = normalizeLockOwner(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")));
+  } catch {}
+  return owner;
+}
+
+async function clearStaleLock(
+  lockPath,
+  staleAfterMs = 30000,
+  { now = Date.now, isProcessAlive = processIsAlive, onBeforeReclaim = null } = {},
+) {
   let handle;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  try {
+    handle = await open(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (error.code === "ENOENT") return true;
+    return false;
+  }
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) return false;
+    const owner = await readLockOwner(handle, metadata);
+    let stale = now() - metadata.mtimeMs > staleAfterMs;
+    if (owner != null) {
+      let ownerAlive = true;
+      try {
+        ownerAlive = isProcessAlive(owner.pid) !== false;
+      } catch {
+        ownerAlive = true;
+      }
+      stale = !ownerAlive;
+    }
+    if (!stale) return false;
+    if (typeof onBeforeReclaim === "function") {
+      await onBeforeReclaim({ lockPath, owner });
+    }
+    return await unlinkOwnedLock(lockPath, handle);
+  } catch {
+    return false;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+async function withFileLock(
+  lockPath,
+  task,
+  {
+    attempts = 80,
+    delayMs = 25,
+    staleAfterMs = 30000,
+    now = Date.now,
+    isProcessAlive = processIsAlive,
+    onBeforeReclaim = null,
+    onBeforeRelease = null,
+  } = {},
+) {
+  let handle = null;
+  let blockedAttempts = 0;
+  let recoveryAttempts = 0;
+  while (handle == null) {
     try {
       handle = await open(lockPath, "wx", 0o600);
       try {
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: Date.now() })}\n`);
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: now() })}\n`);
       } catch (error) {
+        await unlinkOwnedLock(lockPath, handle);
         await handle.close().catch(() => {});
         handle = null;
-        await unlink(lockPath).catch(() => {});
         throw error;
       }
       break;
     } catch (error) {
-      if (error.code !== "EEXIST" || attempt + 1 >= attempts) throw error;
-      if (await clearStaleLock(lockPath, staleAfterMs)) continue;
+      if (error.code !== "EEXIST") throw error;
+      if (recoveryAttempts < attempts) {
+        recoveryAttempts += 1;
+        const reclaimed = await clearStaleLock(lockPath, staleAfterMs, {
+          now,
+          isProcessAlive,
+          onBeforeReclaim,
+        });
+        if (reclaimed) continue;
+      }
+      blockedAttempts += 1;
+      if (blockedAttempts >= attempts) throw error;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
   try {
     return await task();
   } finally {
-    await handle?.close().catch(() => {});
-    await unlink(lockPath).catch(() => {});
+    try {
+      if (typeof onBeforeRelease === "function") {
+        await onBeforeRelease({ lockPath });
+      }
+    } finally {
+      await unlinkOwnedLock(lockPath, handle);
+      await handle?.close().catch(() => {});
+    }
   }
 }
 
-export async function saveManagedState(filePath, state) {
+export async function saveManagedState(filePath, state, lockOptions = {}) {
   if (!filePath) return normalizeManagedState(state);
+  await ensureRealDirectory(path.dirname(filePath), {
+    create: true,
+    label: "Sidebar Flow state directory",
+  });
   return withFileLock(`${filePath}.lock`, async () => {
     let current = null;
     try {
@@ -366,14 +533,19 @@ export async function saveManagedState(filePath, state) {
           sessionFiles: { ...current.sessionFiles, ...proposed.sessionFiles },
         };
     return writeManagedStateFile(filePath, next);
-  });
+  }, lockOptions);
 }
 
 export async function updateManagedState(
   filePath,
   { add = [], remove = [], observe = [], lastSessionScanAt = null, sessionFiles = null } = {},
+  lockOptions = {},
 ) {
   if (!filePath) return normalizeManagedState(null);
+  await ensureRealDirectory(path.dirname(filePath), {
+    create: true,
+    label: "Sidebar Flow state directory",
+  });
   return withFileLock(`${filePath}.lock`, async () => {
     const current = await loadManagedState(filePath);
     const managedThreadIds = new Set(current.managedThreadIds);
@@ -391,7 +563,7 @@ export async function updateManagedState(
       sessionFiles: sessionFiles == null ? current.sessionFiles : { ...current.sessionFiles, ...sessionFiles },
     };
     return writeManagedStateFile(filePath, next);
-  });
+  }, lockOptions);
 }
 
 export function managedHostsByThreadId(managedThreadIds = []) {
@@ -618,7 +790,8 @@ async function socketCandidates(socketDir, explicitPath, maximum, allowSocketDis
   return filterTrustedSocketPaths(selectSocketCandidates(preferred, discovered, maximum));
 }
 
-async function discoverHost(config) {
+async function discoverHost(config, requiredTools = RECONCILER_TOOLS, options = {}) {
+  throwIfDispatchCancelled(options);
   const candidates = await socketCandidates(
     config.socketDir ?? DEFAULT_SOCKET_DIR,
     process.env.CODEX_APP_TOOLS_PIPE_PATH,
@@ -629,6 +802,7 @@ async function discoverHost(config) {
   const deadline = Date.now() + (config.discoveryTimeoutMs ?? 6000);
 
   for (const socketPath of candidates) {
+    throwIfDispatchCancelled(options);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) break;
     const probeTimeoutMs = Math.max(
@@ -641,12 +815,14 @@ async function discoverHost(config) {
         "tools/list",
         { threadStartKind: "all" },
         probeTimeoutMs,
+        options,
       );
+      throwIfDispatchCancelled(options);
       const tools = Array.isArray(result?.tools) ? result.tools : [];
-      const toolMap = new Map(tools.map((tool) => [tool.name, tool]));
-      if (REQUIRED_TOOLS.every((name) => toolMap.has(name))) {
+      const host = { client, socketPath, toolMap: new Map(tools.map((tool) => [tool.name, tool])) };
+      if (hostHasRequiredTools(host, requiredTools)) {
         promoteClientTimeout(client, config.requestTimeoutMs ?? 15000);
-        return { client, socketPath, toolMap };
+        return host;
       }
     } catch (error) {
       if (failures.length < 8) {
@@ -684,14 +860,19 @@ function parseToolText(result, toolName) {
 }
 
 export class AppTools {
-  constructor(config) {
+  constructor(config, { requiredTools = RECONCILER_TOOLS, discoverHost: discoverHostImpl = discoverHost } = {}) {
     this.config = config;
+    this.requiredTools = [...requiredTools];
+    this.discoverHost = discoverHostImpl;
     this.host = null;
     this.failureCount = 0;
     this.nextConnectAt = 0;
+    this.connectionGeneration = 0;
+    this.connecting = null;
   }
 
-  async connect() {
+  async connect(options = {}) {
+    throwIfDispatchCancelled(options);
     if (this.host != null) return this.host;
     if (Date.now() < this.nextConnectAt) {
       const error = new Error("Codex app tools reconnect is backing off");
@@ -699,8 +880,21 @@ export class AppTools {
       error.retryAfterMs = this.nextConnectAt - Date.now();
       throw error;
     }
+    const generation = this.connectionGeneration;
+    if (this.connecting == null) {
+      this.connecting = this.discoverHost(this.config, this.requiredTools, options)
+        .finally(() => {
+          if (this.connectionGeneration === generation) this.connecting = null;
+        });
+    }
+    let discoveredHost;
     try {
-      this.host = await discoverHost(this.config);
+      discoveredHost = await this.connecting;
+      if (generation !== this.connectionGeneration || isDispatchCancelled(options)) {
+        discoveredHost?.client.close();
+        throw cancellationError();
+      }
+      this.host = discoveredHost;
       this.failureCount = 0;
       this.nextConnectAt = 0;
     } catch (error) {
@@ -726,14 +920,24 @@ export class AppTools {
   }
 
   reset() {
+    this.connectionGeneration += 1;
+    this.connecting = null;
     this.host?.client.close();
     this.host = null;
+  }
+
+  acceptsHost(host) {
+    return hostHasRequiredTools(host, this.requiredTools);
   }
 
   async keepAlive() {
     if (this.host == null) return false;
     try {
-      await keepHostAlive(this.host, this.config.socketKeepAliveTimeoutMs ?? 5000);
+      await keepHostAlive(
+        this.host,
+        this.config.socketKeepAliveTimeoutMs ?? 5000,
+        this.requiredTools,
+      );
       return true;
     } catch (error) {
       this.noteFailure();
@@ -743,8 +947,10 @@ export class AppTools {
     }
   }
 
-  async call(name, args) {
-    const host = await this.connect();
+  async call(name, args, options = {}) {
+    throwIfDispatchCancelled(options);
+    const host = await this.connect(options);
+    throwIfDispatchCancelled(options);
     const tool = host.toolMap.get(name);
     if (tool == null) throw new Error(`Missing Codex app tool: ${name}`);
     try {
@@ -755,7 +961,7 @@ export class AppTools {
         threadId: this.config.actorThreadId,
         tool: tool.name,
         turnId: `sidebar-realtime-${randomUUID()}`,
-      });
+      }, host.client.timeoutMs, options);
     } catch (error) {
       this.noteFailure();
       error.backoffRecorded = true;
@@ -764,23 +970,23 @@ export class AppTools {
     }
   }
 
-  async listThreads() {
+  async listThreads(options = {}) {
     return parseToolText(
-      await this.call("list_threads", { limit: this.config.listLimit }),
+      await this.call("list_threads", { limit: this.config.listLimit }, options),
       "list_threads",
     );
   }
 
-  async moveThread(move) {
+  async moveThread(move, options = {}) {
     const args = { threadId: move.threadId, sectionId: move.sectionId };
     if (move.hostId) args.hostId = move.hostId;
     return assertToolSuccess(
-      await this.call("move_thread_to_sidebar_section", args),
+      await this.call("move_thread_to_sidebar_section", args, options),
       "move_thread_to_sidebar_section",
     );
   }
 
-  async readThread(threadId, hostId) {
+  async readThread(threadId, hostId, options = {}) {
     const args = {
       threadId,
       turnLimit: 1,
@@ -789,22 +995,23 @@ export class AppTools {
     };
     if (hostId) args.hostId = hostId;
     return parseToolText(
-      await this.call("read_thread", args),
+      await this.call("read_thread", args, options),
       "read_thread",
+    );
+  }
+
+  async sendMessageToThread({ threadId, hostId, prompt }, options = {}) {
+    const args = { threadId, prompt };
+    if (hostId) args.hostId = hostId;
+    return assertToolSuccess(
+      await this.call("send_message_to_thread", args, options),
+      "send_message_to_thread",
     );
   }
 }
 
-function exactSection(sections, name) {
-  const matches = sections.filter((section) => section.name === name);
-  if (matches.length !== 1) {
-    throw new Error(`Expected exactly one sidebar section named ${name}; found ${matches.length}`);
-  }
-  return matches[0];
-}
-
 function normalizedStatus(status) {
-  return String(status ?? "").toLowerCase().replaceAll(" ", "");
+  return String(status ?? "").toLowerCase().replace(/[\s_-]+/g, "");
 }
 
 export function normalizedThreadStatus(thread) {
@@ -829,49 +1036,70 @@ function parseThreadItemKey(key) {
 }
 
 export function sidebarMembershipForThread(sections, thread) {
-  let directMembership = null;
-  let projectMembership = null;
+  const directMemberships = [];
+  const projectMemberships = [];
   for (const section of sections ?? []) {
     for (const key of section.itemKeys ?? []) {
       const parsed = parseThreadItemKey(key);
       if (parsed?.threadId === thread.id) {
-        directMembership = {
+        directMemberships.push({
           sectionId: section.sectionId,
           itemKey: key,
-        };
+        });
       }
       if (thread.projectId && key === `codex:project:${thread.projectId}`) {
-        projectMembership = {
+        projectMemberships.push({
           sectionId: section.sectionId,
           itemKey: key,
-        };
+        });
       }
     }
   }
+  const direct = [...new Map(directMemberships.map((item) => [`${item.sectionId}\0${item.itemKey}`, item])).values()];
+  const project = [...new Map(projectMemberships.map((item) => [`${item.sectionId}\0${item.itemKey}`, item])).values()];
+  const directMembership = direct.length === 1 ? direct[0] : null;
+  const projectMembership = project.length === 1 ? project[0] : null;
   if (directMembership == null && projectMembership == null) return null;
   const current = directMembership ?? projectMembership;
   return {
     ...current,
+    ambiguous: direct.length > 1 || project.length > 1,
     viaProject: directMembership == null,
     direct: directMembership,
     project: projectMembership,
+    directMemberships: direct,
+    projectMemberships: project,
   };
 }
 
-export function membershipIsProtected(membership, protectedSectionIds) {
+export function membershipIsProtected(
+  membership,
+  protectedSectionIds,
+  { allowedProjectSectionIds = new Set() } = {},
+) {
   if (membership == null) return false;
-  return [membership.direct?.sectionId, membership.project?.sectionId].some((sectionId) =>
-    protectedSectionIds.has(sectionId),
+  const directProtected = (membership.directMemberships ?? [membership.direct]).some((item) =>
+    item != null &&
+    protectedSectionIds.has(item.sectionId),
+  );
+  if (directProtected) return true;
+  return (membership.projectMemberships ?? [membership.project]).some((item) =>
+    item != null
+    && protectedSectionIds.has(item.sectionId)
+    && !allowedProjectSectionIds.has(item.sectionId),
   );
 }
 
 export function statusFromThreadRead(result) {
   const threadStatus = normalizedThreadStatus(result?.thread);
-  if (threadStatus !== "notloaded" && threadStatus !== "") return threadStatus;
   const turnStatus = normalizedStatus(result?.turns?.[0]?.status);
-  if (["running", "inprogress", "active"].includes(turnStatus)) return "active";
+  if (
+    ["running", "inprogress", "active"].includes(turnStatus)
+    && threadStatus !== "needsattention"
+  ) return "active";
+  if (threadStatus !== "notloaded" && threadStatus !== "") return threadStatus;
   if (turnStatus === "completed") return "completed";
-  if (["failed", "interrupted", "cancelled", "canceled"].includes(turnStatus)) {
+  if (["needsattention", "failed", "interrupted", "cancelled", "canceled"].includes(turnStatus)) {
     return "needsattention";
   }
   return threadStatus;
@@ -879,43 +1107,108 @@ export function statusFromThreadRead(result) {
 
 export async function hydrateCustomThreads(snapshot, config, appTools, knownHosts = new Map()) {
   const threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
-  const threadById = new Map(threads.map((thread) => [thread.id, thread]));
+  const threadsById = new Map();
+  for (const thread of threads) {
+    const candidates = threadsById.get(thread.id) ?? [];
+    candidates.push(thread);
+    threadsById.set(thread.id, candidates);
+  }
   snapshot.hydrationErrors = [];
-  const customSections = (snapshot.sections ?? []).filter((section) =>
-    [config.sections.inProgress, config.sections.forReview].includes(section.name),
-  );
+  const configuredSections = resolveConfiguredSections(snapshot.sections ?? [], config.sections);
+  const customSections = [configuredSections.inProgress, configuredSections.forReview];
+  const projects = (snapshot.sections ?? []).find((section) => section.sectionId === "threads");
+  const pinned = (snapshot.sections ?? []).find((section) => section.sectionId === "pinned");
+  const protectedSectionIds = new Set([
+    pinned?.sectionId,
+    configuredSections.forLater.sectionId,
+  ].filter(Boolean));
+  const allowedProjectSectionIds = new Set([pinned?.sectionId].filter(Boolean));
+  const eligibleProjectSectionIds = new Set([
+    projects?.sectionId,
+    pinned?.sectionId,
+  ].filter(Boolean));
+  const excludedIds = new Set([
+    ...(config.excludeThreadIds ?? []),
+    config.eventWake?.organizerThreadId,
+  ].filter(Boolean));
 
   for (const section of customSections) {
     for (const key of section.itemKeys ?? []) {
       const parsed = parseThreadItemKey(key);
       if (parsed == null) continue;
-      const thread = threadById.get(parsed.threadId);
+      const candidates = threadsById.get(parsed.threadId) ?? [];
+      const thread = candidates.length === 1 ? candidates[0] : null;
       if (thread != null) thread.sidebarItemKey = key;
     }
   }
 
-  const inProgress = exactSection(snapshot.sections ?? [], config.sections.inProgress);
   const reads = [];
-  for (const key of inProgress.itemKeys ?? []) {
-    const parsed = parseThreadItemKey(key);
-    if (parsed == null) continue;
-    const existing = threadById.get(parsed.threadId);
-    const existingStatus = normalizedThreadStatus(existing);
-    if (existing != null && !["notloaded", "active"].includes(existingStatus)) continue;
-    const executionHostId = existing?.hostId ?? knownHosts.get(parsed.threadId);
-    if (typeof executionHostId !== "string" || executionHostId.length === 0) {
-      snapshot.hydrationErrors.push({
-        threadId: parsed.threadId,
-        error: "read_thread skipped because no authoritative hostId is available",
-      });
-      continue;
-    }
+  const scheduledThreadIds = new Set();
+  const scheduleRead = ({ key = null, parsed, existing, executionHostId }) => {
+    scheduledThreadIds.add(parsed.threadId);
     reads.push({
       key,
       parsed,
       existing,
       executionHostId,
       promise: appTools.readThread(parsed.threadId, executionHostId),
+    });
+  };
+  for (const section of customSections) {
+    for (const key of section.itemKeys ?? []) {
+      const parsed = parseThreadItemKey(key);
+      if (parsed == null || scheduledThreadIds.has(parsed.threadId)) continue;
+      const candidates = threadsById.get(parsed.threadId) ?? [];
+      if (candidates.length > 1) {
+        snapshot.hydrationErrors.push({
+          threadId: parsed.threadId,
+          error: "read_thread skipped because threadId is ambiguous across hosts",
+        });
+        continue;
+      }
+      const existing = candidates[0] ?? null;
+      const existingStatus = normalizedThreadStatus(existing);
+      if (existing != null && !["notloaded", "active"].includes(existingStatus)) continue;
+      const executionHostId = existing?.hostId ?? knownHosts.get(parsed.threadId);
+      if (typeof executionHostId !== "string" || executionHostId.length === 0) {
+        snapshot.hydrationErrors.push({
+          threadId: parsed.threadId,
+          error: "read_thread skipped because no authoritative hostId is available",
+        });
+        continue;
+      }
+      scheduleRead({
+        key,
+        parsed,
+        existing,
+        executionHostId,
+      });
+    }
+  }
+
+  for (const thread of threads) {
+    if (
+      thread.kind !== "codex"
+      || thread.archived === true
+      || excludedIds.has(thread.id)
+      || scheduledThreadIds.has(thread.id)
+      || (threadsById.get(thread.id) ?? []).length !== 1
+      || !["notloaded", "active"].includes(normalizedThreadStatus(thread))
+      || typeof thread.hostId !== "string"
+      || thread.hostId.length === 0
+    ) continue;
+    const membership = sidebarMembershipForThread(snapshot.sections ?? [], thread);
+    if (
+      membership == null
+      || membership.ambiguous === true
+      || membership.viaProject !== true
+      || !eligibleProjectSectionIds.has(membership.sectionId)
+      || membershipIsProtected(membership, protectedSectionIds, { allowedProjectSectionIds })
+    ) continue;
+    scheduleRead({
+      parsed: { threadId: thread.id, hostId: thread.hostId },
+      existing: thread,
+      executionHostId: thread.hostId,
     });
   }
 
@@ -931,55 +1224,109 @@ export async function hydrateCustomThreads(snapshot, config, appTools, knownHost
       continue;
     }
     const result = outcome.value;
-    const resolvedHostId = result.thread?.hostId ?? existing?.hostId ?? executionHostId;
-    if (typeof resolvedHostId !== "string" || resolvedHostId.length === 0) {
+    if (
+      result?.thread?.id !== parsed.threadId
+      || result.thread.hostId !== executionHostId
+      || result.thread.kind !== "codex"
+    ) {
       snapshot.hydrationErrors.push({
         threadId: parsed.threadId,
-        error: "read_thread did not return an authoritative hostId",
+        error: "read_thread identity did not match the authoritative task and host",
       });
       continue;
     }
+    const resolvedHostId = executionHostId;
     const hydrated = existing ?? {
-      id: result.thread?.id ?? parsed.threadId,
-      kind: result.thread?.kind ?? "codex",
+      id: parsed.threadId,
+      kind: "codex",
       hostId: resolvedHostId,
       title: result.thread?.title ?? parsed.threadId,
       summary: null,
     };
     hydrated.hostId = resolvedHostId;
-    hydrated.sidebarItemKey = key;
+    if (key != null) hydrated.sidebarItemKey = key;
     hydrated.status = statusFromThreadRead(result);
+    hydrated.archived = result.thread.archived ?? result.thread.isArchived ?? existing?.archived;
     if (existing == null) {
       threads.push(hydrated);
-      threadById.set(hydrated.id, hydrated);
+      threadsById.set(hydrated.id, [hydrated]);
     }
   }
   snapshot.threads = threads;
   return snapshot;
 }
 
+export async function hydrateSnapshotWithActivity(
+  snapshot,
+  managedState,
+  config,
+  appTools,
+  knownHosts = new Map(),
+) {
+  const listedActivity = recordSnapshotActivity(managedState, snapshot);
+  const hydratedSnapshot = await hydrateCustomThreads(snapshot, config, appTools, knownHosts);
+  return {
+    snapshot: hydratedSnapshot,
+    managedState: recordSnapshotActivity(listedActivity, hydratedSnapshot),
+  };
+}
+
 export function planMoves(snapshot, config, managedThreadIds = new Set()) {
   const sections = Array.isArray(snapshot?.sections) ? snapshot.sections : [];
-  const inProgress = exactSection(sections, config.sections.inProgress);
-  const forReview = exactSection(sections, config.sections.forReview);
-  const forLater = exactSection(sections, config.sections.forLater);
+  const { inProgress, forReview, forLater } = resolveConfiguredSections(sections, config.sections);
   const tasks = sections.find((section) => section.sectionId === "chats");
   const projects = sections.find((section) => section.sectionId === "threads");
   const pinned = sections.find((section) => section.sectionId === "pinned");
   if (tasks == null || projects == null || pinned == null) {
     throw new Error("Missing built-in Projects, Tasks, or Pinned section");
   }
-  const excludedIds = new Set(config.excludeThreadIds ?? []);
-  const reviewStatuses = new Set(["idle", "completed", "needsattention", "waiting", "approval"]);
+  const excludedIds = new Set([
+    ...(config.excludeThreadIds ?? []),
+    config.eventWake?.organizerThreadId,
+  ].filter(Boolean));
+  const taskCountsById = new Map();
+  for (const thread of snapshot.threads ?? []) {
+    taskCountsById.set(thread.id, (taskCountsById.get(thread.id) ?? 0) + 1);
+  }
+  const reviewStatuses = new Set([
+    "idle",
+    "completed",
+    "needsattention",
+    "waiting",
+    "approval",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "canceled",
+  ]);
   const moves = [];
+  const eligibleProjectSectionIds = new Set([projects.sectionId, pinned.sectionId]);
+  const allowedProjectSectionIds = new Set([pinned.sectionId]);
 
   for (const thread of snapshot.threads ?? []) {
-    if (thread.kind !== "codex" || !thread.hostId || excludedIds.has(thread.id)) continue;
+    if (
+      thread.kind !== "codex"
+      || !thread.hostId
+      || excludedIds.has(thread.id)
+      || thread.archived === true
+      || thread.isArchived === true
+      || taskCountsById.get(thread.id) !== 1
+    ) continue;
 
     const membership = sidebarMembershipForThread(sections, thread);
+    if (membership?.ambiguous === true) continue;
+    if (
+      (membership?.projectMemberships ?? []).some(
+        ({ sectionId }) => !eligibleProjectSectionIds.has(sectionId),
+      )
+    ) continue;
     const currentSectionId = membership?.sectionId;
     if (currentSectionId == null) continue;
-    if (membershipIsProtected(membership, new Set([pinned.sectionId, forLater.sectionId]))) continue;
+    if (membershipIsProtected(
+      membership,
+      new Set([pinned.sectionId, forLater.sectionId]),
+      { allowedProjectSectionIds },
+    )) continue;
 
     const status = normalizedThreadStatus(thread);
     let destination = null;
@@ -987,7 +1334,7 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
       if (
         currentSectionId === tasks.sectionId ||
         currentSectionId === forReview.sectionId ||
-        (membership.viaProject && currentSectionId === projects.sectionId)
+        (membership.viaProject && eligibleProjectSectionIds.has(currentSectionId))
       ) {
         destination = inProgress;
       }
@@ -996,7 +1343,10 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
       const managed = managedThreadIds.has(identity) || managedThreadIds.has(thread.id);
       if (
         currentSectionId === inProgress.sectionId ||
-        ([tasks.sectionId, projects.sectionId].includes(currentSectionId) && managed)
+        ((
+          currentSectionId === tasks.sectionId
+          || (membership.viaProject && eligibleProjectSectionIds.has(currentSectionId))
+        ) && managed)
       ) {
         destination = forReview;
       }
@@ -1017,7 +1367,7 @@ export function planMoves(snapshot, config, managedThreadIds = new Set()) {
 
 export async function loadConfig(configPath) {
   const parsed = JSON.parse(await readFile(configPath, "utf8"));
-  return {
+  const config = {
     socketDir: DEFAULT_SOCKET_DIR,
     sessionsDir: DEFAULT_SESSIONS_DIR,
     requestTimeoutMs: 15000,
@@ -1032,6 +1382,38 @@ export async function loadConfig(configPath) {
     maxMovesPerRun: 10,
     ...parsed,
   };
+  config.sections = validateSectionNames(config.sections);
+  return config;
+}
+
+export async function confirmPlannedMove(appTools, move, config, managedThreadIds = new Set()) {
+  const knownHosts = managedHostsByThreadId([
+    ...managedThreadIds,
+    managedIdentity(move.hostId, move.threadId),
+  ]);
+  const snapshot = await hydrateCustomThreads(
+    await appTools.listThreads(),
+    config,
+    appTools,
+    knownHosts,
+  );
+  const candidates = (snapshot.threads ?? []).filter((thread) =>
+    thread.id === move.threadId && thread.hostId === move.hostId && thread.kind === "codex",
+  );
+  if (candidates.length !== 1) return null;
+  const latest = await appTools.readThread(move.threadId, move.hostId);
+  if (
+    latest?.thread?.id !== move.threadId
+    || latest.thread.hostId !== move.hostId
+    || latest.thread.kind !== "codex"
+  ) return null;
+  candidates[0].status = statusFromThreadRead(latest);
+  candidates[0].archived = latest.thread.archived ?? latest.thread.isArchived ?? candidates[0].archived;
+  return planMoves(snapshot, config, managedThreadIds).find((candidate) =>
+    candidate.threadId === move.threadId
+    && candidate.hostId === move.hostId
+    && candidate.sectionId === move.sectionId,
+  ) ?? null;
 }
 
 function parseArgs(argv) {
@@ -1130,8 +1512,9 @@ async function main() {
           pendingAdds: pendingStateAdds,
           pendingRemoves: pendingStateRemoves,
         });
-        const snapshot = await hydrateCustomThreads(
+        const hydration = await hydrateSnapshotWithActivity(
           await appTools.listThreads(),
+          managedState,
           config,
           appTools,
           managedHostsByThreadId([
@@ -1139,6 +1522,7 @@ async function main() {
             ...managedState.knownThreadIdentities,
           ]),
         );
+        const snapshot = hydration.snapshot;
         if (snapshot.hydrationErrors?.length > 0) {
           log("warn", "some custom-section tasks could not be refreshed", {
             count: snapshot.hydrationErrors.length,
@@ -1165,7 +1549,7 @@ async function main() {
           });
         }
         const previousManagedIds = new Set(managedState.managedThreadIds);
-        const nextManagedState = recordSnapshotActivity(managedState, snapshot);
+        const nextManagedState = hydration.managedState;
         if (nextManagedState.managedThreadIds.length !== managedState.managedThreadIds.length) {
           managedState = nextManagedState;
           scheduleManagedStateSave({
@@ -1174,24 +1558,39 @@ async function main() {
         }
         const moves = planMoves(snapshot, config, new Set(managedState.managedThreadIds));
         if (options.verbose || moves.length > 0) log("info", "sidebar reconciliation", { reason, moves: moves.length });
+        let appliedMoves = 0;
         for (const move of moves) {
-          if (!options.dryRun) await appTools.moveThread(move);
+          const confirmedMove = await confirmPlannedMove(
+            appTools,
+            move,
+            config,
+            new Set(managedState.managedThreadIds),
+          );
+          if (confirmedMove == null) {
+            log("info", "task move skipped after final validation", {
+              threadId: move.threadId.slice(-8),
+              destination: move.sectionName,
+            });
+            continue;
+          }
+          if (!options.dryRun) await appTools.moveThread(confirmedMove);
+          appliedMoves += 1;
           log(options.dryRun ? "dry-run" : "info", "task moved", {
-            threadId: move.threadId.slice(-8),
-            destination: move.sectionName,
+            threadId: confirmedMove.threadId.slice(-8),
+            destination: confirmedMove.sectionName,
           });
-          if (!options.dryRun && move.sectionName === config.sections.forReview) {
-            const nextState = forgetManagedThread(managedState, move.threadId, move.hostId);
+          if (!options.dryRun && confirmedMove.sectionName === config.sections.forReview) {
+            const nextState = forgetManagedThread(managedState, confirmedMove.threadId, confirmedMove.hostId);
             if (nextState.managedThreadIds.length !== managedState.managedThreadIds.length) {
               managedState = nextState;
-              scheduleManagedStateSave({ remove: [managedIdentity(move.hostId, move.threadId)] });
+              scheduleManagedStateSave({ remove: [managedIdentity(confirmedMove.hostId, confirmedMove.threadId)] });
             }
           }
         }
         await writeHealth(config, {
           state: "ok",
           reason,
-          moves: moves.length,
+          moves: appliedMoves,
           socket: path.basename(appTools.host.socketPath),
         });
         if (moves.length >= config.maxMovesPerRun && backlogTimer == null) {

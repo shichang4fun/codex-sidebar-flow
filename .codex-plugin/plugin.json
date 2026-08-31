@@ -1,7 +1,7 @@
 {
   "name": "codex-sidebar-flow",
-  "version": "0.1.0",
-  "description": "Observe lifecycle identity and reconcile Codex sidebar task state.",
+  "version": "0.3.1",
+  "description": "Keep local and remote Codex task lifecycle state organized in the sidebar.",
   "author": {
     "name": "shichang4fun"
   },
@@ -9,10 +9,10 @@
   "interface": {
     "displayName": "Codex Sidebar Flow",
     "shortDescription": "Keep review and active tasks organized.",
-    "longDescription": "Uses observation-only lifecycle hooks plus deterministic observed-state reconciliation through an experimental macOS Desktop adapter.",
+    "longDescription": "Uses root-agent lifecycle transitions, local Hooks, and bounded recovery to organize Codex tasks across hosts.",
     "developerName": "shichang4fun",
     "category": "Productivity",
-    "capabilities": ["lifecycle observation", "sidebar reconciliation"],
+    "capabilities": ["agent-native lifecycle transitions", "lifecycle observation", "sidebar reconciliation"],
     "websiteURL": "https://github.com/shichang4fun/codex-sidebar-flow",
     "defaultPrompt": [
       "Set up bounded-delay sidebar organization",

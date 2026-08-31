@@ -1,9 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  confirmPlannedMove,
   parseDeclaredSocketPaths,
   planMoves,
   statusFromThreadRead,
@@ -80,6 +92,21 @@ assert.deepEqual(
   ],
 );
 
+for (const status of [
+  "needs-attention",
+  "needs_attention",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "canceled",
+]) {
+  const terminal = thread(`terminal-${status}`, status, "progress");
+  assert.deepEqual(
+    planMoves(snapshot([terminal]), config).map(({ threadId, sectionName }) => [threadId, sectionName]),
+    [[terminal.id, "For Review"]],
+  );
+}
+
 const completedBeforeObservation = thread("completed-before-observation", "completed", "chats");
 assert.deepEqual(
   planMoves(snapshot([completedBeforeObservation]), config, new Set([completedBeforeObservation.id])).map(
@@ -115,7 +142,10 @@ const hydrationSnapshot = snapshot([
 const hydratedSnapshot = await sidebarRealtime.hydrateCustomThreads(hydrationSnapshot, config, {
   readThread: async (threadId) => {
     if (threadId === "unreadable") throw new Error("remote host unavailable");
-    return { thread: { id: threadId, status: { type: "notLoaded" } }, turns: [{ status: "completed" }] };
+    return {
+      thread: { id: threadId, hostId: "local", kind: "codex", status: { type: "notLoaded" } },
+      turns: [{ status: "completed" }],
+    };
   },
 });
 assert.equal(
@@ -210,6 +240,82 @@ assert.deepEqual(
   new Set((await sidebarRealtime.loadManagedState(statePath)).managedThreadIds),
   new Set(["local:task-a", "local:task-b", "local:task-c"]),
 );
+
+const malformedOwnerStatePath = path.join(stateDirectory, "malformed-owner-state.json");
+const malformedOwnerLockPath = `${malformedOwnerStatePath}.lock`;
+const malformedOwnerNow = Date.now();
+await writeFile(
+  malformedOwnerLockPath,
+  `${JSON.stringify({ pid: "not-a-pid", createdAt: malformedOwnerNow + 60_000 })}\n`,
+  { mode: 0o600 },
+);
+const malformedOwnerOldTime = new Date(malformedOwnerNow - 30_001);
+await utimes(malformedOwnerLockPath, malformedOwnerOldTime, malformedOwnerOldTime);
+await sidebarRealtime.updateManagedState(
+  malformedOwnerStatePath,
+  { add: ["local:recovered-malformed-owner"] },
+  { now: () => malformedOwnerNow, attempts: 1, delayMs: 0, staleAfterMs: 30_000 },
+);
+assert.deepEqual(
+  (await sidebarRealtime.loadManagedState(malformedOwnerStatePath)).managedThreadIds,
+  ["local:recovered-malformed-owner"],
+);
+
+const slowStatePath = path.join(stateDirectory, "slow-state.json");
+await sidebarRealtime.saveManagedState(slowStatePath, managedState);
+let releaseSlowOwner;
+let slowOwnerReleased = false;
+let signalSlowOwnerReady;
+const slowOwnerReady = new Promise((resolve) => {
+  signalSlowOwnerReady = resolve;
+});
+const slowOwnerRelease = new Promise((resolve) => {
+  releaseSlowOwner = () => {
+    if (slowOwnerReleased) return;
+    slowOwnerReleased = true;
+    resolve();
+  };
+});
+let firstSlowUpdate = null;
+try {
+  firstSlowUpdate = sidebarRealtime.updateManagedState(
+    slowStatePath,
+    { add: ["local:slow-first"] },
+    {
+      now: () => 100_000,
+      onBeforeRelease: async () => {
+        const firstSnapshot = await readFile(slowStatePath, "utf8");
+        signalSlowOwnerReady();
+        await slowOwnerRelease;
+        await writeFile(slowStatePath, firstSnapshot, { mode: 0o600 });
+      },
+    },
+  );
+  await slowOwnerReady;
+
+  let secondError = null;
+  try {
+    await sidebarRealtime.updateManagedState(
+      slowStatePath,
+      { add: ["local:slow-second"] },
+      { now: () => 130_001, attempts: 1, delayMs: 0, isProcessAlive: () => true },
+    );
+  } catch (error) {
+    secondError = error;
+  }
+
+  releaseSlowOwner();
+  await firstSlowUpdate;
+  assert.equal(secondError?.code, "EEXIST");
+  assert.deepEqual(
+    new Set((await sidebarRealtime.loadManagedState(slowStatePath)).managedThreadIds),
+    new Set(["local:task-a", "local:slow-first"]),
+  );
+} finally {
+  releaseSlowOwner?.();
+  await firstSlowUpdate?.catch(() => {});
+}
+
 const staleForegroundSnapshot = { ...managedState, managedThreadIds: ["local:task-a"] };
 await sidebarRealtime.updateManagedState(statePath, { add: ["local:hook-task"] });
 await sidebarRealtime.saveManagedState(statePath, staleForegroundSnapshot);
@@ -227,6 +333,76 @@ assert.equal(
   JSON.parse(await readFile(statePath, "utf8")).managedThreadIds.includes("local:after-stale-lock"),
   true,
 );
+
+const staleSymlinkTarget = path.join(stateDirectory, "stale-symlink-target.lock");
+await writeFile(
+  staleSymlinkTarget,
+  `${JSON.stringify({ pid: 999_999_999, createdAt: Date.now() - 60_000 })}\n`,
+  { mode: 0o600 },
+);
+await symlink(staleSymlinkTarget, `${statePath}.lock`);
+await assert.rejects(
+  sidebarRealtime.updateManagedState(
+    statePath,
+    { add: ["local:must-not-follow-lock-symlink"] },
+    { attempts: 1, delayMs: 0 },
+  ),
+  (error) => error.code === "EEXIST",
+);
+assert.equal((await lstat(`${statePath}.lock`)).isSymbolicLink(), true);
+assert.match(await readFile(staleSymlinkTarget, "utf8"), /999999999/);
+await rm(`${statePath}.lock`, { force: true });
+
+await writeFile(
+  `${statePath}.lock`,
+  `${JSON.stringify({ pid: 999_999_999, createdAt: Date.now() - 60_000 })}\n`,
+  { mode: 0o600 },
+);
+await assert.rejects(
+  sidebarRealtime.updateManagedState(
+    statePath,
+    { add: ["local:must-not-delete-replacement-lock"] },
+    {
+      attempts: 1,
+      delayMs: 0,
+      onBeforeReclaim: async ({ lockPath }) => {
+        await rm(lockPath, { force: true });
+        await writeFile(lockPath, "replacement\n", { mode: 0o600 });
+      },
+    },
+  ),
+  (error) => error.code === "EEXIST",
+);
+assert.equal(await readFile(`${statePath}.lock`, "utf8"), "replacement\n");
+await rm(`${statePath}.lock`, { force: true });
+
+await sidebarRealtime.updateManagedState(
+  statePath,
+  { add: ["local:release-replacement"] },
+  {
+    onBeforeRelease: async ({ lockPath }) => {
+      await rm(lockPath, { force: true });
+      await writeFile(lockPath, "release replacement\n", { mode: 0o600 });
+    },
+  },
+);
+assert.equal(await readFile(`${statePath}.lock`, "utf8"), "release replacement\n");
+await rm(`${statePath}.lock`, { force: true });
+
+const movedOwnedLock = path.join(stateDirectory, "moved-owned.lock");
+await sidebarRealtime.updateManagedState(
+  statePath,
+  { add: ["local:release-symlink-replacement"] },
+  {
+    onBeforeRelease: async ({ lockPath }) => {
+      await rename(lockPath, movedOwnedLock);
+      await symlink(movedOwnedLock, lockPath);
+    },
+  },
+);
+assert.equal((await lstat(`${statePath}.lock`)).isSymbolicLink(), true);
+assert.match(await readFile(movedOwnedLock, "utf8"), /createdAt/);
+await rm(`${statePath}.lock`, { force: true });
 await sidebarRealtime.updateManagedState(statePath, { observe: ["remote-control:env_remote_test:blocked-prompt"] });
 const observedOnlyState = await sidebarRealtime.loadManagedState(statePath);
 assert.equal(observedOnlyState.knownThreadIdentities.includes("remote-control:env_remote_test:blocked-prompt"), true);
@@ -372,6 +548,18 @@ const remoteProjectMove = planMoves(snapshot([remoteProjectActive]), config)[0];
 assert.equal(remoteProjectMove.sectionName, "In Progress");
 assert.equal(remoteProjectMove.hostId, remoteHostId);
 
+const projectWithDirectCustom = thread("project-direct-custom", "active", "threads", {
+  projectId: "remote-project",
+  projectContainer: true,
+});
+const projectWithDirectCustomSnapshot = snapshot([projectWithDirectCustom]);
+projectWithDirectCustomSnapshot.sections.push({
+  sectionId: "other-custom",
+  name: "Other Custom",
+  itemKeys: [`codex:thread:${remoteHostId}:${projectWithDirectCustom.id}`],
+});
+assert.deepEqual(planMoves(projectWithDirectCustomSnapshot, config), []);
+
 const remoteProjectCompleted = thread("remote-project-completed", "completed", "threads", {
   hostId: remoteHostId,
   projectId: "remote-project",
@@ -386,6 +574,157 @@ assert.equal(
   "For Review",
 );
 
+const remoteProjectHydrationTasks = [
+  thread("remote-project-hydrate-active", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-hydration-project",
+    projectContainer: true,
+  }),
+  thread("remote-project-hydrate-completed", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-hydration-project",
+    projectContainer: true,
+  }),
+  thread("remote-project-hydrate-attention", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-hydration-project",
+    projectContainer: true,
+  }),
+];
+const remoteProjectHydrationCalls = [];
+const remoteProjectHydrated = await sidebarRealtime.hydrateCustomThreads(
+  snapshot(remoteProjectHydrationTasks),
+  config,
+  {
+    readThread: async (threadId, hostId) => {
+      remoteProjectHydrationCalls.push({ threadId, hostId });
+      if (threadId.endsWith("active")) {
+        return {
+          thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+          turns: [{ status: "inProgress" }],
+        };
+      }
+      if (threadId.endsWith("attention")) {
+        return {
+          thread: {
+            id: threadId,
+            hostId,
+            kind: "codex",
+            status: { type: "active", activeFlags: ["waitingOnUserInput"] },
+          },
+          turns: [{ status: "inProgress" }],
+        };
+      }
+      return {
+        thread: { id: threadId, hostId, kind: "codex", status: { type: "notLoaded" } },
+        turns: [{ status: "completed" }],
+      };
+    },
+  },
+);
+assert.deepEqual(
+  remoteProjectHydrationCalls,
+  remoteProjectHydrationTasks.map(({ id }) => ({ threadId: id, hostId: remoteHostId })),
+);
+assert.deepEqual(
+  remoteProjectHydrated.threads.map(({ status }) => status),
+  ["active", "completed", "needsattention"],
+);
+assert.deepEqual(
+  planMoves(
+    remoteProjectHydrated,
+    config,
+    new Set(remoteProjectHydrationTasks.map(({ id }) => managedIdentity(remoteHostId, id))),
+  ).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [
+    ["remote-project-hydrate-active", "In Progress"],
+    ["remote-project-hydrate-completed", "For Review"],
+    ["remote-project-hydrate-attention", "For Review"],
+  ],
+);
+
+const projectTerminalTransition = snapshot([
+  thread("remote-project-transition-completed", "active", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-transition-project",
+    projectContainer: true,
+  }),
+  thread("remote-project-transition-attention", "active", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-transition-project",
+    projectContainer: true,
+  }),
+]);
+const projectTerminalOutcome = await sidebarRealtime.hydrateSnapshotWithActivity(
+  projectTerminalTransition,
+  sidebarRealtime.normalizeManagedState(null, 10_000, 0),
+  config,
+  {
+    readThread: async (threadId, hostId) => threadId.endsWith("attention")
+      ? {
+          thread: {
+            id: threadId,
+            hostId,
+            kind: "codex",
+            status: { type: "active", activeFlags: ["waitingOnApproval"] },
+          },
+          turns: [{ status: "inProgress" }],
+        }
+      : {
+          thread: { id: threadId, hostId, kind: "codex", status: { type: "notLoaded" } },
+          turns: [{ status: "completed" }],
+        },
+  },
+);
+assert.deepEqual(
+  new Set(projectTerminalOutcome.managedState.managedThreadIds),
+  new Set(projectTerminalTransition.threads.map(({ id }) => managedIdentity(remoteHostId, id))),
+);
+assert.deepEqual(
+  planMoves(
+    projectTerminalOutcome.snapshot,
+    config,
+    new Set(projectTerminalOutcome.managedState.managedThreadIds),
+  ).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [
+    ["remote-project-transition-completed", "For Review"],
+    ["remote-project-transition-attention", "For Review"],
+  ],
+);
+
+const pinnedProjectHydration = snapshot([
+  thread("remote-project-pinned", "notLoaded", "threads", {
+    hostId: remoteHostId,
+    projectId: "remote-pinned-project",
+    projectContainer: true,
+  }),
+]);
+pinnedProjectHydration.sections.find((section) => section.sectionId === "threads").itemKeys = [];
+pinnedProjectHydration.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
+  "codex:project:remote-pinned-project",
+);
+const pinnedProjectReads = [];
+const pinnedProjectHydrated = await sidebarRealtime.hydrateCustomThreads(pinnedProjectHydration, config, {
+  readThread: async (threadId, hostId) => {
+    pinnedProjectReads.push({ threadId, hostId });
+    return {
+      thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+      turns: [{ status: "inProgress" }],
+    };
+  },
+});
+assert.deepEqual(pinnedProjectReads, [{ threadId: "remote-project-pinned", hostId: remoteHostId }]);
+assert.deepEqual(
+  planMoves(pinnedProjectHydrated, config).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [["remote-project-pinned", "In Progress"]],
+);
+assert.equal(
+  pinnedProjectHydrated.sections.find((section) => section.sectionId === "pinned").itemKeys.includes(
+    "codex:project:remote-pinned-project",
+  ),
+  true,
+);
+
 const remoteHydrationCalls = [];
 const remoteNotLoaded = thread("remote-not-loaded", "notLoaded", "progress", {
   hostId: remoteHostId,
@@ -394,12 +733,38 @@ const remoteNotLoaded = thread("remote-not-loaded", "notLoaded", "progress", {
 const remoteHydrated = await sidebarRealtime.hydrateCustomThreads(snapshot([remoteNotLoaded]), config, {
   readThread: async (threadId, hostId) => {
     remoteHydrationCalls.push({ threadId, hostId });
-    return { thread: { id: threadId, hostId, status: { type: "notLoaded" } }, turns: [{ status: "completed" }] };
+    return {
+      thread: { id: threadId, hostId, kind: "codex", status: { type: "notLoaded" } },
+      turns: [{ status: "completed" }],
+    };
   },
 });
 assert.deepEqual(remoteHydrationCalls, [{ threadId: remoteNotLoaded.id, hostId: remoteHostId }]);
 assert.equal(remoteHydrated.threads[0].status, "completed");
 assert.equal(planMoves(remoteHydrated, config)[0].hostId, remoteHostId);
+
+const wrongHostHydration = snapshot([thread("wrong-host-hydration", "notLoaded", "progress", {
+  hostId: remoteHostId,
+  sidebarItemKey: "codex:thread:local:wrong-host-hydration",
+})]);
+await sidebarRealtime.hydrateCustomThreads(wrongHostHydration, config, {
+  readThread: async (threadId) => ({
+    thread: { id: threadId, hostId: "local", kind: "codex", status: { type: "completed" } },
+    turns: [{ status: "completed" }],
+  }),
+});
+assert.equal(wrongHostHydration.threads[0].status, "notLoaded");
+assert.match(wrongHostHydration.hydrationErrors[0].error, /identity did not match/);
+
+const reviewNotLoaded = thread("review-not-loaded", "notLoaded", "review", { hostId: remoteHostId });
+const reviewHydrated = await sidebarRealtime.hydrateCustomThreads(snapshot([reviewNotLoaded]), config, {
+  readThread: async (threadId, hostId) => ({
+    thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+    turns: [{ status: "inProgress" }],
+  }),
+});
+assert.equal(reviewHydrated.threads[0].status, "active");
+assert.equal(planMoves(reviewHydrated, config)[0].sectionName, "In Progress");
 
 const remoteMissingFromList = snapshot([]);
 remoteMissingFromList.sections.find((section) => section.sectionId === "progress").itemKeys.push(
@@ -437,16 +802,124 @@ const hostlessHydrated = await sidebarRealtime.hydrateCustomThreads(hostlessMiss
 assert.deepEqual(hostlessCalls, []);
 assert.match(hostlessHydrated.hydrationErrors[0].error, /no authoritative hostId/);
 
+const pinnedParentChild = thread("pinned-parent-child", "idle", "progress", {
+  projectId: "project-pinned",
+});
+const pinnedParentSnapshot = snapshot([pinnedParentChild]);
+pinnedParentSnapshot.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
+  `codex:project:${pinnedParentChild.projectId}`,
+);
+assert.deepEqual(
+  planMoves(pinnedParentSnapshot, config).map(({ threadId, sectionName }) => [threadId, sectionName]),
+  [["pinned-parent-child", "For Review"]],
+);
+
+const laterParentChild = thread("later-parent-child", "idle", "progress", {
+  projectId: "project-later",
+});
+const laterParentSnapshot = snapshot([laterParentChild]);
+laterParentSnapshot.sections.find((section) => section.sectionId === "later").itemKeys.push(
+  `codex:project:${laterParentChild.projectId}`,
+);
+assert.deepEqual(planMoves(laterParentSnapshot, config), []);
+
 for (const protectedSection of ["pinned", "later"]) {
-  const child = thread(`protected-parent-${protectedSection}`, "idle", "progress", {
-    projectId: `project-${protectedSection}`,
-  });
-  const protectedSnapshot = snapshot([child]);
-  protectedSnapshot.sections.find((section) => section.sectionId === protectedSection).itemKeys.push(
-    `codex:project:${child.projectId}`,
-  );
-  assert.deepEqual(planMoves(protectedSnapshot, config), []);
+  for (const status of ["active", "idle"]) {
+    const directProtected = thread(`direct-${protectedSection}-${status}`, status, protectedSection);
+    assert.deepEqual(planMoves(snapshot([directProtected]), config), []);
+  }
 }
+
+for (const [id, status, section] of [
+  ["direct-tasks-custom-parent", "active", "chats"],
+  ["direct-progress-custom-parent", "idle", "progress"],
+  ["direct-review-custom-parent", "active", "review"],
+]) {
+  const child = thread(id, status, section, { projectId: `${id}-parent` });
+  const customParentSnapshot = snapshot([child]);
+  customParentSnapshot.sections.push({
+    sectionId: `${id}-custom`,
+    name: `${id} Custom`,
+    itemKeys: [`codex:project:${child.projectId}`],
+  });
+  assert.deepEqual(planMoves(customParentSnapshot, config), []);
+}
+
+const duplicateDirect = snapshot([thread("duplicate-direct", "active", "chats")]);
+duplicateDirect.sections.find((section) => section.sectionId === "pinned").itemKeys.push(
+  "codex:thread:local:duplicate-direct",
+);
+assert.deepEqual(planMoves(duplicateDirect, config), []);
+
+const duplicateProject = snapshot([thread("duplicate-project", "active", "threads", {
+  projectId: "duplicate-project-parent",
+  projectContainer: true,
+})]);
+duplicateProject.sections.find((section) => section.sectionId === "later").itemKeys.push(
+  "codex:project:duplicate-project-parent",
+);
+assert.deepEqual(planMoves(duplicateProject, config), []);
+
+const duplicateHostId = snapshot([
+  thread("same-id-two-hosts", "active", "chats", { hostId: "local" }),
+  thread("same-id-two-hosts", "active", "chats", { hostId: remoteHostId }),
+]);
+assert.deepEqual(planMoves(duplicateHostId, config), []);
+
+const duplicateSameHostId = snapshot([
+  thread("same-id-same-host", "active", "chats", { hostId: "local" }),
+  thread("same-id-same-host", "active", "chats", { hostId: "local" }),
+]);
+assert.deepEqual(planMoves(duplicateSameHostId, config), []);
+
+assert.throws(
+  () => planMoves(snapshot([]), {
+    ...config,
+    sections: { inProgress: "Pinned", forReview: "For Review", forLater: "For Later" },
+  }),
+  (error) => error.code === "INVALID_SECTION_CONFIG",
+);
+
+const confirmSource = snapshot([thread("confirm-final-read", "active", "chats")]);
+const plannedConfirmation = planMoves(confirmSource, config)[0];
+let finalReads = 0;
+const rejectedConfirmation = await confirmPlannedMove({
+  listThreads: async () => structuredClone(confirmSource),
+  readThread: async (threadId, hostId) => {
+    finalReads += 1;
+    return {
+      thread: { id: threadId, hostId, kind: "codex", status: { type: "idle" } },
+      turns: [{ status: "completed" }],
+    };
+  },
+}, plannedConfirmation, config);
+assert.equal(rejectedConfirmation, null);
+assert.equal(finalReads, 1);
+
+const acceptedConfirmation = await confirmPlannedMove({
+  listThreads: async () => structuredClone(confirmSource),
+  readThread: async (threadId, hostId) => ({
+    thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+    turns: [{ status: "inProgress" }],
+  }),
+}, plannedConfirmation, config);
+assert.deepEqual(acceptedConfirmation, plannedConfirmation);
+
+const customParentConfirmationSource = structuredClone(confirmSource);
+customParentConfirmationSource.threads[0].projectId = "confirm-custom-parent";
+customParentConfirmationSource.sections.push({
+  sectionId: "confirm-custom-parent-section",
+  name: "Confirm Custom Parent",
+  itemKeys: ["codex:project:confirm-custom-parent"],
+});
+const rejectedCustomParentConfirmation = await confirmPlannedMove({
+  listThreads: async () => structuredClone(customParentConfirmationSource),
+  readThread: async (threadId, hostId) => ({
+    thread: { id: threadId, hostId, kind: "codex", status: { type: "active", activeFlags: [] } },
+    turns: [{ status: "inProgress" }],
+  }),
+}, plannedConfirmation, config);
+assert.equal(rejectedCustomParentConfirmation, null);
 
 assert.deepEqual(planMoves(snapshot([thread("remote-active-idempotent", "active", "progress", {
   hostId: remoteHostId,
@@ -479,9 +952,25 @@ assert.equal(
   statusFromThreadRead({ thread: { status: { type: "notLoaded" } }, turns: [{ status: "completed" }] }),
   "completed",
 );
+for (const turnStatus of [
+  "needs-attention",
+  "needs_attention",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "canceled",
+]) {
+  assert.equal(
+    statusFromThreadRead({
+      thread: { status: { type: "notLoaded" } },
+      turns: [{ status: turnStatus }],
+    }),
+    "needsattention",
+  );
+}
 assert.equal(
-  statusFromThreadRead({ thread: { status: { type: "notLoaded" } }, turns: [{ status: "failed" }] }),
-  "needsattention",
+  statusFromThreadRead({ thread: { status: { type: "idle" } }, turns: [{ status: "inProgress" }] }),
+  "active",
 );
 for (const activeFlag of ["waitingOnApproval", "waitingOnUserInput"]) {
   assert.equal(
@@ -499,6 +988,7 @@ const attentionHydrated = await sidebarRealtime.hydrateCustomThreads(snapshot([a
     thread: {
       id: attentionTask.id,
       hostId: "local",
+      kind: "codex",
       status: { type: "active", activeFlags: ["waitingOnApproval"] },
     },
     turns: [{ status: "inProgress" }],
@@ -582,6 +1072,20 @@ await sidebarRealtime.keepHostAlive(
   2_000,
 );
 assert.deepEqual(keepAliveRequests, [["tools/list", { threadStartKind: "all" }, 2_000]]);
+await sidebarRealtime.keepHostAlive(
+  {
+    client: {
+      request: async () => ({
+        tools: [
+          { name: "list_threads" },
+          { name: "read_thread" },
+        ],
+      }),
+    },
+  },
+  2_000,
+  ["list_threads", "read_thread"],
+);
 await assert.rejects(
   sidebarRealtime.keepHostAlive(
     { client: { request: async () => ({ tools: [{ name: "list_threads" }] }) } },
@@ -589,6 +1093,181 @@ await assert.rejects(
   ),
   /required sidebar tools/,
 );
+
+assert.deepEqual(sidebarRealtime.RECONCILER_TOOLS, [
+  "list_threads",
+  "read_thread",
+  "move_thread_to_sidebar_section",
+]);
+
+const reconcilerTools = new sidebarRealtime.AppTools(config);
+assert.deepEqual(reconcilerTools.requiredTools, [
+  "list_threads",
+  "read_thread",
+  "move_thread_to_sidebar_section",
+]);
+
+const observationTools = new sidebarRealtime.AppTools(config, {
+  requiredTools: ["list_threads", "read_thread"],
+});
+assert.deepEqual(observationTools.requiredTools, ["list_threads", "read_thread"]);
+assert.equal(observationTools.requiredTools.includes("move_thread_to_sidebar_section"), false);
+
+const eventHookTools = new sidebarRealtime.AppTools(config, {
+  requiredTools: ["list_threads", "read_thread", "send_message_to_thread"],
+});
+assert.deepEqual(eventHookTools.requiredTools, [
+  "list_threads",
+  "read_thread",
+  "send_message_to_thread",
+]);
+
+const sendMessageCalls = [];
+eventHookTools.call = async (name, args) => {
+  sendMessageCalls.push({ name, args });
+  return { success: true, contentItems: [] };
+};
+await eventHookTools.sendMessageToThread({
+  threadId: "hook-target",
+  hostId: remoteHostId,
+  prompt: "hook prompt",
+});
+assert.deepEqual(sendMessageCalls, [{
+  name: "send_message_to_thread",
+  args: {
+    threadId: "hook-target",
+    hostId: remoteHostId,
+    prompt: "hook prompt",
+  },
+}]);
+
+const moveCalls = [];
+const moveTools = new sidebarRealtime.AppTools(config);
+moveTools.call = async (name, args) => {
+  moveCalls.push({ name, args });
+  return { success: true, contentItems: [] };
+};
+await moveTools.moveThread(mismatchedMove);
+assert.deepEqual(moveCalls, [{
+  name: "move_thread_to_sidebar_section",
+  args: {
+    threadId: mismatchedMove.threadId,
+    hostId: remoteHostId,
+    sectionId: mismatchedMove.sectionId,
+  },
+}]);
+
+{
+  const client = new sidebarRealtime.NativePipeClient("/tmp/not-used.sock", 200);
+  let writes = 0;
+  let logicalNow = 0;
+  client.connect = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    logicalNow = 50;
+    client.socket = {
+      destroyed: false,
+      write(_frame, callback) {
+        writes += 1;
+        callback?.(null);
+      },
+    };
+  };
+  await assert.rejects(
+    client.request("tools/call", { ping: true }, 200, {
+      canDispatch: () => logicalNow < 20,
+    }),
+    (error) => error?.code === "WAKE_DEADLINE",
+  );
+  assert.equal(writes, 0);
+}
+
+{
+  let closedHosts = 0;
+  let sendCalls = 0;
+  const cancellingTools = new sidebarRealtime.AppTools(
+    {
+      ...config,
+      quiet: true,
+      actorThreadId: "hook-actor",
+      socketProbeTimeoutMs: 200,
+      requestTimeoutMs: 200,
+      discoveryTimeoutMs: 200,
+    },
+    {
+      requiredTools: ["list_threads", "read_thread", "send_message_to_thread"],
+      discoverHost: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return {
+          socketPath: "/tmp/fake.sock",
+          toolMap: new Map([
+            ["send_message_to_thread", { name: "send_message_to_thread", namespace: "codex" }],
+          ]),
+          client: {
+            timeoutMs: 200,
+            close() {
+              closedHosts += 1;
+            },
+            async request(method) {
+              if (method === "tools/call") sendCalls += 1;
+              return { success: true, contentItems: [] };
+            },
+          },
+        };
+      },
+    },
+  );
+  const controller = new AbortController();
+
+  try {
+    const pendingSend = cancellingTools.sendMessageToThread(
+      { threadId: "hook-target", hostId: remoteHostId, prompt: "hook prompt" },
+      { signal: controller.signal, canDispatch: () => !controller.signal.aborted },
+    );
+    setTimeout(() => {
+      controller.abort();
+      cancellingTools.reset();
+    }, 10);
+    await assert.rejects(pendingSend, (error) => error?.code === "WAKE_DEADLINE");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(sendCalls, 0);
+    assert.equal(cancellingTools.host, null);
+    assert.equal(closedHosts, 1);
+  } finally {
+    controller.abort();
+  }
+}
+
+const reducedCapabilityHost = {
+  client: { close() {} },
+  toolMap: new Map([
+    ["list_threads", { name: "list_threads", namespace: "codex" }],
+    ["read_thread", { name: "read_thread", namespace: "codex" }],
+  ]),
+};
+assert.equal(typeof observationTools.acceptsHost, "function");
+assert.equal(observationTools.acceptsHost(reducedCapabilityHost), true);
+assert.equal(reconcilerTools.acceptsHost(reducedCapabilityHost), false);
+
+const keepAliveObserver = new sidebarRealtime.AppTools(
+  { ...config, socketKeepAliveTimeoutMs: 250, quiet: true },
+  { requiredTools: ["list_threads", "read_thread"] },
+);
+let keepAliveClosed = 0;
+keepAliveObserver.host = {
+  socketPath: "/tmp/reduced.sock",
+  toolMap: reducedCapabilityHost.toolMap,
+  client: {
+    close() {
+      keepAliveClosed += 1;
+    },
+    request: async () => ({
+      tools: [{ name: "list_threads" }],
+    }),
+  },
+};
+await assert.rejects(keepAliveObserver.keepAlive(), /required sidebar tools/);
+assert.equal(keepAliveClosed, 1);
+assert.equal(keepAliveObserver.host, null);
 
 assert.equal(typeof sidebarRealtime.createEventScheduler, "function");
 const scheduledReasons = [];

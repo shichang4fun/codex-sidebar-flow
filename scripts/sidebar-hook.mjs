@@ -40,7 +40,7 @@ const DEFAULT_ATTEMPTS = 2;
 const MAX_HYDRATION_HOST_CANDIDATES = 8;
 const OBSERVATION_REQUIRED_TOOLS = ["list_threads", "read_thread"];
 const STOP_REQUIRED_TOOLS = ["list_threads", "read_thread", "move_thread_to_sidebar_section"];
-const EVENT_WAKE_REQUIRED_TOOLS = ["list_threads", "read_thread", "send_message_to_thread"];
+const EVENT_WAKE_REQUIRED_TOOLS = ["send_message_to_thread"];
 const MAX_LOG_BYTES = 1024 * 1024;
 const LIFECYCLE_ID_PATTERN = /^[A-Za-z0-9:_-]{1,256}$/;
 
@@ -647,7 +647,7 @@ export async function handleHook(
       now,
     }).catch(() => false);
   } else if (probeClaim.status === "claimed") {
-    const probeTools = createAppTools(config, { requiredTools: OBSERVATION_REQUIRED_TOOLS });
+    const probeTools = createAppTools(config, { requiredTools: EVENT_WAKE_REQUIRED_TOOLS });
     try {
       const present = await inspectCapability(probeTools, deadlineAt, now);
       const status = present ? "present" : "missing";

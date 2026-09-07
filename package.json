@@ -1,12 +1,13 @@
 {
   "name": "codex-sidebar-flow",
-  "version": "0.3.1",
-  "description": "Agent-assisted multi-host Codex Desktop sidebar lifecycle organization.",
+  "version": "0.4.0-beta.1",
+  "description": "Experimental local event-driven Codex Desktop sidebar organization, with separate legacy Hook tools.",
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test",
-    "check": "node --check scripts/runtime-integrity.mjs && node --check scripts/sidebar-agent-context.mjs && node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs && node --check scripts/render-heartbeat.mjs && node --check scripts/event-wake.mjs && sh -n scripts/plugin-hook.sh"
+    "check:desktop": "node --check experimental/desktop-proxy-config.mjs && node --check experimental/desktop-observer-manager.mjs && node --check scripts/install-desktop-proxy.mjs && node --check scripts/launch-desktop-proxy.mjs && node --check scripts/desktop-proxy-lock.mjs",
+    "check": "node --check scripts/runtime-integrity.mjs && node --check scripts/sidebar-agent-context.mjs && node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs && node --check scripts/render-heartbeat.mjs && node --check scripts/event-wake.mjs && node --check experimental/app-server-observer.mjs && node --check experimental/stdio-relay.mjs && node --check experimental/desktop-mcp-adapter.mjs && node --check experimental/stdio-observer-proxy.mjs && sh -n scripts/plugin-hook.sh"
   },
   "license": "MIT",
   "repository": {

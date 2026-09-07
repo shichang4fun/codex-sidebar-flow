@@ -45,8 +45,8 @@ if (configPath != null && barrierDirectory != null) {
         };
       },
       createAppTools(_config, options) {
-        if ((options?.requiredTools ?? []).includes("send_message_to_thread")) {
-          return { reset() {} };
+        if (JSON.stringify(options?.requiredTools) !== JSON.stringify(["send_message_to_thread"])) {
+          throw new Error("unexpected event-wake tool requirements");
         }
         return {
           async connect() {

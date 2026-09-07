@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0-beta.1] - 2026-09-07
+
+### Added
+
+- Opt-in macOS Desktop stdio proxy that observes structured lifecycle events and uses native Desktop list/read/move tools without sorting model turns, Hooks or heartbeat.
+- Local-only automatic discovery, explicit allowlist/exclusions, hot disable, serialized/coalesced events, final state validation and fail-closed protection for manual sections, Projects and remote tasks.
+- Private content-hashed installation, dedicated app/command launcher, attachment diagnostics, stale-lock recovery and standalone recoverable uninstall.
+- Protocol, Unicode framing, lifecycle, burst, installer and launcher regression tests; optional isolated real App Server tests; Node 20/22/24 CI.
+
+### Fixed during independent review
+
+- Reject fresh Project membership even when an earlier list snapshot classified the task as non-Project.
+- Stop observer injection on client EOF while preserving pending Desktop request mappings and draining final server output.
+
+### Release scope
+
+- Prerelease only. Use the dedicated launcher on every start; the original app icon bypasses the proxy. Plugin enablement and the legacy setup command do not install the proxy.
+- Start/completion movement was observed on two real local Desktop tasks. A third ordinary task, repeat normal launch, and real approval/cancellation UI acceptance remain unverified.
+- Remote and Project tasks are not supported by this new path. No periodic reconciliation, atomic move guarantee or latency SLA is provided. Existing legacy mechanisms must be disabled separately before migration.
+
+## [0.3.2] - 2026-08-31
+
+### Fixed
+
+- Route remote lifecycle events to the controlling Mac without a host override, then resolve the unique task ID to the controller-visible `remote-control:*` host before any read or move.
+- Disable remote self-moves in controller-bridge mode so remote Hooks cannot update only the remote machine's local sidebar database and falsely appear centrally reconciled.
+- Keep host-bound event wake available as an explicit compatibility mode and fail closed on route/envelope mismatches or duplicate cross-host task IDs.
+
 ## [0.3.1] - 2026-08-31
 
 ### Fixed

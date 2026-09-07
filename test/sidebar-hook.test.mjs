@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { lstat, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -115,6 +115,136 @@ function snapshot({ hostId = "local", kind = "codex", includeThread = true } = {
     threads: includeThread ? [{ id: "thread-1", hostId, kind, status: "idle" }] : [],
     sections: [],
   };
+}
+
+{
+  const bridgeConfig = {
+    ...config,
+    eventWake: {
+      ...eventWakeConfig,
+      organizerHostId: null,
+      routingMode: "controller-bridge",
+    },
+  };
+  for (const event of ["UserPromptSubmit", "Stop"]) {
+    const waits = [];
+    const result = await executeHookEvent(
+      { session_id: "thread-1", hook_event_name: event, host_id: "local" },
+      bridgeConfig,
+      {
+        createAppTools() {
+          assert.fail("controller bridge must not read or mutate the remote sidebar");
+        },
+        wait: async (delayMs) => waits.push(delayMs),
+      },
+    );
+    assert.deepEqual(result.eventEnvelope, {
+      protocol: "codex-sidebar-flow/bridge-v1",
+      event,
+      threadId: "thread-1",
+    });
+    assert.equal(result.attempts, 0);
+    assert.deepEqual(result.moves, []);
+    assert.deepEqual(result.observedIdentities, []);
+    assert.deepEqual(waits, event === "Stop" ? [3000] : []);
+  }
+  assert.equal(
+    buildAgentSelfMoveHookOutput(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      bridgeConfig,
+    ),
+    null,
+  );
+
+  const dormantBridgeConfig = {
+    ...bridgeConfig,
+    eventWake: { ...bridgeConfig.eventWake, enabled: false },
+  };
+  for (const event of ["UserPromptSubmit", "Stop"]) {
+    const dormant = await executeHookEvent(
+      { session_id: "thread-1", hook_event_name: event },
+      dormantBridgeConfig,
+      {
+        createAppTools: () => assert.fail("dormant controller bridge must not access the remote sidebar"),
+        wait: async () => assert.fail("dormant controller bridge must not delay or dispatch"),
+      },
+    );
+    assert.equal(dormant.eventEnvelope, null);
+    assert.deepEqual(dormant.moves, []);
+    assert.equal(dormant.attempts, 0);
+  }
+  assert.equal(
+    buildAgentSelfMoveHookOutput(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      dormantBridgeConfig,
+    ),
+    null,
+  );
+
+  const invalidRoute = await executeHookEvent(
+    { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+    { ...bridgeConfig, eventWake: { ...bridgeConfig.eventWake, routingMode: "invalid" } },
+    { createAppTools: () => assert.fail("invalid routing must fail closed") },
+  );
+  assert.equal(invalidRoute.eventEnvelope, null);
+  assert.deepEqual(invalidRoute.moves, []);
+}
+
+{
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-bridge-wiring-"));
+  const runtime = path.join(codexHome, "sidebar-flow");
+  const configPath = path.join(runtime, "config.json");
+  const previousMode = process.env[INSTALL_MODE_ENV];
+  process.env[INSTALL_MODE_ENV] = "source";
+  const sendCalls = [];
+  let appToolsCreations = 0;
+  try {
+    await mkdir(runtime, { recursive: true });
+    await writeJsonAtomic(configPath, {
+      ...runtimeDefaultConfig(codexHome, "source"),
+      excludeThreadIds: ["organizer-thread"],
+      agentTransitions: { enabled: false },
+      eventWake: {
+        enabled: true,
+        organizerThreadId: "organizer-thread",
+        organizerHostId: null,
+        routingMode: "controller-bridge",
+        maxPerMinute: 20,
+      },
+    });
+
+    const output = await handleHook(
+      { session_id: "thread-1", hook_event_name: "UserPromptSubmit" },
+      configPath,
+      {
+        claimProbe: async () => ({ status: "missing" }),
+        loadState: async () => ({ managedThreadIds: [] }),
+        updateManaged: async () => {},
+        createAppTools(_runtimeConfig, options) {
+          appToolsCreations += 1;
+          assert.deepEqual(options.requiredTools, ["send_message_to_thread"]);
+          return {
+            async sendMessageToThread(args) {
+              sendCalls.push(args);
+            },
+            reset() {},
+          };
+        },
+      },
+    );
+
+    assert.equal(output, null);
+    assert.equal(appToolsCreations, 1);
+    assert.equal(sendCalls.length, 1);
+    assert.deepEqual(Object.keys(sendCalls[0]).sort(), ["prompt", "threadId"]);
+    assert.equal(sendCalls[0].threadId, "organizer-thread");
+    assert.equal(Object.hasOwn(sendCalls[0], "hostId"), false);
+    assert.match(sendCalls[0].prompt, /codex-sidebar-flow\/bridge-v1/);
+  } finally {
+    if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
+    else process.env[INSTALL_MODE_ENV] = previousMode;
+    await rm(codexHome, { recursive: true, force: true });
+  }
 }
 
 assert.deepEqual(
@@ -1759,7 +1889,7 @@ for (const event of ["UserPromptSubmit"]) {
         async updateManaged() {},
       },
     );
-    assert.deepEqual(capturedRequiredTools, ["list_threads", "read_thread", "send_message_to_thread"]);
+    assert.deepEqual(capturedRequiredTools, ["send_message_to_thread"]);
     await rm(codexHome, { recursive: true, force: true });
   } finally {
     if (previousMode == null) delete process.env[INSTALL_MODE_ENV];
@@ -2026,7 +2156,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
         };
       },
       createAppTools(_config, options) {
-        if ((options?.requiredTools ?? []).includes("send_message_to_thread")) return { reset() {} };
+        assert.deepEqual(options?.requiredTools, ["send_message_to_thread"]);
         return {
           async connect() {
             connectionAttempts += 1;
@@ -2263,7 +2393,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
           };
         },
         createAppTools(_config, options) {
-          if ((options?.requiredTools ?? []).includes("send_message_to_thread")) return { reset() {} };
+          assert.deepEqual(options?.requiredTools, ["send_message_to_thread"]);
           return {
             async connect() {
               throw new Error("expired invalid probe result must not inspect capability");
@@ -2371,7 +2501,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
           return outcome;
         },
         createAppTools(_config, options) {
-          if ((options?.requiredTools ?? []).includes("send_message_to_thread")) return { reset() {} };
+          assert.deepEqual(options?.requiredTools, ["send_message_to_thread"]);
           return {
             async connect() {
               toolsListCalls += 1;
@@ -2487,9 +2617,7 @@ for (const [capabilityPresent, expectedStatus] of [[true, "present"], [false, "m
         };
       },
       createAppTools(_config, options) {
-        if ((options?.requiredTools ?? []).includes("send_message_to_thread")) {
-          return { reset() {} };
-        }
+        assert.deepEqual(options?.requiredTools, ["send_message_to_thread"]);
         return {
           async connect() {
             probeConnections += 1;

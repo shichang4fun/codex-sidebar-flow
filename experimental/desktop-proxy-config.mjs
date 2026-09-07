@@ -10,8 +10,11 @@ export function validateProxyConfig(value) {
     throw Error('Explicit desktop proxy mode required');
   }
   const threadIds = ids(value.threadIds), excludedThreadIds = ids(value.excludedThreadIds);
+  const reconcileIntervalSeconds = value.reconcileIntervalSeconds === undefined ? 60 : value.reconcileIntervalSeconds;
+  if (!Number.isInteger(reconcileIntervalSeconds) || (reconcileIntervalSeconds !== 0
+      && (reconcileIntervalSeconds < 15 || reconcileIntervalSeconds > 3600))) throw Error('Invalid reconciliation interval');
   if (value.mode === 'allowlist' && threadIds.length === 0) throw Error('Empty allowlist');
-  return { version: 1, mode: value.mode, threadIds, excludedThreadIds };
+  return { version: 1, mode: value.mode, threadIds, excludedThreadIds, reconcileIntervalSeconds };
 }
 
 export function isManagedTask(config, id) {

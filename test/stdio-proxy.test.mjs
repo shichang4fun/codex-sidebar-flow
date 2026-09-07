@@ -2,7 +2,39 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { once } from 'node:events';
 const script = fileURLToPath(new URL('../experimental/stdio-observer-proxy.mjs', import.meta.url));
+test('installed-mode proxy starts compensation without lifecycle events or model turns', { timeout: 12000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'sidebar-timer-'));
+  const config = join(root, 'config.json');
+  await writeFile(config, JSON.stringify({ version: 1, mode: 'all-local' }));
+  const server = `require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+    const m = JSON.parse(line);
+    if (!['initialize', 'thread/loaded/list'].includes(m.method)) process.exit(9);
+    process.stdout.write(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:{data:[],nextCursor:null}})+'\\n');
+  });`;
+  const child = spawn(process.execPath, [script, '-e', server, 'app-server'], {
+    env: { ...process.env, SIDEBAR_FLOW_REAL_CODEX: process.execPath, SIDEBAR_FLOW_CONFIG_FILE: config },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(async () => { child.kill(); child.stdin.destroy(); await rm(root, { recursive: true, force: true }); });
+  child.stdout.resume();
+  const diagnostic = new Promise((resolve, reject) => {
+    let stderr = '';
+    child.once('error', reject); child.once('close', () => reject(Error('No timer diagnostic before exit')));
+    child.stderr.setEncoding('utf8').on('data', chunk => {
+      stderr += chunk;
+      if (stderr.includes('no-native-context')) resolve(stderr);
+    });
+  });
+  child.stdin.write(JSON.stringify({ id: 1, method: 'initialize' }) + '\n');
+  assert.match(await diagnostic, /reconciliation/);
+  const closed = once(child, 'close'); child.stdin.end();
+  assert.equal((await closed)[0], 0);
+});
 test('CLI proxy drains final server responses after client EOF', () => {
   const server = `let input = ''; process.stdin.setEncoding('utf8');
     process.stdin.on('data', chunk => { input += chunk; });

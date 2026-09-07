@@ -1,5 +1,8 @@
 # Local Desktop proxy (v0.4.0-beta.1)
 
+This page describes the published beta. For the unpublished local compensation
+addition in this checkout, see [periodic compensation](local-compensation.md).
+
 This opt-in path observes the original Desktop App Server stdio stream and calls
 the native `codex_app` read/move tools. It does not start model turns for sorting,
 scan conversation files, change the signed app, install Hooks, or require a

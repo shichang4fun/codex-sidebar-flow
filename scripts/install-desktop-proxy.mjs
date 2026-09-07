@@ -13,6 +13,7 @@ const sourceRoot = fileURLToPath(new URL('../', import.meta.url));
 const files = ['experimental/stdio-observer-proxy.mjs', 'experimental/stdio-relay.mjs',
   'experimental/app-server-observer.mjs', 'experimental/desktop-mcp-adapter.mjs',
   'experimental/desktop-proxy-config.mjs', 'experimental/desktop-observer-manager.mjs',
+  'experimental/desktop-reconciliation-timer.mjs',
   'scripts/sidebar-policy.mjs', 'scripts/launch-desktop-proxy.mjs', 'scripts/desktop-proxy-lock.mjs',
   'scripts/install-desktop-proxy.mjs'];
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;

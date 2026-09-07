@@ -83,6 +83,18 @@ test('attention maps to review without treating arbitrary idle tasks as complete
   assert.equal((await f.observer.handle(event())).sectionId, 'review');
 });
 
+test('snapshot reconciliation repairs missed starts and stops without fabricating start evidence', async () => {
+  const f = fixture({ apply: true });
+  assert.equal(await typeof f.observer.reconcile, 'function');
+  assert.equal((await f.observer.reconcile('test-thread')).sectionId, 'progress');
+  const restarted = fixture({ apply: true, thread: task({ type: 'idle' }, sections[0]) });
+  assert.equal((await restarted.observer.reconcile('test-thread')).sectionId, 'review');
+  assert.equal((await restarted.observer.reconcile('test-thread')).action, 'skipped');
+  const idle = fixture({ apply: true, thread: task({ type: 'idle' }, null) });
+  assert.equal((await idle.observer.reconcile('test-thread')).action, 'skipped');
+  assert.equal(idle.calls.some(c => c.method.endsWith('/move')), false);
+});
+
 test('duplicate sections and missing opt-in reject safely', async () => {
   assert.throws(() => api.createObserver({}, {}));
   const o = api.createObserver({ async request() { return { data: [...sections, sections[0]] }; } }, { threadIds: ['test-thread'], apply: true });

@@ -1,5 +1,8 @@
 # Codex Sidebar Flow
 
+This local checkout includes an unpublished [periodic compensation patch](docs/local-compensation.md)
+on top of v0.4.0-beta.1. The published beta tag has not been changed.
+
 ## v0.4.0-beta.1: local event-driven Desktop proxy
 
 An opt-in macOS launcher observes structured App Server events and uses native

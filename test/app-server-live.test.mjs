@@ -150,6 +150,8 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
   });
   // Reading is non-mutating. Do not resume or start a copy through the observer.
   await watcher.request('thread/read', { threadId: thread.id });
+  const loaded = await watcher.request('thread/loaded/list', { limit: 1000 });
+  assert.ok(loaded.data.includes(thread.id), 'Read-only loaded task discovery supplies a context without starting another turn');
   await actor.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: 'Say OK', text_elements: [] }] });
   let timer;
   await Promise.race([done, new Promise(resolve => { timer = setTimeout(resolve, 12000); })]);
@@ -161,6 +163,10 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
   assert.ok(outcomes.some(r => r.action === 'moved' && r.sectionId === sections['For Review'].id));
   const final = await actor.request('thread/read', { threadId: thread.id });
   assert.equal(final.thread.section?.id, sections['For Review'].id);
+  // Simulate a missed terminal event in this isolated server, not the user's Desktop.
+  await actor.request('thread/section/move', { threadId: thread.id, sectionId: sections['In Progress'].id });
+  const restartedObserver = createObserver(watcher, { threadIds: [thread.id], apply: true });
+  assert.equal((await restartedObserver.reconcile(thread.id)).sectionId, sections['For Review'].id);
   const mcpResults = await Promise.all(mcpCalls);
   const markers = mcpResults.map(r => JSON.parse(r.content[0].text).marker);
   assert.ok(markers.includes('active'));

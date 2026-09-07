@@ -8,6 +8,7 @@ import { createStdioRelay } from './stdio-relay.mjs';
 import { createObserver } from './app-server-observer.mjs';
 import { desktopMcpAdapter } from './desktop-mcp-adapter.mjs';
 import { createDesktopObserverManager } from './desktop-observer-manager.mjs';
+import { startReconciliation } from './desktop-reconciliation-timer.mjs';
 
 // JSONL is delimited by ASCII LF, not Unicode line/paragraph separators.
 // Node readline also splits those valid JSON string characters in this runtime.
@@ -87,6 +88,9 @@ function main() {
     readConfig: () => JSON.parse(readFileSync(configFile, 'utf8')),
   }) : null;
   const log = value => process.stderr.write(JSON.stringify({ sidebarFlow: value }) + '\n');
+  const stopReconciliation = manager ? startReconciliation(manager, {
+    readConfig: () => JSON.parse(readFileSync(configFile, 'utf8')), log,
+  }) : () => {};
   relay.subscribe(message => {
     if (manager) {
       return manager.handle(message).then(result => {
@@ -108,10 +112,10 @@ function main() {
     try { message = JSON.parse(line); } catch { process.stdout.write(line + '\n'); return; }
     relay.fromServer(message);
   });
-  incoming.once('end', () => { relay.stopObserving(); child.stdin.end(); });
-  child.stdin.on('error', () => relay.stopObserving());
-  process.stdout.on('error', () => { relay.close(); child.kill(); });
-  child.once('close', () => { relay.close(); stopIncoming(); stopOutgoing(); });
+  incoming.once('end', () => { stopReconciliation(); relay.stopObserving(); child.stdin.end(); });
+  child.stdin.on('error', () => { stopReconciliation(); relay.stopObserving(); });
+  process.stdout.on('error', () => { stopReconciliation(); relay.close(); child.kill(); });
+  child.once('close', () => { stopReconciliation(); relay.close(); stopIncoming(); stopOutgoing(); });
 }
 
 try { main(); }

@@ -103,19 +103,17 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
     return null;
   }
 
-  async function reconcile(message) {
-    const id = message.method === 'thread/started' ? message.params?.thread?.id : message.params?.threadId;
-    if (!['thread/status/changed', 'thread/started', 'turn/started', 'turn/completed'].includes(message.method)
-        || !allowed.has(id)) return { action: 'skipped' };
+  async function reconcile(id, message = null) {
+    if (!allowed.has(id)) return { action: 'skipped' };
     const result = await rpc.request('threadSection/list');
     const sections = resolveConfiguredSections(result.data?.map(s => ({ sectionId: s.id, name: s.name })), names);
     const read = async () => (await rpc.request('thread/read', { threadId: id, includeTurns: false })).thread;
     const thread = await read();
     // Only these messages from the connected server are activity evidence, never
     // user text. Preserve a short turn's start even if the current read is idle.
-    const eventStatus = message.method === 'thread/status/changed' ? message.params?.status
-      : message.method === 'thread/started' ? message.params?.thread?.status : null;
-    if (eligible(thread, id, sections) && (message.method === 'turn/started' || (eventStatus?.type === 'active'
+    const eventStatus = message?.method === 'thread/status/changed' ? message.params?.status
+      : message?.method === 'thread/started' ? message.params?.thread?.status : null;
+    if (eligible(thread, id, sections) && (message?.method === 'turn/started' || (eventStatus?.type === 'active'
         && Array.isArray(eventStatus.activeFlags)
         && eventStatus.activeFlags.every(f => ['waitingOnApproval', 'waitingOnUserInput'].includes(f))))) activeSeen.add(id);
     const target = destination(thread, id, sections);
@@ -135,7 +133,17 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
   }
   return {
     handle(message) {
-      const result = queue.then(() => reconcile(message));
+      if (!['thread/status/changed', 'thread/started', 'turn/started', 'turn/completed'].includes(message.method)) {
+        return Promise.resolve({ action: 'skipped' });
+      }
+      const id = message.method === 'thread/started' ? message.params?.thread?.id : message.params?.threadId;
+      const result = queue.then(() => reconcile(id, message));
+      queue = result.catch(() => {});
+      return result;
+    },
+    // Explicit snapshot path: never invent a lifecycle event or start evidence.
+    reconcile(id) {
+      const result = queue.then(() => reconcile(id));
       queue = result.catch(() => {});
       return result;
     },

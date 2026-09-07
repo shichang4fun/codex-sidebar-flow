@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0-beta.1+local.reconcile] - Unpublished local patch
+
+- Add deterministic compensation inside the existing proxy: first check after five seconds, then sixty seconds after each completed check. No model heartbeat or separate daemon.
+- Discover loaded App Server contexts without starting/resuming tasks; keep executor context separate from the repair target so unloaded targets can be read through native Desktop tools.
+- Rotate bounded batches through eligible tasks in the native recent-50 snapshot, using the shared write queue and current identity/status/protection checks. Ordinary idle Tasks are not treated as completed work.
+- Support hot interval configuration and disable, sanitized diagnostics, EOF cleanup, context isolation and missed-event regression tests.
+- Existing installations require a normal relaunch through the dedicated entry to load the new immutable runtime. This patch does not republish the beta tag.
+
 ## [0.4.0-beta.1] - 2026-09-07
 
 ### Added

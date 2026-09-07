@@ -1,10 +1,12 @@
 // Translate the prototype's small RPC surface into official, thread-scoped MCP
 // calls. Desktop owns logical section IDs and invalidation. Never forge _meta.
-export function desktopMcpAdapter(rpc, threadId) {
-  if (typeof threadId !== 'string' || !threadId) throw Error('Explicit task identity required');
+export function desktopMcpAdapter(rpc, threadId, { contextThreadId = threadId } = {}) {
+  if ([threadId, contextThreadId].some(id => typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id))) {
+    throw Error('Explicit task identity required');
+  }
   async function call(tool, args) {
     const result = await rpc.request('mcpServer/tool/call', {
-      threadId, server: 'codex_app', tool, arguments: args,
+      threadId: contextThreadId, server: 'codex_app', tool, arguments: args,
     });
     if (!result || result.isError === true) throw Error('Desktop MCP tool failed');
     const text = result.content?.filter(item => item.type === 'text');
@@ -18,18 +20,27 @@ export function desktopMcpAdapter(rpc, threadId) {
         || data.unavailableSources?.length) throw Error('Incomplete Desktop snapshot');
     return data;
   }
-  function identity(data) {
-    const matches = [...data.threads, ...data.pinnedThreads].filter(t => t.id === threadId);
+  function identity(data, id = threadId) {
+    const matches = [...data.threads, ...data.pinnedThreads].filter(t => t.id === id);
     const t = matches[0];
     if (matches.length !== 1 || t.kind !== 'codex' || t.hostId !== 'local'
         || t.projectId !== null || t.archived || t.isArchived) throw Error('Ineligible local task');
     const memberships = data.sections.flatMap(s => (s.itemKeys ?? []).filter(k =>
-      typeof k === 'string' && k.startsWith('codex:thread:') && k.endsWith(`:${threadId}`),
+      typeof k === 'string' && k.startsWith('codex:thread:') && k.endsWith(`:${id}`),
     ).map(() => s));
     if (memberships.length !== 1) throw Error('Ambiguous or missing task membership');
     return { task: t, section: memberships[0] };
   }
   return {
+    async candidates() {
+      const data = await snapshot();
+      return data.threads.slice(0, 50).flatMap(t => {
+        try {
+          const { section } = identity(data, t.id);
+          return section.sectionId === 'chats' || ['In Progress', 'For Review'].includes(section.name) ? [t.id] : [];
+        } catch { return []; }
+      });
+    },
     async request(method, params = {}) {
       if (!['threadSection/list', 'thread/read', 'thread/section/move'].includes(method)) throw Error('Unsupported adapter method');
       if (method !== 'threadSection/list' && params.threadId !== threadId) throw Error('Cross-task operation forbidden');

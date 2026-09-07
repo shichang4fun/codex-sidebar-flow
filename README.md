@@ -1,5 +1,24 @@
 # Codex Sidebar Flow
 
+## v0.4.0-beta.1: local event-driven Desktop proxy
+
+An opt-in macOS launcher observes structured App Server events and uses native
+Desktop tools to move eligible local tasks between In Progress and For Review.
+No sorting model turns, Hooks or heartbeat are required by this path.
+
+**Start here: [installation, scope, privacy and rollback](docs/local-desktop-proxy.md).**
+Use the dedicated launcher every time: the original Codex icon bypasses the proxy.
+Remote tasks, Project tasks, Pinned and For Later are not managed by this beta.
+Real Desktop start/completion movement has been observed on two local tasks;
+this is not a stable release or a guarantee of instantaneous/lossless delivery.
+See [protocol research and verification boundaries](docs/local-official-api-prototype.md).
+
+The plugin manifest and `scripts/setup.mjs` still install the **legacy Hook path**,
+not the new proxy. Do not run both mechanisms against the same tasks. Follow the
+proxy guide's migration section before enabling it on an existing installation.
+
+## Legacy v0.3.x Hook/controller integration
+
 Codex Sidebar Flow v0.3.2 adds an experimental controller-host bridge for multi-host near-realtime organization on compatible Codex Desktop builds. A remote lifecycle Hook sends only a strict `{ protocol, event, threadId }` wake hint without a destination `hostId`; the organizer running on the controlling Mac resolves the unique controller-visible task, its real `remote-control:*` host, and the controlling Mac's section IDs before any move. A recurring heartbeat repairs missed or interrupted transitions. Classification never follows task content.
 
 > [!WARNING]

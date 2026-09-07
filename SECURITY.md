@@ -2,7 +2,27 @@
 
 Only the latest experimental release is supported.
 
-## Trust boundary
+## Local Desktop proxy (v0.4 beta)
+
+The opt-in proxy is a trusted CLI wrapper with access to the original App Server
+stream, including prompts/results. It forwards that stream without persisting
+conversation content; classification uses structured metadata only. It adds no
+TCP listener, external backend, model sorting turns, Hook or heartbeat. Native
+MCP list/read results may contain previews, but those are not interpreted or
+logged. Direct read/move calls are limited to eligible local non-Project tasks.
+
+The installation uses private directories, immutable content-hashed runtime
+snapshots and recoverable uninstall. Hashes identify files, not publisher
+signatures. The launcher is unsigned and the Desktop integration is
+version-specific, not a supported extension contract. Review the source before
+installing and retest after Desktop updates. Missing/invalid config disables
+observer writes while leaving the underlying transport active. A final state
+read is not atomic with a move; concurrent manual changes can still race it.
+
+See [scope, permissions and recovery](docs/local-desktop-proxy.md). The following
+section describes the separate legacy integration, not the proxy.
+
+## Legacy Hook trust boundary
 
 Lifecycle hooks run with the local Codex process permissions. Review the scripts before installation.
 

@@ -2,6 +2,11 @@
 
 This page describes the published beta. For the unpublished local compensation
 addition in this checkout, see [periodic compensation](local-compensation.md).
+For optional original-icon startup in this checkout (not the published beta),
+see [original-icon integration](original-icon.md). The dedicated-launch behavior
+below describes installations without that additional opt-in. Disable the
+original-icon integration before relying on the original icon as a bypass or
+following this page's uninstall/recovery instructions.
 
 This opt-in path observes the original Desktop App Server stdio stream and calls
 the native `codex_app` read/move tools. It does not start model turns for sorting,

@@ -1,7 +1,8 @@
 # Codex Sidebar Flow
 
 This local checkout includes an unpublished [periodic compensation patch](docs/local-compensation.md)
-on top of v0.4.0-beta.1. The published beta tag has not been changed.
+and [optional original-icon startup](docs/original-icon.md) on top of
+v0.4.0-beta.1. The published beta tag has not been changed.
 
 ## v0.4.0-beta.1: local event-driven Desktop proxy
 
@@ -10,7 +11,9 @@ Desktop tools to move eligible local tasks between In Progress and For Review.
 No sorting model turns, Hooks or heartbeat are required by this path.
 
 **Start here: [installation, scope, privacy and rollback](docs/local-desktop-proxy.md).**
-Use the dedicated launcher every time: the original Codex icon bypasses the proxy.
+By default, use the dedicated launcher every time. This checkout also provides an
+explicit opt-in to load the proxy when opening the original Codex icon; see the
+original-icon guide above for its GUI-session-wide effect and rollback.
 Remote tasks, Project tasks, Pinned and For Later are not managed by this beta.
 Real Desktop start/completion movement has been observed on two local tasks;
 this is not a stable release or a guarantee of instantaneous/lossless delivery.

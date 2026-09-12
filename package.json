@@ -6,7 +6,7 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test",
-    "check:desktop": "node --check experimental/desktop-proxy-config.mjs && node --check experimental/desktop-observer-manager.mjs && node --check experimental/desktop-reconciliation-timer.mjs && node --check scripts/install-desktop-proxy.mjs && node --check scripts/launch-desktop-proxy.mjs && node --check scripts/desktop-proxy-lock.mjs",
+    "check:desktop": "node --check experimental/desktop-proxy-config.mjs && node --check experimental/desktop-observer-manager.mjs && node --check experimental/desktop-reconciliation-timer.mjs && node --check scripts/install-desktop-proxy.mjs && node --check scripts/launch-desktop-proxy.mjs && node --check scripts/desktop-proxy-lock.mjs && node --check scripts/original-icon.mjs",
     "check": "node --check scripts/runtime-integrity.mjs && node --check scripts/sidebar-agent-context.mjs && node --check scripts/sidebar-realtime.mjs && node --check scripts/sidebar-hook.mjs && node --check scripts/setup.mjs && node --check scripts/uninstall.mjs && node --check scripts/doctor.mjs && node --check scripts/render-heartbeat.mjs && node --check scripts/event-wake.mjs && node --check experimental/app-server-observer.mjs && node --check experimental/stdio-relay.mjs && node --check experimental/desktop-mcp-adapter.mjs && node --check experimental/stdio-observer-proxy.mjs && sh -n scripts/plugin-hook.sh"
   },
   "license": "MIT",

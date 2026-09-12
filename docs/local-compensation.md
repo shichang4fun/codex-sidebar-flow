@@ -64,7 +64,8 @@ Run the [dedicated installer](local-desktop-proxy.md#setup) **from this local
 checkout**, omitting that guide's clone command for the old beta tag. Existing
 config and old immutable runtime snapshots are retained. The installer does not
 replace code inside a running process: quit Codex normally after work finishes,
-then reopen through **Codex Sidebar Flow.app** or its launch command. The old
+then reopen through **Codex Sidebar Flow.app** or its launch command, or through
+the original icon after [explicitly enabling original-icon startup](original-icon.md). The old
 launcher/runtime can be retained for rollback; do not delete its snapshot.
 
 Automated tests cover missed-event repairs, exclusions, idempotency, rotating

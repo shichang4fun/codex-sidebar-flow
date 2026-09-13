@@ -2,13 +2,14 @@
 // CLI wrapper used by the opt-in Desktop installation and isolated protocol lab.
 import { spawn } from 'node:child_process';
 import { realpathSync, readFileSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createStdioRelay } from './stdio-relay.mjs';
 import { createObserver } from './app-server-observer.mjs';
 import { desktopMcpAdapter } from './desktop-mcp-adapter.mjs';
 import { createDesktopObserverManager } from './desktop-observer-manager.mjs';
 import { startReconciliation } from './desktop-reconciliation-timer.mjs';
+import { createTimingWriter } from './desktop-timing.mjs';
 
 // JSONL is delimited by ASCII LF, not Unicode line/paragraph separators.
 // Node readline also splits those valid JSON string characters in this runtime.
@@ -84,10 +85,12 @@ function main() {
   const observers = new Map(threadIds.filter(id => !excluded.includes(id)).map(id => [id,
     createObserver(desktopMcpAdapter(relay, id), { threadIds: [id], apply: process.env.SIDEBAR_FLOW_APPLY_TEST_ONLY === '1' }),
   ]));
+  const log = value => process.stderr.write(JSON.stringify({ sidebarFlow: value }) + '\n');
   const manager = configFile ? createDesktopObserverManager(relay, {
     readConfig: () => JSON.parse(readFileSync(configFile, 'utf8')),
+    onRetry: result => log({ event: 'startup-retry', ...result }),
+    onTiming: createTimingWriter(dirname(configFile)),
   }) : null;
-  const log = value => process.stderr.write(JSON.stringify({ sidebarFlow: value }) + '\n');
   const stopReconciliation = manager ? startReconciliation(manager, {
     readConfig: () => JSON.parse(readFileSync(configFile, 'utf8')), log,
   }) : () => {};
@@ -112,10 +115,10 @@ function main() {
     try { message = JSON.parse(line); } catch { process.stdout.write(line + '\n'); return; }
     relay.fromServer(message);
   });
-  incoming.once('end', () => { stopReconciliation(); relay.stopObserving(); child.stdin.end(); });
-  child.stdin.on('error', () => { stopReconciliation(); relay.stopObserving(); });
-  process.stdout.on('error', () => { stopReconciliation(); relay.close(); child.kill(); });
-  child.once('close', () => { stopReconciliation(); relay.close(); stopIncoming(); stopOutgoing(); });
+  incoming.once('end', () => { stopReconciliation(); manager?.stop(); relay.stopObserving(); child.stdin.end(); });
+  child.stdin.on('error', () => { stopReconciliation(); manager?.stop(); relay.stopObserving(); });
+  process.stdout.on('error', () => { stopReconciliation(); manager?.stop(); relay.close(); child.kill(); });
+  child.once('close', () => { stopReconciliation(); manager?.stop(); relay.close(); stopIncoming(); stopOutgoing(); });
 }
 
 try { main(); }

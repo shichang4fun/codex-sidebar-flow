@@ -72,7 +72,7 @@ export async function connectRpc(endpoint, { timeoutMs = 5000 } = {}) {
   } catch (error) { rpc.close(); throw error; }
 }
 
-export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds = [] } = {}) {
+export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds = [], allowProjectTasks = false } = {}) {
   if (!Array.isArray(threadIds) || threadIds.length === 0 || threadIds.length > 10
       || threadIds.some(id => typeof id !== 'string' || !id || id.length > 128)
       || new Set(threadIds).size !== threadIds.length) throw Error('1-10 explicit unique test thread IDs required');
@@ -82,7 +82,8 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
   const names = { inProgress: 'In Progress', forReview: 'For Review', forLater: 'For Later' };
 
   function eligible(thread, id, sections) {
-    if (!thread || thread.id !== id || thread.projectId !== null || thread.parentThreadId != null
+    if (!thread || thread.id !== id || (thread.projectId !== null
+        && (!allowProjectTasks || typeof thread.projectId !== 'string' || !thread.projectId)) || thread.parentThreadId != null
         || thread.archived === true || thread.ephemeral === true) return null;
     if (thread.section !== null && (typeof thread.section?.id !== 'string' || !thread.section.id)) return null;
     // Only a bare task or a task in one of our two managed sections is eligible.
@@ -103,11 +104,11 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
     return null;
   }
 
-  async function reconcile(id, message = null) {
+  async function reconcile(id, message = null, client = rpc) {
     if (!allowed.has(id)) return { action: 'skipped' };
-    const result = await rpc.request('threadSection/list');
+    const result = await client.request('threadSection/list');
     const sections = resolveConfiguredSections(result.data?.map(s => ({ sectionId: s.id, name: s.name })), names);
-    const read = async () => (await rpc.request('thread/read', { threadId: id, includeTurns: false })).thread;
+    const read = async () => (await client.request('thread/read', { threadId: id, includeTurns: false })).thread;
     const thread = await read();
     // Only these messages from the connected server are activity evidence, never
     // user text. Preserve a short turn's start even if the current read is idle.
@@ -126,10 +127,15 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
       return { action: 'skipped' };
     }
     // API has no conditional move. This final read narrows, but cannot eliminate, the race.
-    await rpc.request('thread/section/move', { threadId: id, sectionId: target });
+    await client.request('thread/section/move', { threadId: id, sectionId: target });
     const after = await read();
     if (after?.section?.id !== target) throw Error('Server section readback mismatch');
     return { action: 'moved', sectionId: target, desktopVerified: false };
+  }
+  function runReconciliation(id, message) {
+    return typeof rpc.withReconciliation === 'function'
+      ? rpc.withReconciliation(client => reconcile(id, message, client))
+      : reconcile(id, message);
   }
   return {
     handle(message) {
@@ -137,13 +143,13 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
         return Promise.resolve({ action: 'skipped' });
       }
       const id = message.method === 'thread/started' ? message.params?.thread?.id : message.params?.threadId;
-      const result = queue.then(() => reconcile(id, message));
+      const result = queue.then(() => runReconciliation(id, message));
       queue = result.catch(() => {});
       return result;
     },
     // Explicit snapshot path: never invent a lifecycle event or start evidence.
     reconcile(id) {
-      const result = queue.then(() => reconcile(id));
+      const result = queue.then(() => runReconciliation(id));
       queue = result.catch(() => {});
       return result;
     },

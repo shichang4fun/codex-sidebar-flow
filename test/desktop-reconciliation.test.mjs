@@ -59,10 +59,14 @@ test('disabled/malformed compensation configuration performs no native calls', a
   }
 });
 
-test('compensation and event writes share a serial queue, and overlapping scans coalesce', async () => {
+test('compensation yields to queued events, then overlapping idle scans coalesce', async () => {
   const f = fixture();
   const a = f.manager.reconcile(), b = f.manager.reconcile();
-  await Promise.all([a, b, f.manager.handle({ method: 'turn/started', params: { threadId: 'missed-start' } })]);
+  const results = await Promise.all([a, b, f.manager.handle({ method: 'turn/started', params: { threadId: 'missed-start' } })]);
+  assert.equal(results[0].action, 'deferred');
+  assert.equal(results[1].action, 'deferred');
+  assert.equal(f.calls.filter(c => c.method === 'thread/loaded/list').length, 0);
+  await Promise.all([f.manager.reconcile(), f.manager.reconcile()]);
   assert.equal(f.calls.filter(c => c.method === 'thread/loaded/list').length, 1);
   assert.equal(f.moves.filter(m => m.threadId === 'missed-start').length, 1);
 });
@@ -76,6 +80,30 @@ test('bounded batches rotate instead of starving older candidates', async () => 
   assert.equal(f.moves.filter(m => m.threadId.startsWith('stale-')).length, 30);
 });
 
+test('an event arriving during loaded-task discovery prevents a new compensation snapshot', async () => {
+  const f = fixture(), request = f.rpc.request;
+  let releaseLoaded, releaseEvent, notifyLoaded, notifyEvent;
+  const loadedStarted = new Promise(resolve => { notifyLoaded = resolve; });
+  const eventStarted = new Promise(resolve => { notifyEvent = resolve; });
+  f.rpc.request = async (method, p) => {
+    if (method === 'thread/loaded/list') {
+      notifyLoaded(); await new Promise(resolve => { releaseLoaded = resolve; });
+    } else if (p.tool === 'list_threads' && !releaseEvent) {
+      notifyEvent(); await new Promise(resolve => { releaseEvent = resolve; });
+    }
+    return request(method, p);
+  };
+  const scan = f.manager.reconcile();
+  await loadedStarted;
+  const event = f.manager.handle({ method: 'turn/started', params: { threadId: 'missed-start' } });
+  await eventStarted;
+  releaseLoaded();
+  assert.equal((await scan).action, 'deferred');
+  assert.equal(f.calls.filter(c => c.p?.tool === 'list_threads').length, 0);
+  releaseEvent(); await event;
+  assert.equal(f.moves.length, 1);
+});
+
 test('hot disable blocks pending recovery writes without disabling real events', async () => {
   const f = fixture(), request = f.rpc.request;
   f.rpc.request = async (method, p) => {
@@ -86,4 +114,32 @@ test('hot disable blocks pending recovery writes without disabling real events',
   await f.manager.reconcile(); assert.equal(f.moves.length, 0);
   await f.manager.handle({ method: 'turn/started', params: { threadId: 'missed-start' } });
   assert.equal(f.moves.length, 1);
+});
+
+test('event queued during a candidate repair defers the next repair without losing round-robin progress', async () => {
+  const f = fixture(), request = f.rpc.request;
+  let releaseRepair, notifyRepair;
+  const repairStarted = new Promise(resolve => { notifyRepair = resolve; });
+  f.rpc.request = async (method, p) => {
+    if (p.tool === 'read_thread' && !releaseRepair) {
+      notifyRepair(); await new Promise(resolve => { releaseRepair = resolve; });
+    }
+    return request(method, p);
+  };
+  const scan = f.manager.reconcile();
+  await repairStarted;
+  const event = f.manager.handle({ method: 'turn/started', params: { threadId: 'missed-start' } });
+  releaseRepair();
+  // The queued event starts before the scan considers its second candidate.
+  const result = await scan;
+  assert.equal(result.action, 'deferred');
+  assert.equal(result.checked, 1);
+  assert.equal(f.moves.some(m => m.threadId === 'missed-stop'), false);
+  await event;
+  const previousReads = f.calls.filter(c => c.p?.tool === 'read_thread').length;
+  await f.manager.reconcile();
+  const newReads = f.calls.filter(c => c.p?.tool === 'read_thread').slice(previousReads);
+  assert.equal(newReads[0].p.arguments.threadId, 'missed-stop');
+  assert.equal(f.moves.filter(m => m.threadId === 'missed-start').length, 1);
+  assert.equal(f.moves.filter(m => m.threadId === 'missed-stop').length, 1);
 });

@@ -4,6 +4,105 @@ import assert from 'node:assert/strict';
 import * as api from '../experimental/stdio-relay.mjs';
 test('stdio relay API exists', () => assert.equal(typeof api.createStdioRelay, 'function'));
 
+const listParams = (threadId = 'test') => ({ threadId, server: 'codex_app', tool: 'list_threads', arguments: { limit: 50 } });
+function timedFixture() {
+  const timers = new Map();
+  const f = fixture({ setTimer(fn, delay) { timers.set(fn, delay); return fn; }, clearTimer(fn) { timers.delete(fn); } });
+  f.initialize();
+  function advance(ms) {
+    for (const [fn, remaining] of [...timers]) {
+      if (remaining <= ms) { timers.delete(fn); fn(); }
+      else timers.set(fn, remaining - ms);
+    }
+  }
+  return { ...f, timers, advance };
+}
+
+test('cold list read retains the native response past five seconds without duplicating the same-context call', async () => {
+  const f = timedFixture();
+  try {
+    const first = f.relay.request('mcpServer/tool/call', listParams());
+    const second = f.relay.request('mcpServer/tool/call', listParams());
+    const settled = Promise.all([first, second]);
+    settled.catch(() => {}); // Keep assertion-failure cleanup rejection handled.
+    assert.equal(first, second);
+    assert.deepEqual([...f.timers.values()], [35000]);
+    assert.equal(f.upstream.filter(m => m.method === 'mcpServer/tool/call').length, 1);
+    let finished = false;
+    settled.finally(() => { finished = true; }).catch(() => {});
+    f.advance(5000); await Promise.resolve();
+    assert.equal(finished, false, 'The old deadline must not drop a cold response');
+    f.advance(19000); await Promise.resolve();
+    assert.equal(finished, false, 'The observed 24-second native wait must still have a listener');
+    const result = { content: [{ type: 'text', text: '{"threads":[]}' }] };
+    f.relay.fromServer({ id: f.upstream.at(-1).id, result });
+    assert.deepEqual(await settled, [result, result]);
+    assert.equal(f.timers.size, 0);
+    // A new transaction must fetch again, never reuse a completed snapshot.
+    const fresh = f.relay.request('mcpServer/tool/call', listParams());
+    assert.notEqual(fresh, first);
+    f.relay.fromServer({ id: f.upstream.at(-1).id, result: {} });
+    await fresh;
+  } finally { f.relay.close(); }
+});
+
+test('list coalescing never crosses context or arguments; writes keep separate five-second deadlines', async () => {
+  const f = timedFixture();
+  const params = listParams();
+  const promises = [params, listParams('other'), { ...params, arguments: { limit: 10 } },
+    { ...params, tool: 'move_thread_to_sidebar_section' }, { ...params, tool: 'move_thread_to_sidebar_section' }]
+    .map(p => f.relay.request('mcpServer/tool/call', p));
+  const settled = Promise.allSettled(promises);
+  try {
+    assert.deepEqual([...f.timers.values()], [35000, 35000, 35000, 5000, 5000]);
+    assert.equal(f.upstream.filter(m => m.method === 'mcpServer/tool/call').length, 5);
+  } finally { f.relay.stopObserving(); }
+  assert.ok((await settled).every(r => r.status === 'rejected'));
+  assert.equal(f.timers.size, 0);
+});
+
+test('cold list timeout is bounded, clears singleflight and hides late replies', async () => {
+  const f = timedFixture();
+  const pending = f.relay.request('mcpServer/tool/call', listParams());
+  const rejected = assert.rejects(pending, /timeout/i);
+  const id = f.upstream.at(-1).id;
+  const fn = [...f.timers.keys()][0];
+  assert.equal(typeof fn, 'function');
+  f.timers.delete(fn); fn();
+  await rejected;
+  const fresh = f.relay.request('mcpServer/tool/call', listParams());
+  assert.notEqual(fresh, pending);
+  f.relay.fromServer({ id, result: { stale: true } });
+  assert.equal(f.downstream.length, 1);
+  f.relay.fromServer({ id: f.upstream.at(-1).id, result: { fresh: true } });
+  assert.deepEqual(await fresh, { fresh: true });
+  f.relay.close();
+});
+
+test('failed list responses and synchronous send failures release the in-flight entry', async () => {
+  const f = timedFixture();
+  const failed = f.relay.request('mcpServer/tool/call', listParams());
+  f.relay.fromServer({ id: f.upstream.at(-1).id, error: { code: -32603 } });
+  await assert.rejects(failed, /RPC failed/);
+  const next = f.relay.request('mcpServer/tool/call', listParams());
+  assert.notEqual(next, failed);
+  f.relay.fromServer({ id: f.upstream.at(-1).id, result: {} });
+  await next;
+  assert.equal(f.timers.size, 0);
+  f.relay.close();
+
+  let broken = false, attempts = 0;
+  const g = fixture({ toServer(message) {
+    if (!broken) g.upstream.push(message);
+    else { attempts++; throw Error('transport closed'); }
+  } });
+  g.initialize(); broken = true;
+  await assert.rejects(g.relay.request('mcpServer/tool/call', listParams()), /send failed/);
+  await assert.rejects(g.relay.request('mcpServer/tool/call', listParams()), /send failed/);
+  assert.equal(attempts, 2);
+  g.relay.close();
+});
+
 test('Desktop initialize response enables events without an initialized notification', async () => {
   const f = fixture();
   const events = [];

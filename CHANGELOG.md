@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Support eligible local Project child tasks while preserving their Project association and protected parent/task membership.
+- Preserve short-turn start evidence through bounded startup retries and periodic compensation; defer repairs while lifecycle work is pending.
+- Project lifecycle evidence immediately, merge equivalent in-flight events and cancel obsolete prewrite work without stale retries. Rebuild task context after superseded recovery.
+- Bound native listing deadlines, share identical in-flight reads within one context and retain fresh prewrite/readback safeguards.
+- Add private bounded timing diagnostics, lifecycle/race regression coverage and anonymized Desktop acceptance evidence. Real movement remains subject to multi-second native queries and queueing; no latency SLA or cross-host support is implied.
+
 ## [0.4.0-beta.1+local.reconcile] - Unpublished local patch
 
 - Add deterministic compensation inside the existing proxy: first check after five seconds, then sixty seconds after each completed check. No model heartbeat or separate daemon.

@@ -2,6 +2,9 @@
 
 This page describes the published beta. For the unpublished local compensation
 addition in this checkout, see [periodic compensation](local-compensation.md).
+For the unpublished Project/new-task lifecycle fix, see
+[local new-task validation](local-new-task-validation.md). The published beta's
+Project exclusion below does not describe that working-checkout change.
 For optional original-icon startup in this checkout (not the published beta),
 see [original-icon integration](original-icon.md). The dedicated-launch behavior
 below describes installations without that additional opt-in. Disable the
@@ -96,14 +99,29 @@ is never interpreted as executable code.
 - Pending events are coalesced per task with original start evidence retained.
   Work is serialized. At most 256 task observers are retained; completions of
   already observed tasks are admitted even under pending-event pressure.
+- In this unpublished checkout, lifecycle evidence is projected immediately on
+  receipt, independently of the native RPC queue. Equal known state/turn events
+  share an in-flight transaction; new turn identities, attention changes and
+  unknown events supersede obsolete work. There is no persistent status cache.
+  Superseded reads finish at the transport level but cannot dispatch the old
+  move or schedule a stale retry. An already-dispatched write still gets its
+  fresh readback, followed by the newer event's transaction. A recovery-context
+  observer is discarded before switching back to a task's own event context.
+  These changes save duplicate/obsolete work, not the three fresh sidebar
+  snapshots required for a successful move or the platform's own RPC latency.
 - This is event-driven, not an instantaneous/atomic UI guarantee. Native MCP
   startup, queued work and Desktop rendering add latency. A final authoritative
   read narrows but cannot eliminate the platform's read/write race.
-- There is no periodic reconciliation. Recovered idle tasks already in In
-  Progress can be repaired when a subsequent event occurs, but untouched tasks
-  with no post-restart event are not scanned. More than 256 distinct concurrent
-  task identities, missing events or persistent native-tool failures can require
-  a later event/retry. Do not call this guaranteed lossless delivery.
+- Periodic reconciliation repairs missed events using loaded local contexts and
+  bounded, rotating batches from the native list. `reconcileIntervalSeconds`
+  defaults to 60; set it to 600 for ten-minute compensation or 0 to disable.
+  Startup checks begin after five seconds. Pending lifecycle work defers a scan
+  by five seconds; completed scans use the configured interval. Already-issued
+  reads are not cancelled. Native visibility limits and persistent failures can
+  still require a later event/retry; this is not guaranteed lossless delivery.
+- Only native Desktop list reads have a 35-second deadline to cover cold startup.
+  Identical in-flight reads share work within one context, without caching settled
+  responses. Writes retain their original deadline and fresh protection checks.
 
 ## Privacy and permissions
 
@@ -113,6 +131,24 @@ uses only structured identity, membership and status. Native list/read responses
 may contain previews, but the code neither interprets nor persists that text.
 Diagnostic messages omit task content and raw server errors. No new TCP listener,
 remote bridge, telemetry endpoint, credentials copy or analytics is installed.
+
+Installed proxies write content-free timing summaries to `timings.jsonl` in the
+private installation root. Records contain PID, task ID, event kind, timestamps,
+queue/execution durations, native call counts/durations and result category; they
+never include prompts, titles, tool arguments or raw errors. One record is written
+per processed queue entry, not per token or event in a burst. The file is mode
+0600 and capped at 256 KiB (old records are discarded when full). Unsafe links,
+non-private files and write errors are rejected without stopping classification.
+The recoverable uninstaller moves this log with the installation directory.
+
+`queueMs` begins when the manager enqueues an entry; it does not measure the time
+before the notification reaches the proxy. `moveAfterMs` measures enqueue to the
+move RPC settling, not screen rendering or successful verification; consult
+`action` too. `readbackMs` covers the remaining execution after that RPC. Retries
+produce separate attempt records. These fields reveal plugin queuing and native
+query costs without claiming an atomic UI transition.
+An `action` of `superseded` records a safely abandoned prewrite transaction,
+not an RPC failure or successful sidebar move. Its successor has its own record.
 
 The `CODEX_CLI_PATH` selection and direct Desktop MCP behavior are version-specific
 implementation capabilities, not a promised third-party plugin contract. Retest

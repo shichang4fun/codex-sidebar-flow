@@ -14,6 +14,7 @@ const files = ['experimental/stdio-observer-proxy.mjs', 'experimental/stdio-rela
   'experimental/app-server-observer.mjs', 'experimental/desktop-mcp-adapter.mjs',
   'experimental/desktop-proxy-config.mjs', 'experimental/desktop-observer-manager.mjs',
   'experimental/desktop-reconciliation-timer.mjs',
+  'experimental/desktop-timing.mjs',
   'scripts/sidebar-policy.mjs', 'scripts/launch-desktop-proxy.mjs', 'scripts/desktop-proxy-lock.mjs',
   'scripts/install-desktop-proxy.mjs'];
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;

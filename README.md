@@ -2,7 +2,11 @@
 
 This local checkout includes an unpublished [periodic compensation patch](docs/local-compensation.md)
 and [optional original-icon startup](docs/original-icon.md) on top of
-v0.4.0-beta.1. The published beta tag has not been changed.
+v0.4.0-beta.1. It also includes [local Project-task lifecycle support, event queue
+optimizations and validation evidence](docs/local-new-task-validation.md).
+These development-branch changes do not modify the published beta tag; real
+movement still has multi-second latency and remote controller-side tasks are
+not supported by this proxy.
 
 ## v0.4.0-beta.1: local event-driven Desktop proxy
 

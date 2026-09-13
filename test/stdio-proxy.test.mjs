@@ -2,11 +2,54 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 const script = fileURLToPath(new URL('../experimental/stdio-observer-proxy.mjs', import.meta.url));
+test('installed proxy persists a content-free timing summary for a real relayed event', { timeout: 5000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'sidebar-proxy-timing-'));
+  const config = join(root, 'config.json');
+  await writeFile(config, JSON.stringify({ version: 1, mode: 'all-local', reconcileIntervalSeconds: 0 }));
+  const server = `let section='review'; const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
+    require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+      const m=JSON.parse(line);
+      if(m.method==='initialize'){send({id:m.id,result:{}});send({method:'turn/started',params:{threadId:'test',private:'PRIVATE_EVENT'}});return;}
+      if(m.method!=='mcpServer/tool/call')process.exit(9);
+      const p=m.params, thread={id:'test',kind:'codex',hostId:'local',projectId:null,status:{type:'active',activeFlags:[]}};
+      let result;
+      if(p.tool==='list_threads')result={threads:[thread],pinnedThreads:[],sections:[['progress','In Progress'],['review','For Review'],['later','For Later']].map(([sectionId,name])=>({sectionId,name,itemKeys:sectionId===section?['codex:thread:local:test']:[]}))};
+      else if(p.tool==='read_thread')result={thread};
+      else if(p.tool==='move_thread_to_sidebar_section'){section=p.arguments.sectionId;result=p.arguments;}
+      else process.exit(8);
+      send({id:m.id,result:{content:[{type:'text',text:JSON.stringify(result)}]}});
+    });`;
+  const child = spawn(process.execPath, [script, '-e', server, 'app-server'], {
+    env: { ...process.env, SIDEBAR_FLOW_REAL_CODEX: process.execPath, SIDEBAR_FLOW_CONFIG_FILE: config },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(async () => { child.kill(); child.stdin.destroy(); await rm(root, { recursive: true, force: true }); });
+  child.stdout.resume();
+  const moved = new Promise((resolve, reject) => {
+    let stderr = '';
+    child.once('error', reject); child.once('close', () => reject(Error('Proxy exited before movement')));
+    child.stderr.setEncoding('utf8').on('data', chunk => {
+      stderr += chunk;
+      if (stderr.includes('"action":"moved"')) resolve();
+    });
+  });
+  child.stdin.write(JSON.stringify({ id: 1, method: 'initialize' }) + '\n');
+  await moved;
+  const text = await readFile(join(root, 'timings.jsonl'), 'utf8');
+  const timing = JSON.parse(text);
+  assert.equal(timing.threadId, 'test');
+  assert.equal(timing.action, 'moved');
+  assert.equal(timing.rpcCounts.list_threads, 3);
+  assert.ok(timing.queueMs >= 0 && timing.executionMs > 0);
+  assert.ok(!text.includes('PRIVATE_EVENT'));
+  const closed = once(child, 'close'); child.stdin.end();
+  assert.equal((await closed)[0], 0);
+});
 test('installed-mode proxy starts compensation without lifecycle events or model turns', { timeout: 12000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'sidebar-timer-'));
   const config = join(root, 'config.json');

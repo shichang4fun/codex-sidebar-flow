@@ -1,6 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+test('busy lifecycle defers compensation for five seconds, then restores configured interval', async () => {
+  const { startReconciliation } = await import('../experimental/desktop-reconciliation-timer.mjs');
+  const timers = new Map();
+  let busy = true;
+  const stop = startReconciliation({ async reconcile() { return { action: busy ? 'deferred' : 'reconciled' }; } }, {
+    readConfig: () => ({ version: 1, mode: 'all-local', reconcileIntervalSeconds: 600 }), log() {},
+    setTimer(fn, delay) { timers.set(fn, delay); return fn; }, clearTimer: fn => timers.delete(fn),
+  });
+  const tick = async () => { const fn = timers.keys().next().value; timers.delete(fn); await fn(); };
+  await tick(); assert.deepEqual([...timers.values()], [5000]);
+  busy = false;
+  await tick(); assert.deepEqual([...timers.values()], [600000]);
+  stop(); assert.equal(timers.size, 0);
+});
+
 test('timer runs at 60-second completion intervals, reloads disable and stops without overlaps', async () => {
   const { startReconciliation } = await import('../experimental/desktop-reconciliation-timer.mjs');
   let config = { version: 1, mode: 'all-local' }, calls = 0;

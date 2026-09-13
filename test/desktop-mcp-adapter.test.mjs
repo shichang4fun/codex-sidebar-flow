@@ -33,7 +33,7 @@ test('uses official MCP bridge, structured local identity and Desktop section ID
   await adapter.request('thread/section/move', { threadId, sectionId: 'progress' });
   assert.deepEqual(f.calls.at(-1).params.arguments, { threadId, hostId: 'local', sectionId: 'progress' });
 });
-test('rejects remote, ambiguous, Project, missing and malformed membership', async () => {
+test('rejects remote, ambiguous, unknown Project, missing and malformed membership', async () => {
   for (const change of [
     s => { s.threads[0].hostId = 'remote-control:test'; },
     s => { s.threads.push({ ...s.threads[0] }); },
@@ -45,6 +45,37 @@ test('rejects remote, ambiguous, Project, missing and malformed membership', asy
     const f = fixture(); change(f.snapshot);
     await assert.rejects(f.adapter().request('thread/read', { threadId }));
   }
+});
+
+test('Project child without direct membership can move without losing its project identity', async () => {
+  const f = fixture();
+  f.snapshot.threads[0].projectId = 'project';
+  f.snapshot.sections[0].itemKeys = [];
+  f.snapshot.sections.push({ sectionId: 'threads', name: 'Projects', itemKeys: ['codex:project:project'] });
+  const adapter = f.adapter();
+  const result = await adapter.request('thread/read', { threadId });
+  assert.equal(result.thread.projectId, 'project');
+  assert.equal(result.thread.section, null);
+  assert.deepEqual(await adapter.candidates(), [threadId]);
+  await adapter.request('thread/section/move', { threadId, sectionId: 'progress' });
+  assert.deepEqual(f.calls.at(-1).params.arguments, { threadId, hostId: 'local', sectionId: 'progress' });
+});
+
+test('Project ancestry protects pinned, later and custom groups even with direct managed membership', async () => {
+  for (const sectionId of ['pinned', 'later', 'other']) {
+    const f = fixture();
+    f.snapshot.threads[0].projectId = 'project';
+    f.snapshot.sections.push({ sectionId, name: sectionId, itemKeys: ['codex:project:project'] });
+    await assert.rejects(f.adapter().request('thread/section/move', { threadId, sectionId: 'progress' }));
+    assert.ok(!f.calls.some(c => c.params.tool === 'move_thread_to_sidebar_section'));
+  }
+});
+
+test('fresh association with another Project rejects a stale list identity', async () => {
+  const f = fixture({ projectId: 'different-project' });
+  f.snapshot.threads[0].projectId = 'project';
+  f.snapshot.sections.push({ sectionId: 'threads', name: 'Projects', itemKeys: ['codex:project:project'] });
+  await assert.rejects(f.adapter().request('thread/section/move', { threadId, sectionId: 'progress' }));
 });
 test('cannot use this adapter to operate another task or invoke arbitrary tools', async () => {
   const f = fixture(), adapter = f.adapter();

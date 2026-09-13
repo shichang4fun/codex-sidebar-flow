@@ -173,4 +173,38 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
   assert.ok(markers.includes('idle'));
   assert.ok(mcpResults.every(r => JSON.parse(r.content[0].text).meta.threadId === thread.id));
   t.diagnostic(JSON.stringify({ directMcpMarkers: markers, executorSuppliedThreadIdentity: true, modelRequiredForToolCalls: false }));
+  if (transport === 'stdio-relay') {
+    // Desktop create_thread/send_message_to_thread use toolOutput in current
+    // builds. Verify this visibility boundary instead of treating those turns
+    // as equivalent to a human-created task in the sidebar acceptance harness.
+    const { thread: delegated } = await actor.request('thread/start', {
+      cwd: root, model: 'fixture', modelProvider: 'fixture', sandbox: 'read-only', approvalPolicy: 'never',
+      threadSource: 'agent_created_thread', baseInstructions: 'Reply OK. Do not use tools.',
+    });
+    async function runVisibilityTurn(params) {
+      let finish;
+      const done = new Promise(resolve => { finish = resolve; });
+      actor.subscribe(message => {
+        if (message.method === 'turn/completed' && message.params?.threadId === delegated.id) finish();
+      });
+      await actor.request('turn/start', { threadId: delegated.id, ...params });
+      let timer;
+      try {
+        await Promise.race([done, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(Error('Visibility turn did not finish')), 5000);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
+    const listed = async () => (await actor.request('thread/list', {
+      archived: false, limit: 100, modelProviders: null, sortKey: 'updated_at', useStateDbOnly: true,
+    })).data.some(t => t.id === delegated.id);
+    await runVisibilityTurn({ input: [], toolOutput: { name: 'create_thread', namespace: 'codex_app', output: 'Reply OK' } });
+    assert.equal((await actor.request('thread/read', { threadId: delegated.id })).thread.preview, '');
+    assert.equal(await listed(), false, 'Tool-only task is not a valid visible-sidebar test fixture');
+    await runVisibilityTurn({ input: [], toolOutput: { name: 'send_message_to_thread', namespace: 'codex_app', output: 'Reply OK again' } });
+    assert.equal(await listed(), false, 'A tool follow-up does not repair missing user preview');
+    await runVisibilityTurn({ input: [{ type: 'text', text: 'User acceptance prompt', text_elements: [] }] });
+    assert.equal(await listed(), true, 'A genuine user input makes the same task list-visible');
+    t.diagnostic(JSON.stringify({ toolOnlyThreadVisible: false, toolFollowupVisible: false, afterUserInputVisible: true }));
+  }
 });

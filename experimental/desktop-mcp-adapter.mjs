@@ -76,7 +76,7 @@ export function desktopMcpAdapter(rpc, threadId, { contextThreadId = threadId } 
       return data.threads.slice(0, 50).flatMap(t => {
         try {
           const { section } = identity(data, t.id);
-          return section.sectionId === 'chats' || ['In Progress', 'For Review'].includes(section.name) ? [t.id] : [];
+          return section.sectionId === 'chats' || ['In Progress', 'For Review', 'For Later'].includes(section.name) ? [t.id] : [];
         } catch { return []; }
       });
     },
@@ -96,9 +96,13 @@ export function desktopMcpAdapter(rpc, threadId, { contextThreadId = threadId } 
         } };
       }
       const destination = data.sections.filter(s => s.sectionId === params.sectionId);
+      const later = data.sections.filter(s => s.name === 'For Later');
+      const startingDeferredTask = later.length === 1 && later[0].sectionId === section.sectionId
+        && !['pinned', 'chats', 'threads'].includes(section.sectionId)
+        && destination[0]?.name === 'In Progress';
       if (destination.length !== 1 || !['In Progress', 'For Review'].includes(destination[0].name)
           || ['pinned', 'chats', 'threads'].includes(destination[0].sectionId)
-          || !(section.sectionId === 'chats' || ['In Progress', 'For Review'].includes(section.name))) {
+          || !(section.sectionId === 'chats' || ['In Progress', 'For Review'].includes(section.name) || startingDeferredTask)) {
         throw Error('Protected section');
       }
       // Keep an authoritative read adjacent to the write. A section snapshot

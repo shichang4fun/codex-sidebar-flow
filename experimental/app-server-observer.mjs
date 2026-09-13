@@ -72,7 +72,8 @@ export async function connectRpc(endpoint, { timeoutMs = 5000 } = {}) {
   } catch (error) { rpc.close(); throw error; }
 }
 
-export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds = [], allowProjectTasks = false } = {}) {
+export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds = [], allowProjectTasks = false,
+  allowForLaterStart = false } = {}) {
   if (!Array.isArray(threadIds) || threadIds.length === 0 || threadIds.length > 10
       || threadIds.some(id => typeof id !== 'string' || !id || id.length > 128)
       || new Set(threadIds).size !== threadIds.length) throw Error('1-10 explicit unique test thread IDs required');
@@ -86,8 +87,12 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
         && (!allowProjectTasks || typeof thread.projectId !== 'string' || !thread.projectId)) || thread.parentThreadId != null
         || thread.archived === true || thread.ephemeral === true) return null;
     if (thread.section !== null && (typeof thread.section?.id !== 'string' || !thread.section.id)) return null;
-    // Only a bare task or a task in one of our two managed sections is eligible.
+    // Desktop may release a directly deferred task only while it is running.
+    // Idle/attention/unknown state stays protected, even with prior start evidence.
     const source = thread.section?.id ?? null;
+    if (source === sections.forLater.sectionId) return allowForLaterStart
+      && thread.status?.type === 'active' && Array.isArray(thread.status.activeFlags)
+      && thread.status.activeFlags.length === 0;
     if (source !== null && ![sections.inProgress.sectionId, sections.forReview.sectionId].includes(source)) return null;
     return true;
   }

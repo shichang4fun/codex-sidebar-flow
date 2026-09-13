@@ -81,12 +81,20 @@ parent has one unambiguous ordinary Projects membership; a child with no direct
 membership is treated as a Tasks candidate.
 
 Only the child task moves: its `projectId` and parent Project placement remain
-unchanged. Project containers are never moved. Pinned, For Later, other custom
-sections and ambiguous membership fail closed for both the child and its parent.
+unchanged. Project containers are never moved. Pinned tasks, other custom
+sections and ambiguous membership fail closed. Parent Projects in Pinned,
+For Later or other custom sections continue to protect their children.
 In particular, children of Pinned Projects remain untouched even without their
 own pinned membership. The same safeguards are refreshed before every write.
 Remote tasks and excluded identities remain untouched. A local task is not
 blocked merely because a remote host is offline.
+
+Direct For Later task membership has one exception: confirmed `active` with an
+empty `activeFlags` array may enter In Progress. This is based on fresh status,
+not prompt text or a stale start notification. Completion after that move follows
+the normal For Review rule. Idle, attention, unknown and already-finished short
+tasks remain in For Later; there is no direct For Later-to-review transition.
+Compensation can repair a missed active transition under the same checks.
 
 Each event and each native operation re-reads `config.json`. To stop future writes
 without restarting, set `mode` to `disabled`. For a limited rollout use:
@@ -102,9 +110,11 @@ is never interpreted as executable code.
 ## State rules and limits
 
 - Confirmed active without attention flags → In Progress.
-- Approval/user-input attention → For Review; resumed activity → In Progress.
+- Approval/user-input attention → For Review, unless still in For Later;
+  resumed activity without attention → In Progress.
 - Confirmed idle/systemError after observed activity, or already in In Progress
-  → For Review. Cancellation is handled when the server reports idle.
+  → For Review, except for tasks still in For Later. Cancellation is handled
+  when the server reports idle.
 - Unknown status/flags, missing identities or native-tool errors → no move.
 - Pending events are coalesced per task with original start evidence retained.
   Work is serialized. At most 256 task observers are retained; completions of
@@ -205,9 +215,12 @@ a heartbeat.
 
 ## Verification status
 
-The accepted development baseline is commit
+The previously accepted development baseline is commit
 `a3dc1514fd6c36e072f2dae69c03c95bd017f165`, Desktop runtime
 `6f25af2678ab8e740445d06a6f5c0490f1a3221224d8b00f95a2d876066fc96d`.
+The For Later start exception changes the runtime. Prior acceptance does not
+validate that new behavior or prove it is installed; its GUI start/completion and
+unchanged Pinned/parent protections must be checked after a normal relaunch.
 The release-closeout environment reports ChatGPT Desktop **26.908.40834 (8881)**
 and bundled Codex CLI **0.154.0-alpha.6.2**. This is the compatibility boundary;
 the Codex product name does not imply support for every standalone Codex app build.

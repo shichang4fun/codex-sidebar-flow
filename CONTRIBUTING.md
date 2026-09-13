@@ -21,8 +21,12 @@ are a separate release gate, not proof of real GUI placement.
 For the current Desktop proxy, cover start/completion/attention, superseded
 events, retries, compensation and fresh prewrite/readback checks. Ordinary
 Projects may supply local root child tasks without direct membership; only the
-child moves and its Project association remains intact. Pinned, For Later,
-other custom sections and ambiguous membership protect both child and parent.
+child moves and its Project association remains intact. Pinned tasks, other custom
+sections and ambiguous membership remain protected. Parent Projects in Pinned,
+For Later or other custom sections protect their children. A direct For Later
+task may move only to In Progress on fresh active/no-attention evidence; cover
+idle/attention/unknown states, stale starts, prewrite state/parent changes,
+subsequent completion and compensation idempotency for this exception.
 Keep Project containers, remote/subagent/archived tasks and excluded identities
 untouched. Test real ordinary and Project-child GUI paths before claiming live
 acceptance on a specific Desktop build.

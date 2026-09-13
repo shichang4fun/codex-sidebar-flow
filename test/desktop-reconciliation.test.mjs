@@ -40,15 +40,17 @@ function fixture() {
     config: value => { config = value; } };
 }
 
-test('periodic snapshot repairs missed events after restart and preserves every protected group', async () => {
+test('periodic snapshot repairs missed starts including For Later and preserves protected groups', async () => {
   const f = fixture();
   assert.equal(typeof f.manager.reconcile, 'function');
   const result = await f.manager.reconcile();
-  assert.equal(result.moved, 2);
-  assert.deepEqual(f.moves.map(m => [m.threadId, m.sectionId]), [['missed-start', 'progress'], ['missed-stop', 'review']]);
+  assert.equal(result.moved, 3);
+  assert.deepEqual(f.moves.map(m => [m.threadId, m.sectionId]), [
+    ['missed-start', 'progress'], ['missed-stop', 'review'], ['later-task', 'progress'],
+  ]);
   await f.manager.reconcile();
-  assert.equal(f.moves.length, 2, 'Repeated compensation must be idempotent');
-  assert.ok(!f.calls.some(c => c.p?.tool === 'read_thread' && ['organizer', 'remote-task', 'project-task', 'pinned-task', 'later-task'].includes(c.p.arguments.threadId)));
+  assert.equal(f.moves.length, 3, 'Repeated compensation must be idempotent');
+  assert.ok(!f.calls.some(c => c.p?.tool === 'read_thread' && ['organizer', 'remote-task', 'project-task', 'pinned-task'].includes(c.p.arguments.threadId)));
 });
 
 test('disabled/malformed compensation configuration performs no native calls', async () => {

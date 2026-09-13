@@ -105,7 +105,8 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
               }
             } };
             observers.set(id, createObserver(desktopMcpAdapter(guarded, id,
-              { contextThreadId: currentRecovery ? entry.context : id }), { threadIds: [id], apply, allowProjectTasks: true }));
+              { contextThreadId: currentRecovery ? entry.context : id }),
+            { threadIds: [id], apply, allowProjectTasks: true, allowForLaterStart: true }));
           }
           const observer = observers.get(id);
           // Preserve the original server start notification when a burst has

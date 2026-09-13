@@ -33,7 +33,7 @@ function fixture({ project = false, onCall = () => {} } = {}) {
     return { content: [{ type: 'text', text: JSON.stringify(value) }] };
   } }, threadId);
   return { calls, data, task, place, adapter,
-    observer: createObserver(adapter, { threadIds: [threadId], apply: true, allowProjectTasks: true }) };
+    observer: createObserver(adapter, { threadIds: [threadId], apply: true, allowProjectTasks: true, allowForLaterStart: true }) };
 }
 
 test('one move uses three sidebar snapshots including a fresh prewrite guard and postwrite readback', async () => {
@@ -52,6 +52,7 @@ test('unchanged reconciliation uses one snapshot and starts fresh on the next ev
   assert.equal((await f.observer.reconcile(threadId)).action, 'unchanged');
   assert.equal(f.calls.filter(c => c === 'list_threads').length, 1);
   f.place('later');
+  f.task.status = { type: 'idle' };
   assert.equal((await f.observer.handle({ method: 'turn/started', params: { threadId } })).action, 'skipped');
   assert.equal(f.calls.filter(c => c === 'list_threads').length, 2);
   assert.equal(f.calls.includes('move_thread_to_sidebar_section'), false);
@@ -83,6 +84,7 @@ test('read failure discards the transaction snapshot before retry', async () => 
   } });
   await assert.rejects(f.observer.reconcile(threadId), /DESKTOP_MCP_UNAVAILABLE/);
   f.place('later');
+  f.task.status = { type: 'idle' };
   assert.equal((await f.observer.reconcile(threadId)).action, 'skipped');
   assert.equal(f.calls.filter(c => c === 'list_threads').length, 2);
   assert.equal(f.calls.includes('move_thread_to_sidebar_section'), false);

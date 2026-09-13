@@ -17,16 +17,20 @@ Each round uses the native recent-task snapshot, currently limited by Desktop to
 50 non-pinned tasks. Local children of an ordinary Projects entry are eligible,
 including those without direct membership. Only the child moves, never its
 Project container or association. Protected, remote, archived, excluded and
-ambiguous tasks are skipped. Pinned, For Later and other custom sections protect
-both tasks and parent Projects, including children of Pinned Projects.
+ambiguous tasks are skipped. Pinned and other custom sections protect tasks.
+Parent Projects in Pinned, For Later and other custom sections protect children.
+Direct For Later tasks may be inspected, but move only when fresh reads confirm
+active with no attention flags; idle/attention/unknown states remain deferred.
 At most 20 eligible tasks are checked per round in rotating
 order. Scheduling new candidates stops after a ten-second soft budget; an
 in-flight transaction is allowed to finish. Writes share the real-event queue.
 
 - Confirmed active tasks without attention flags belong in In Progress.
-- Confirmed attention belongs in For Review.
+- Confirmed attention belongs in For Review, except when directly in For Later.
 - Idle/systemError tasks stuck in In Progress return to For Review.
 - An ordinary idle task in Tasks is not evidence of a missed completion.
+- A task still in For Later never moves straight to For Review, even after a
+  missed short turn or previously observed activity.
 - Unknown/unavailable identities or states never authorize a move.
 
 This is bounded recovery, not a sixty-second SLA or full-history repair. More

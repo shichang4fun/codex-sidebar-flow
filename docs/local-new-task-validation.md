@@ -3,8 +3,12 @@
 This page describes the current development branch, not the published beta tag.
 The Desktop adapter supports local root tasks, including children of an ordinary
 Projects entry. It moves the task only and preserves its Project association.
-Pinned tasks, For Later, custom sections, protected or ambiguous parent Projects,
+Pinned tasks, other custom sections, protected or ambiguous parent Projects,
 remote tasks, archived tasks and excluded organizer tasks remain fail-closed.
+Direct For Later tasks may enter In Progress on fresh active/no-attention evidence.
+Idle/attention/unknown tasks there stay deferred; For Later parent Projects still
+protect their children. The real acceptance below predates this new exception and
+does not establish its activation or GUI behavior.
 
 ## Implementation
 

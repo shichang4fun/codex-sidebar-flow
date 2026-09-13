@@ -11,9 +11,16 @@ TCP listener, external backend, model sorting turns, Hook or heartbeat. Native
 MCP list/read results may contain previews, but those are not interpreted or
 logged. Direct read/move calls are limited to eligible local root tasks, including
 children of an unambiguous ordinary Projects entry. Only the child moves; its
-Project association and container remain unchanged. Pinned, For Later, other
-custom groups and ambiguous task/parent membership are protected, including
-children of Pinned Projects. Remote tasks are not managed by the proxy.
+Project association and container remain unchanged. Pinned tasks, other custom
+groups and ambiguous membership are protected. Parent Projects in Pinned,
+For Later or other custom groups protect their children. Remote tasks are not
+managed by the proxy.
+
+The only manual-section exception is a task directly in For Later: fresh reads
+must confirm active with no attention flags before moving it to In Progress.
+No direct For Later-to-review write is allowed, even with earlier start evidence.
+Idle, attention and unknown states remain deferred. Source/identity/parent checks
+are still refreshed before the write; this exception does not override Pinned.
 
 Private bounded timing records contain task IDs and durations, not task content.
 Do not upload timing logs, local usernames/paths, credentials or acceptance

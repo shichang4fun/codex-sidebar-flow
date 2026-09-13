@@ -19,8 +19,13 @@ explicit opt-in to load the proxy when opening the original Codex icon; see the
 original-icon guide above for its GUI-session-wide effect and rollback.
 Eligible standalone local tasks and local child tasks of an ordinary Projects
 entry are supported. Only the child moves; its `projectId` and Project container
-remain unchanged. Pinned, For Later, other custom groups and ambiguous membership
-protect both tasks and their parent Projects. A child of a Pinned Project is
+remain unchanged. A task directly in For Later leaves for In Progress only when
+fresh reads confirm `active` with no attention flags; normal completion then goes
+to For Review. Idle, attention and unknown states remain in For Later, including
+a short task already finished before the read. Compensation uses the same rule.
+Pinned tasks, other custom groups and ambiguous membership remain protected.
+Parent Projects in Pinned, For Later or other custom groups protect their children.
+A child of a Pinned Project is
 therefore **not** eligible, even when the child is not individually pinned.
 Remote tasks are not managed by this proxy.
 
@@ -28,7 +33,9 @@ Start/completion movement passed real acceptance for ordinary and Project-child
 tasks on ChatGPT Desktop **26.908.40834 (8881)** with bundled Codex CLI
 **0.154.0-alpha.6.2**. This does not establish compatibility with all ChatGPT/Codex
 Desktop versions. Movement can still take several seconds; this is not a stable
-release or a guarantee of instantaneous/lossless delivery.
+release or a guarantee of instantaneous/lossless delivery. That acceptance predates
+the For Later start exception; the changed runtime needs installation and fresh
+GUI acceptance before the new rule is considered live-verified.
 See [protocol research and verification boundaries](docs/local-official-api-prototype.md).
 
 The plugin manifest and `scripts/setup.mjs` still install the **legacy Hook path**,

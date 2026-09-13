@@ -1,4 +1,7 @@
-# v0.4.0-beta.2 release notes — draft, not published
+# v0.4.0-beta.2 — archived development draft
+
+Superseded by [v0.4.0 release notes](release-notes-v0.4.0.md). Pending gates and
+recommendations below are historical snapshots, not current release status.
 
 Status: candidate metadata only on `feat/local-periodic-reconciliation`.
 `VERSION`, `package.json` and `.codex-plugin/plugin.json` agree. This document does

@@ -1,7 +1,9 @@
 # Local periodic compensation patch
 
-Version: `0.4.0-beta.2` (unreleased candidate). This extends the released
-beta; it does not alter the GitHub tag or re-enable legacy Hooks/agent heartbeat.
+Version: `0.4.0`. This does not re-enable legacy Hooks or model heartbeat.
+The rules below describe the conservative default policy. Explicit
+[`forceStatusSections`](local-status-grouping.md) uses paged local recovery
+and protects only directly Pinned tasks; it does not use the global snapshot.
 
 ## Operation
 

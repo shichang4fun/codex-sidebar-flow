@@ -2,7 +2,21 @@
 
 All notable changes to this project are documented here.
 
-## [0.4.0-beta.2] - Unreleased candidate
+## [0.4.0] - 2026-09-14
+
+- Promote the reviewed local Desktop runtime from implementation commit
+  `796969bb8cae2639d5f62a969b386fd9c83653ab` without changing runtime code.
+- Align package metadata at 0.4.0 and document the maintainer-confirmed second-Mac
+  activation/verification separately from instrumented first-Mac evidence.
+- Publish bounded compatibility, installation and rollback guidance in the
+  [release notes](docs/release-notes-v0.4.0.md). Native approval/cancellation UI
+  and atomic pin/write behavior are not claimed as accepted.
+
+### Included development changes (historical candidate record)
+
+The bullets below retain the development history; pending-acceptance statements
+describe their original stage. Current evidence and scope are in the release
+notes above. Default and explicit status-grouping policies remain distinct.
 
 - Add a force-status local running-event fast path: fresh active/no-attention tasks no longer wait for preview-filtered task-list inclusion. Keep Pinned/identity checks, fresh prewrite status and section/Project readback. Attention, terminal events, periodic compensation and default policy retain list checks. Gate the proof on the tested bundled build's archive/unload and active-writer behavior. Fresh GUI-created standalone and Project-child samples passed after normal activation; see [acceptance limits](docs/local-boundary-acceptance.md).
 

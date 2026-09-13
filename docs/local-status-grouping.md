@@ -1,4 +1,4 @@
-# Local status grouping with Pinned protection — opt-in candidate
+# Local status grouping with Pinned protection — v0.4.0 opt-in
 
 This is a new, explicitly selected policy, not a silent upgrade of existing
 manual-group protections. It targets the inspected ChatGPT Desktop

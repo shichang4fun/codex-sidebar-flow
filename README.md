@@ -1,11 +1,12 @@
 # Codex Sidebar Flow
 
-This development branch prepares **v0.4.0-beta.2 (unreleased)**, including
+**v0.4.0** provides local status-driven grouping on the tested macOS Desktop
+build, including
 [periodic compensation](docs/local-compensation.md),
 [optional original-icon startup](docs/original-icon.md), and
 [local Project-task lifecycle support and event queue optimizations](docs/local-new-task-validation.md).
-The existing v0.4.0-beta.1 tag is unchanged. See the
-[release notes draft and compatibility boundary](docs/release-notes-beta.2.md).
+See the [release notes and compatibility boundary](docs/release-notes-v0.4.0.md).
+Install from the `v0.4.0` tag, not the default branch's historical instructions.
 
 ## Current local event-driven Desktop proxy
 
@@ -40,10 +41,12 @@ see [measured results and remaining limits](docs/local-boundary-acceptance.md).
 Start/completion movement passed real acceptance for ordinary and Project-child
 tasks on ChatGPT Desktop **26.908.40834 (8881)** with bundled Codex CLI
 **0.154.0-alpha.6.2**. This does not establish compatibility with all ChatGPT/Codex
-Desktop versions. Movement can still take several seconds; this is not a stable
-release or a guarantee of instantaneous/lossless delivery. That acceptance predates
-the For Later start exception; the changed runtime needs installation and fresh
-GUI acceptance before the new rule is considered live-verified.
+Desktop versions. This release is stable within its documented build and policy
+scope, not a guarantee of instantaneous/lossless delivery. New GUI-created
+ordinary and Project-child tasks passed under the explicit status-grouping mode;
+a second Mac's activation and verification were confirmed by the maintainer.
+Approval/cancellation UI has not been separately accepted, and pinning between
+the final read and move remains a documented race.
 See [protocol research and verification boundaries](docs/local-official-api-prototype.md).
 
 The plugin manifest and `scripts/setup.mjs` still install the **legacy Hook path**,
@@ -85,7 +88,7 @@ Membership is resolved from the controlling Mac's real sidebar item key by task 
 
 Requirements: macOS, Codex Desktop, Node.js 20+, and custom sections named `In Progress`, `For Review`, and `For Later`.
 
-Run setup and doctor separately on the local machine and on every connected execution host such as `scmeituan.local`. Remote Connections use that host's own Codex home, configuration, credentials, plugins, and global AGENTS files; one local installation is not shared with remote tasks.
+Run setup and doctor separately on the local machine and on every connected execution host such as `remote-mac.local`. Remote Connections use that host's own Codex home, configuration, credentials, plugins, and global AGENTS files; one local installation is not shared with remote tasks.
 
 Source mode base installation:
 

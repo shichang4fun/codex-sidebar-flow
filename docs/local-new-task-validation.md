@@ -1,6 +1,12 @@
 # Local new-task lifecycle validation
 
-This page describes the current development branch, not the published beta tag.
+Historical default-policy implementation record. For v0.4.0's explicit
+status-grouping mode and fresh GUI-created task results, use the
+[current release notes](release-notes-v0.4.0.md) and
+[acceptance record](local-boundary-acceptance.md). Pending statements below
+describe the earlier stage, not the current release.
+
+This section describes the earlier development-stage default policy.
 The Desktop adapter supports local root tasks, including children of an ordinary
 Projects entry. It moves the task only and preserves its Project association.
 Pinned tasks, other custom sections, protected or ambiguous parent Projects,
@@ -46,7 +52,7 @@ isolated temporary storage and a loopback fixture model. Both syntax-check
 commands and whitespace checks passed.
 These counts describe accepted commit `a3dc1514fd6c36e072f2dae69c03c95bd017f165`,
 before release-closeout regressions; current gate results are tracked in the
-[release notes draft](release-notes-beta.2.md).
+[v0.4.0 release notes](release-notes-v0.4.0.md).
 
 Seventeen added event/coalescing regressions cover duplicate starts, first-turn
 identity, stale reads, completion and attention transitions, unloaded state,

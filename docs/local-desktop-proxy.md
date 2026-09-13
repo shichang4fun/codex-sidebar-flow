@@ -1,9 +1,8 @@
-# Local Desktop proxy (v0.4.0-beta.2 candidate, unreleased)
+# Local Desktop proxy (v0.4.0)
 
-This page describes the current development branch, not the unchanged published
-v0.4.0-beta.1 tag. See [periodic compensation](local-compensation.md),
+This page describes v0.4.0. See [periodic compensation](local-compensation.md),
 [local lifecycle validation](local-new-task-validation.md) and the
-[release notes draft](release-notes-beta.2.md). Optional
+[release notes](release-notes-v0.4.0.md). Optional
 [original-icon integration](original-icon.md) enables the original icon to load
 the same proxy. The dedicated-launch behavior below applies without that opt-in.
 Disable original-icon integration before using the original icon as a bypass or
@@ -37,7 +36,7 @@ separate WebSocket research tests), and exactly one custom section each named
 `In Progress`, `For Review`, `For Later`. Supply your actual absolute paths:
 
 ```sh
-git clone --branch feat/local-periodic-reconciliation https://github.com/shichang4fun/codex-sidebar-flow.git
+git clone --branch v0.4.0 --single-branch https://github.com/shichang4fun/codex-sidebar-flow.git
 cd codex-sidebar-flow
 node scripts/install-desktop-proxy.mjs \
   --root /absolute/private/sidebar-flow-desktop \
@@ -47,9 +46,9 @@ node scripts/install-desktop-proxy.mjs \
   --exclude YOUR_ORGANIZER_TASK_ID
 ```
 
-The branch is moving: inspect `git rev-parse HEAD` and compare it with the exact
-reviewed commit before installation. A candidate version string is not proof of
-publication or acceptance. Other app names/paths require matching build checks.
+Inspect `git rev-parse HEAD` and compare it with the commit behind the published
+`v0.4.0` tag before installation. A version string alone is not proof of runtime
+activation. Other app names/paths require matching build checks.
 
 The parent installation directory must exist. The dedicated root must be new or
 owned by this installer. Runtime files are content-hashed snapshots, not links
@@ -124,7 +123,7 @@ is never interpreted as executable code.
 - Pending events are coalesced per task with original start evidence retained.
   Work is serialized. At most 256 task observers are retained; completions of
   already observed tasks are admitted even under pending-event pressure.
-- In this unpublished checkout, lifecycle evidence is projected immediately on
+- Lifecycle evidence is projected immediately on
   receipt, independently of the native RPC queue. Equal known state/turn events
   share an in-flight transaction; new turn identities, attention changes and
   unknown events supersede obsolete work. There is no persistent status cache.
@@ -219,6 +218,15 @@ Backups are not deleted automatically. No rollback step requires legacy Hooks or
 a heartbeat.
 
 ## Verification status
+
+Current v0.4.0 status-grouping acceptance and runtime fingerprint are in the
+[release notes](release-notes-v0.4.0.md) and
+[running-client acceptance record](local-boundary-acceptance.md). Fresh GUI-created
+ordinary and Project-child tasks passed on the first Mac; the maintainer also
+confirmed second-Mac activation and verification. These are distinct from the
+historical default-policy evidence below.
+
+### Historical default-policy baseline
 
 The previously accepted development baseline is commit
 `a3dc1514fd6c36e072f2dae69c03c95bd017f165`, Desktop runtime

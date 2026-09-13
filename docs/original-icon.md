@@ -1,7 +1,6 @@
 # Optional original Codex icon startup
 
-Part of the unreleased `0.4.0-beta.2` candidate. This is not
-included in the existing GitHub beta tag. It changes how the already-installed
+Included in `v0.4.0`. It changes how the already-installed
 local Desktop proxy is selected, not its classification rules or runtime files.
 
 ## Enable

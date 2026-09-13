@@ -26,6 +26,20 @@ samples pass the previously blocked new-task lifecycle gate. They do not rerun
 the historical boundary matrix below or establish attention/cancel UI behavior,
 an atomic pin/write guarantee, other Desktop builds or a latency SLA.
 
+## Second-Mac confirmation — 2026-09-14
+
+A second Mac installed exact implementation commit
+`796969bb8cae2639d5f62a969b386fd9c83653ab` with the same twelve-file runtime hash.
+Its installation records report 324 passing tests, zero failures, three opt-in
+skips, both syntax checks passing and all three bundled App Server tests passing.
+The installed build matches the boundary above. Host-specific section mappings
+were resolved locally; no private identities or raw logs are included here.
+
+The maintainer subsequently confirmed the new runtime was loaded and verification
+completed. This is maintainer-reported acceptance: the controller could not read
+the newest task's detailed outputs. It is not a second instrumented latency
+sample or separate proof of approval/cancellation and pin-race edge cases.
+
 ## Historical method and limits
 
 Reused two existing user-visible local test tasks: a standalone task and a

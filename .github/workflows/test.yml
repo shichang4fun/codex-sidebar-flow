@@ -14,8 +14,14 @@ jobs:
     strategy:
       matrix:
         node-version: [20, 22, 24]
+        checkout-path: [source, 'source with spaces']
+    defaults:
+      run:
+        working-directory: ${{ matrix.checkout-path }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ${{ matrix.checkout-path }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}

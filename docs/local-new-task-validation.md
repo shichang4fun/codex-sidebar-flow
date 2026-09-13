@@ -29,12 +29,15 @@ remote tasks, archived tasks and excluded organizer tasks remain fail-closed.
 - Write private, bounded, content-free timing records. See
   [Desktop proxy diagnostics](local-desktop-proxy.md#privacy-and-permissions).
 
-## Automated verification, 2026-09-13
+## Baseline automated verification, 2026-09-13
 
 The default suite passed 223 tests with zero failures and 3 opt-in tests skipped.
 The 3 real bundled-App-Server tests were enabled separately and passed using
 isolated temporary storage and a loopback fixture model. Both syntax-check
 commands and whitespace checks passed.
+These counts describe accepted commit `a3dc1514fd6c36e072f2dae69c03c95bd017f165`,
+before release-closeout regressions; current gate results are tracked in the
+[release notes draft](release-notes-beta.2.md).
 
 Seventeen added event/coalescing regressions cover duplicate starts, first-turn
 identity, stale reads, completion and attention transitions, unloaded state,
@@ -43,6 +46,13 @@ replacement. Independent review found and regression-tested the recovery-context
 defect before approving the corrected implementation.
 
 ## Real Desktop acceptance
+
+The release-closeout environment identifies ChatGPT Desktop 26.908.40834 (8881)
+and bundled CLI 0.154.0-alpha.6.2. The maintainer additionally confirms ordinary
+GUI and ordinary-Project child lifecycle placement, unchanged `projectId`/parent
+placement, Pinned Project/Pinned/For Later protection and original-icon observer
+startup. This does not broaden compatibility beyond that tested build. The
+timed observations below are the narrower recorded existing-task sample.
 
 After a normal restart, process inspection confirmed the installed runtime
 `6f25af2678ab8e740445d06a6f5c0490f1a3221224d8b00f95a2d876066fc96d`.

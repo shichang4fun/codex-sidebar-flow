@@ -1,15 +1,13 @@
-# Local Desktop proxy (v0.4.0-beta.1)
+# Local Desktop proxy (v0.4.0-beta.2 candidate, unreleased)
 
-This page describes the published beta. For the unpublished local compensation
-addition in this checkout, see [periodic compensation](local-compensation.md).
-For the unpublished Project/new-task lifecycle fix, see
-[local new-task validation](local-new-task-validation.md). The published beta's
-Project exclusion below does not describe that working-checkout change.
-For optional original-icon startup in this checkout (not the published beta),
-see [original-icon integration](original-icon.md). The dedicated-launch behavior
-below describes installations without that additional opt-in. Disable the
-original-icon integration before relying on the original icon as a bypass or
-following this page's uninstall/recovery instructions.
+This page describes the current development branch, not the unchanged published
+v0.4.0-beta.1 tag. See [periodic compensation](local-compensation.md),
+[local lifecycle validation](local-new-task-validation.md) and the
+[release notes draft](release-notes-beta.2.md). Optional
+[original-icon integration](original-icon.md) enables the original icon to load
+the same proxy. The dedicated-launch behavior below applies without that opt-in.
+Disable original-icon integration before using the original icon as a bypass or
+uninstalling the proxy.
 
 This opt-in path observes the original Desktop App Server stdio stream and calls
 the native `codex_app` read/move tools. It does not start model turns for sorting,
@@ -34,20 +32,24 @@ attachment separately from actual task-movement acceptance.
 
 ## Setup
 
-Requirements: macOS, a compatible Codex Desktop build, Node 20+ (Node 22+ for the
+Requirements: macOS, the [tested Desktop build](#verification-status), Node 20+ (Node 22+ for the
 separate WebSocket research tests), and exactly one custom section each named
 `In Progress`, `For Review`, `For Later`. Supply your actual absolute paths:
 
 ```sh
-git clone --branch v0.4.0-beta.1 https://github.com/shichang4fun/codex-sidebar-flow.git
+git clone --branch feat/local-periodic-reconciliation https://github.com/shichang4fun/codex-sidebar-flow.git
 cd codex-sidebar-flow
 node scripts/install-desktop-proxy.mjs \
   --root /absolute/private/sidebar-flow-desktop \
   --node /absolute/path/to/node \
-  --app /Applications/Codex.app \
-  --codex /Applications/Codex.app/Contents/Resources/codex \
+  --app /Applications/ChatGPT.app \
+  --codex /Applications/ChatGPT.app/Contents/Resources/codex \
   --exclude YOUR_ORGANIZER_TASK_ID
 ```
+
+The branch is moving: inspect `git rev-parse HEAD` and compare it with the exact
+reviewed commit before installation. A candidate version string is not proof of
+publication or acceptance. Other app names/paths require matching build checks.
 
 The parent installation directory must exist. The dedicated root must be new or
 owned by this installer. Runtime files are content-hashed snapshots, not links
@@ -72,11 +74,19 @@ classification does not stop that organizer from making its own moves.
 ## Scope and hot configuration
 
 The default installation config explicitly selects `all-local` and the supplied
-excluded IDs. Only ordinary, non-Project, root local Codex tasks with an unambiguous
-direct membership in Tasks/In Progress/For Review are eligible. Remote tasks,
-Projects and their child tasks, Pinned, For Later, other custom sections, archived
-tasks and ambiguous identities remain untouched. A local task is not blocked
-merely because a remote host is offline.
+excluded IDs. Only root local Codex tasks are eligible (not subagents, ephemeral
+or archived tasks). Standalone tasks require one unambiguous direct membership in
+Tasks/In Progress/For Review. Local Project children are also eligible when their
+parent has one unambiguous ordinary Projects membership; a child with no direct
+membership is treated as a Tasks candidate.
+
+Only the child task moves: its `projectId` and parent Project placement remain
+unchanged. Project containers are never moved. Pinned, For Later, other custom
+sections and ambiguous membership fail closed for both the child and its parent.
+In particular, children of Pinned Projects remain untouched even without their
+own pinned membership. The same safeguards are refreshed before every write.
+Remote tasks and excluded identities remain untouched. A local task is not
+blocked merely because a remote host is offline.
 
 Each event and each native operation re-reads `config.json`. To stop future writes
 without restarting, set `mode` to `disabled`. For a limited rollout use:
@@ -170,21 +180,47 @@ observer operations fail closed. Codex itself is not stopped. Launch the origina
 Codex icon after exiting normally. A live installer/launcher lock blocks uninstall
 to avoid racing a pending app launch; stale PID locks are checked and recovered.
 
-To roll back an upgrade, restore the previous runtime via its retained release and
-review the launcher/manifest paths. To undo uninstall, move the reported backup
-back only if the original destination is absent, then use the installed entry.
-Never overwrite newer user files blindly. Backups are not deleted automatically.
+To roll back an upgrade:
+
+1. Preserve a private copy of the installation's config, then atomically set its
+   `mode` to `disabled`. Finish work and quit the app normally; an already-issued
+   move may finish before shutdown. Do not force-quit.
+2. Use a separate trusted checkout of the previous accepted commit. Run that
+   checkout's `install-desktop-proxy.mjs` with the same root and verified app,
+   Node and CLI paths. This selects the previous content-hashed runtime without
+   resetting the working repository, deleting snapshots or overwriting config.
+3. Verify `installation.json` references the expected previous runtime hash.
+   Restore the intended mode atomically, retaining current exclusions. Relaunch
+   with the dedicated entry, or the original icon if its unchanged owned
+   integration is still enabled. Recheck real start/completion placement.
+
+Original-icon support is installed separately: proxy reinstall does not replace
+that helper. If it is the cause, disable it first and use the dedicated entry;
+follow its guide before replacing an owned helper or changing target paths.
+
+To undo uninstall, move the reported backup back only if the original destination
+is absent, then use the installed entry. Never overwrite newer user files blindly.
+Backups are not deleted automatically. No rollback step requires legacy Hooks or
+a heartbeat.
 
 ## Verification status
 
-On 2026-09-07, the installed all-local path had real Desktop start/completion
-evidence for two local tasks on bundled Codex CLI 0.153.4. Measured start
-acknowledgement to native move response was approximately 0.4–1.9 seconds; this
-is not UI-render latency or an SLA. All-local discovery, hot disable, protection
-rules, event bursts and recoverable installation have automated tests.
+The accepted development baseline is commit
+`a3dc1514fd6c36e072f2dae69c03c95bd017f165`, Desktop runtime
+`6f25af2678ab8e740445d06a6f5c0490f1a3221224d8b00f95a2d876066fc96d`.
+The release-closeout environment reports ChatGPT Desktop **26.908.40834 (8881)**
+and bundled Codex CLI **0.154.0-alpha.6.2**. This is the compatibility boundary;
+the Codex product name does not imply support for every standalone Codex app build.
 
-A third ordinary task, a second normal launch through the installed entry, and
-real approval/cancellation UI lifecycles remain deployment acceptance gaps.
-A new installation's `proxy-attached` status proves only transport attachment;
-verify actual task movement and normal relaunch on that installation. The beta
-does not claim general compatibility with other Desktop builds.
+The maintainer's real acceptance covers ordinary GUI tasks and local children of
+ordinary Projects: active → In Progress → completed → For Review, unchanged
+`projectId`/Project placement, Pinned Project/Pinned/For Later protections, and
+observer startup through the original icon. The recorded timed sample resumed
+existing tasks; it is not a new-task-creation or latency benchmark. See
+[detailed evidence and boundaries](local-new-task-validation.md).
+
+Real approval/cancellation UI lifecycles, broader build/host compatibility and
+long-running reliability remain unverified. A new installation's
+`proxy-attached` status proves only transport attachment; retest actual movements
+after installation or Desktop updates. Isolated App Server tests do not substitute
+for these GUI checks.

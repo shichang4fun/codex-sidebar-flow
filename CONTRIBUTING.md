@@ -9,6 +9,26 @@ Before opening a pull request:
 ```bash
 npm test
 npm run check
+npm run check:desktop
 ```
 
-Tests must cover both sides of the `UserPromptSubmit` and `Stop` transitions, and must distinguish event semantics from heartbeat semantics: event `Stop` may target `Tasks`, `In Progress`, or an eligible Project task for `For Review`, while heartbeat terminal recovery is limited to tasks already in `In Progress`. Also cover protected memberships (`Pinned`, `For Later`, archived, non-Codex, Project objects, organizer exclusion), remote `hostId` routing, Project tasks without direct membership, recursion prevention, wake failure fallback, and concurrency/deadline/probe safety.
+Run the full suite in both an ordinary checkout and a separate checkout whose
+path contains spaces. CI runs both paths on Node 20/22/24; do not skip fingerprint
+tests or weaken digest verification to pass either path. The opt-in
+[three bundled App Server tests](docs/local-official-api-prototype.md#reproducible-isolated-integration-tests)
+are a separate release gate, not proof of real GUI placement.
+
+For the current Desktop proxy, cover start/completion/attention, superseded
+events, retries, compensation and fresh prewrite/readback checks. Ordinary
+Projects may supply local root child tasks without direct membership; only the
+child moves and its Project association remains intact. Pinned, For Later,
+other custom sections and ambiguous membership protect both child and parent.
+Keep Project containers, remote/subagent/archived tasks and excluded identities
+untouched. Test real ordinary and Project-child GUI paths before claiming live
+acceptance on a specific Desktop build.
+
+Legacy-only changes must separately cover `UserPromptSubmit`/`Stop`, event versus
+heartbeat terminal recovery, host routing, recursion, wake fallback and probe
+safety. The legacy Pinned-Project policy differs from the current proxy; do not
+copy it into the Desktop adapter or restore legacy Hooks/heartbeat during proxy
+validation. Never commit private task IDs, paths, logs, tokens or databases.

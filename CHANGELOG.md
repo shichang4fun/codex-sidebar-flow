@@ -2,13 +2,18 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.4.0-beta.2] - Unreleased candidate
 
-- Support eligible local Project child tasks while preserving their Project association and protected parent/task membership.
+- Support local root child tasks of an unambiguous ordinary Projects entry, including children without direct sidebar membership. Move only the child and preserve its Project association; never move the Project container. Pinned, For Later, other custom groups and ambiguous task/parent membership remain fail-closed, including children of Pinned Projects.
 - Preserve short-turn start evidence through bounded startup retries and periodic compensation; defer repairs while lifecycle work is pending.
 - Project lifecycle evidence immediately, merge equivalent in-flight events and cancel obsolete prewrite work without stale retries. Rebuild task context after superseded recovery.
 - Bound native listing deadlines, share identical in-flight reads within one context and retain fresh prewrite/readback safeguards.
 - Add private bounded timing diagnostics, lifecycle/race regression coverage and anonymized Desktop acceptance evidence. Real movement remains subject to multi-second native queries and queueing; no latency SLA or cross-host support is implied.
+- Include optional original-icon startup and in-proxy periodic compensation; neither restores legacy Hooks or model heartbeats.
+- Fix the doctor fingerprint test fixture's unquoted source path by reusing the installer's command builder. Add an always-on copied-checkout regression for spaces, retaining wrong-digest rejection and exact-digest acceptance in source and plugin modes.
+- Run full tests and both syntax checks on ordinary and space-containing checkout paths in the Node 20/22/24 CI matrix.
+- Align current scope, privacy, rollback and compatibility documentation. The tested build is ChatGPT Desktop 26.908.40834 (8881), bundled CLI 0.154.0-alpha.6.2; other builds require new acceptance.
+- Align package and plugin manifest candidate versions. No tag or GitHub Release is created by this preparation; see the [release notes draft](docs/release-notes-beta.2.md).
 
 ## [0.4.0-beta.1+local.reconcile] - Unpublished local patch
 

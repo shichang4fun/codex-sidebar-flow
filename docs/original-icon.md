@@ -1,6 +1,6 @@
 # Optional original Codex icon startup
 
-Unpublished checkout addition to `0.4.0-beta.1+local.reconcile`. This is not
+Part of the unreleased `0.4.0-beta.2` candidate. This is not
 included in the existing GitHub beta tag. It changes how the already-installed
 local Desktop proxy is selected, not its classification rules or runtime files.
 
@@ -79,6 +79,12 @@ with changed app/Node paths likewise require disable and preservation of the
 old support directory/agent before reinstalling. Never delete an active shim.
 
 ## Verification
+
+The current maintainer acceptance confirms original-icon observer startup and
+local start/completion placement. See the exact
+[tested build and accepted baseline](local-desktop-proxy.md#verification-status).
+The historical implementation-specific record below is retained to distinguish
+earlier evidence from validation of a newly installed helper on another Mac.
 
 Automated tests use temporary homes and a launchctl boundary substitute; they
 never change the developer's GUI environment. The generated shim is executed

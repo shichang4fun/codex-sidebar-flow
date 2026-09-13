@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   armEventWakeProbe,
   claimEventWakeProbe,
@@ -19,8 +20,9 @@ import {
   agentTransitionInstructions,
   defaultConfig,
   HOOK_MARKER,
+  hookCommand,
 } from "../scripts/setup.mjs";
-import { computeRuntimeFingerprint } from "../scripts/runtime-integrity.mjs";
+import { computeRuntimeFingerprint, PLUGIN_RUNTIME_FILES } from "../scripts/runtime-integrity.mjs";
 
 const execFileAsync = promisify(execFile);
 const TEST_RUNTIME_FINGERPRINT = "a".repeat(64);
@@ -117,16 +119,15 @@ test("doctor verifies agent-transition configuration against the active global i
   }
 });
 
-test("doctor CLI recomputes source Hook and plugin-root fingerprints", async () => {
-  const doctorScript = path.resolve("scripts/doctor.mjs");
-  const repositoryRoot = path.resolve(".");
+async function assertDoctorFingerprints(repositoryRoot) {
+  const doctorScript = path.join(repositoryRoot, "scripts/doctor.mjs");
   for (const mode of ["source", "plugin"]) {
     const codexHome = await mkdtemp(path.join(os.tmpdir(), `sidebar-flow-doctor-binding-${mode}-`));
     const runtimeRoot = path.join(codexHome, "sidebar-flow");
     try {
       await mkdir(runtimeRoot, { recursive: true });
       if (mode === "source") {
-        const command = `${HOOK_MARKER} node ${path.join(repositoryRoot, "scripts/sidebar-hook.mjs")}`;
+        const command = hookCommand(repositoryRoot, process.execPath, path.join(runtimeRoot, "config.json"));
         await writeFile(path.join(codexHome, "hooks.json"), `${JSON.stringify({
           hooks: {
             UserPromptSubmit: [{ hooks: [{ type: "command", command }] }],
@@ -161,6 +162,28 @@ test("doctor CLI recomputes source Hook and plugin-root fingerprints", async () 
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
+  }
+}
+
+test("doctor CLI recomputes source Hook and plugin-root fingerprints", async () => {
+  await assertDoctorFingerprints(fileURLToPath(new URL("../", import.meta.url)));
+});
+
+test("doctor CLI accepts exact source and plugin fingerprints under a checkout path with spaces", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "sidebar-flow-doctor-spaces-"));
+  const repositoryRoot = path.join(temporaryRoot, "checkout with  spaces");
+  const sourceRoot = fileURLToPath(new URL("../", import.meta.url));
+  try {
+    for (const relativePath of PLUGIN_RUNTIME_FILES) {
+      const destination = path.join(repositoryRoot, relativePath);
+      await mkdir(path.dirname(destination), { recursive: true });
+      await copyFile(path.join(sourceRoot, relativePath), destination);
+    }
+    // Run the actual CLI against real copied files, rejecting a wrong digest
+    // before accepting the exact digest in both installation modes.
+    await assertDoctorFingerprints(repositoryRoot);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
 

@@ -1,20 +1,25 @@
 # Local periodic compensation patch
 
-Version: `0.4.0-beta.1+local.reconcile` (unpublished). This extends the released
+Version: `0.4.0-beta.2` (unreleased candidate). This extends the released
 beta; it does not alter the GitHub tag or re-enable legacy Hooks/agent heartbeat.
 
 ## Operation
 
-The existing proxy runs a check five seconds after startup, then waits sixty
-seconds after each check finishes. Real lifecycle events remain the primary
+The existing proxy runs a check five seconds after startup, then waits the
+configured interval (sixty seconds by default) after each check finishes.
+Pending lifecycle work defers a scan by five seconds. Real events remain the primary
 path. There is no model invocation, new task, task resume, extra daemon or
 listening socket. Native tool calls run against an already-loaded local task
 context, while explicit read/move arguments identify the independently validated
 target. An unloaded target need not be started merely to inspect it.
 
 Each round uses the native recent-task snapshot, currently limited by Desktop to
-50 non-pinned tasks. Protected, remote, Project, archived, excluded and ambiguous
-tasks are skipped. At most 20 eligible tasks are checked per round in rotating
+50 non-pinned tasks. Local children of an ordinary Projects entry are eligible,
+including those without direct membership. Only the child moves, never its
+Project container or association. Protected, remote, archived, excluded and
+ambiguous tasks are skipped. Pinned, For Later and other custom sections protect
+both tasks and parent Projects, including children of Pinned Projects.
+At most 20 eligible tasks are checked per round in rotating
 order. Scheduling new candidates stops after a ten-second soft budget; an
 in-flight transaction is allowed to finish. Writes share the real-event queue.
 
@@ -47,6 +52,7 @@ The new optional field defaults to sixty seconds:
 ```
 
 Use `reconcileIntervalSeconds: 0` to stop compensation while keeping live events.
+Use `reconcileIntervalSeconds: 600` for ten-minute compensation.
 Valid nonzero values are integers from 15 to 3600. `mode: "disabled"` stops both
 paths. Changes are checked again before native operations; the next scheduled
 wake reloads the interval. Disabled/invalid settings are rechecked in about sixty
@@ -57,11 +63,14 @@ on stderr. There are no prompts, titles, task IDs, raw native errors or external
 telemetry in compensation diagnostics. `unavailable/no-native-context` is not
 reported as a successful repair. Native tools may return preview text, but the
 code neither classifies from nor stores it.
+The separate private per-task `timings.jsonl` **does** contain task IDs, including
+repair attempts; see [diagnostic privacy](local-desktop-proxy.md#privacy-and-permissions).
+Do not publish those records or installation databases as acceptance evidence.
 
 ## Install and activate
 
-Run the [dedicated installer](local-desktop-proxy.md#setup) **from this local
-checkout**, omitting that guide's clone command for the old beta tag. Existing
+Run the [dedicated installer](local-desktop-proxy.md#setup) **from the reviewed
+development checkout**, not the unchanged old beta tag. Existing
 config and old immutable runtime snapshots are retained. The installer does not
 replace code inside a running process: quit Codex normally after work finishes,
 then reopen through **Codex Sidebar Flow.app** or its launch command, or through

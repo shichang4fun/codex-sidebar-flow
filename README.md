@@ -1,14 +1,13 @@
 # Codex Sidebar Flow
 
-This local checkout includes an unpublished [periodic compensation patch](docs/local-compensation.md)
-and [optional original-icon startup](docs/original-icon.md) on top of
-v0.4.0-beta.1. It also includes [local Project-task lifecycle support, event queue
-optimizations and validation evidence](docs/local-new-task-validation.md).
-These development-branch changes do not modify the published beta tag; real
-movement still has multi-second latency and remote controller-side tasks are
-not supported by this proxy.
+This development branch prepares **v0.4.0-beta.2 (unreleased)**, including
+[periodic compensation](docs/local-compensation.md),
+[optional original-icon startup](docs/original-icon.md), and
+[local Project-task lifecycle support and event queue optimizations](docs/local-new-task-validation.md).
+The existing v0.4.0-beta.1 tag is unchanged. See the
+[release notes draft and compatibility boundary](docs/release-notes-beta.2.md).
 
-## v0.4.0-beta.1: local event-driven Desktop proxy
+## Current local event-driven Desktop proxy
 
 An opt-in macOS launcher observes structured App Server events and uses native
 Desktop tools to move eligible local tasks between In Progress and For Review.
@@ -18,9 +17,18 @@ No sorting model turns, Hooks or heartbeat are required by this path.
 By default, use the dedicated launcher every time. This checkout also provides an
 explicit opt-in to load the proxy when opening the original Codex icon; see the
 original-icon guide above for its GUI-session-wide effect and rollback.
-Remote tasks, Project tasks, Pinned and For Later are not managed by this beta.
-Real Desktop start/completion movement has been observed on two local tasks;
-this is not a stable release or a guarantee of instantaneous/lossless delivery.
+Eligible standalone local tasks and local child tasks of an ordinary Projects
+entry are supported. Only the child moves; its `projectId` and Project container
+remain unchanged. Pinned, For Later, other custom groups and ambiguous membership
+protect both tasks and their parent Projects. A child of a Pinned Project is
+therefore **not** eligible, even when the child is not individually pinned.
+Remote tasks are not managed by this proxy.
+
+Start/completion movement passed real acceptance for ordinary and Project-child
+tasks on ChatGPT Desktop **26.908.40834 (8881)** with bundled Codex CLI
+**0.154.0-alpha.6.2**. This does not establish compatibility with all ChatGPT/Codex
+Desktop versions. Movement can still take several seconds; this is not a stable
+release or a guarantee of instantaneous/lossless delivery.
 See [protocol research and verification boundaries](docs/local-official-api-prototype.md).
 
 The plugin manifest and `scripts/setup.mjs` still install the **legacy Hook path**,
@@ -28,6 +36,11 @@ not the new proxy. Do not run both mechanisms against the same tasks. Follow the
 proxy guide's migration section before enabling it on an existing installation.
 
 ## Legacy v0.3.x Hook/controller integration
+
+Everything below, except the license, documents the separate historical Hook
+implementation. Its Pinned-Project policy differs from the current proxy above.
+Do not use these setup/heartbeat instructions to install the current proxy or
+enable them alongside it.
 
 Codex Sidebar Flow v0.3.2 adds an experimental controller-host bridge for multi-host near-realtime organization on compatible Codex Desktop builds. A remote lifecycle Hook sends only a strict `{ protocol, event, threadId }` wake hint without a destination `hostId`; the organizer running on the controlling Mac resolves the unique controller-visible task, its real `remote-control:*` host, and the controlling Mac's section IDs before any move. A recurring heartbeat repairs missed or interrupted transitions. Classification never follows task content.
 

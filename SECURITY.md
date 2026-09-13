@@ -9,7 +9,15 @@ stream, including prompts/results. It forwards that stream without persisting
 conversation content; classification uses structured metadata only. It adds no
 TCP listener, external backend, model sorting turns, Hook or heartbeat. Native
 MCP list/read results may contain previews, but those are not interpreted or
-logged. Direct read/move calls are limited to eligible local non-Project tasks.
+logged. Direct read/move calls are limited to eligible local root tasks, including
+children of an unambiguous ordinary Projects entry. Only the child moves; its
+Project association and container remain unchanged. Pinned, For Later, other
+custom groups and ambiguous task/parent membership are protected, including
+children of Pinned Projects. Remote tasks are not managed by the proxy.
+
+Private bounded timing records contain task IDs and durations, not task content.
+Do not upload timing logs, local usernames/paths, credentials or acceptance
+databases in issues or release artifacts. Publish only sanitized aggregate evidence.
 
 The installation uses private directories, immutable content-hashed runtime
 snapshots and recoverable uninstall. Hashes identify files, not publisher

@@ -73,6 +73,11 @@ classification does not stop that organizer from making its own moves.
 
 ## Scope and hot configuration
 
+The rules below describe the default compatibility policy. The separately
+authorized [`forceStatusSections` opt-in](local-status-grouping.md) instead
+protects only directly Pinned tasks and does not call the global task list.
+It is not enabled automatically by reinstalling.
+
 The default installation config explicitly selects `all-local` and the supplied
 excluded IDs. Only root local Codex tasks are eligible (not subagents, ephemeral
 or archived tasks). Standalone tasks require one unambiguous direct membership in

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 const OBSERVER_METHODS = new Set([
-  'thread/read', 'thread/loaded/list', 'threadSection/list', 'thread/section/move',
+  'thread/read', 'thread/list', 'thread/loaded/list', 'threadSection/list', 'thread/section/move',
   'mcpServerStatus/list', 'mcpServer/tool/call',
 ]);
 

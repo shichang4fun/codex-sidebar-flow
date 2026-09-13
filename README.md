@@ -29,6 +29,14 @@ A child of a Pinned Project is
 therefore **not** eligible, even when the child is not individually pinned.
 Remote tasks are not managed by this proxy.
 
+**New explicit opt-in:** [local status grouping with Pinned protection](docs/local-status-grouping.md)
+replaces the manual-group/Project-ancestor rules above. Only directly Pinned
+tasks remain protected; For Later and other custom groups follow runtime status.
+It uses local App Server reads instead of the global Desktop task list. Existing
+configurations keep the default policy. Fresh GUI-created standalone and
+Project-child tasks passed start/completion acceptance after normal activation;
+see [measured results and remaining limits](docs/local-boundary-acceptance.md).
+
 Start/completion movement passed real acceptance for ordinary and Project-child
 tasks on ChatGPT Desktop **26.908.40834 (8881)** with bundled Codex CLI
 **0.154.0-alpha.6.2**. This does not establish compatibility with all ChatGPT/Codex

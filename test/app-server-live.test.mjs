@@ -12,6 +12,8 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { connectRpc, createObserver } from '../experimental/app-server-observer.mjs';
 import { createStdioRelay } from '../experimental/stdio-relay.mjs';
+import { desktopMcpAdapter } from '../experimental/desktop-mcp-adapter.mjs';
+import { createDesktopObserverManager } from '../experimental/desktop-observer-manager.mjs';
 
 async function relayedClient(child) {
   const pending = new Map(), listeners = new Set();
@@ -50,9 +52,16 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
   timeout: 30000,
 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'sidebar-official-api-test-'));
-  let child, actor, watcher;
+  let child, actor, watcher, manager, secondChild, secondActor, secondWatcher;
   t.after(async () => {
+    manager?.stop();
     watcher?.close(); actor?.close();
+    secondWatcher?.close(); secondActor?.close();
+    if (secondChild?.pid && secondChild.exitCode === null && secondChild.signalCode === null) {
+      const exited = once(secondChild, 'exit'); secondChild.kill();
+      const timer = setTimeout(() => secondChild.kill('SIGKILL'), 3000);
+      await exited; clearTimeout(timer);
+    }
     if (child?.pid && child.exitCode === null && child.signalCode === null) {
       const exited = once(child, 'exit');
       child.kill();
@@ -122,7 +131,28 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
     cwd: root, model: 'fixture', modelProvider: 'fixture', sandbox: 'read-only', approvalPolicy: 'never',
     baseInstructions: 'Reply OK. Do not use tools.',
   });
-  const observer = createObserver(watcher, { threadIds: [thread.id], apply: true });
+  // Exercise the actual lifecycle manager. Only the Desktop renderer/native
+  // move boundary is substituted with a raw isolated-server section write.
+  const startupMapping = {
+    inProgress: { desktopId: sections['In Progress'].id, localId: sections['In Progress'].id },
+    forReview: { desktopId: sections['For Review'].id, localId: sections['For Review'].id },
+  };
+  const fastMoves = [], lifecycleTimings = [];
+  const lifecycleRpc = { async request(method, params) {
+    if (method !== 'mcpServer/tool/call') return watcher.request(method, params);
+    assert.equal(params.tool, 'move_thread_to_sidebar_section');
+    assert.equal(params.arguments.hostId, 'local');
+    const before = (await actor.request('thread/read', { threadId: thread.id })).thread;
+    await actor.request('thread/section/move', { threadId: thread.id, sectionId: params.arguments.sectionId });
+    fastMoves.push({ active: before.status.type === 'active', previewEmpty: before.preview === '' });
+    return { content: [{ type: 'text', text: JSON.stringify(params.arguments) }] };
+  } };
+  manager = createDesktopObserverManager(lifecycleRpc, {
+    readConfig: () => ({ version: 1, mode: 'all-local', forceStatusSections: startupMapping }),
+    onTiming: row => lifecycleTimings.push(row),
+  });
+  const observer = manager;
+  let captureLifecycle = true;
   const events = [];
   const actorErrors = [];
   actor.subscribe(message => {
@@ -133,6 +163,7 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
   let completed;
   const done = new Promise(resolve => { completed = resolve; });
   watcher.subscribe(message => {
+    if (!captureLifecycle) return;
     if (message.params?.threadId !== thread.id) return;
     if (!['thread/status/changed', 'turn/started', 'turn/completed'].includes(message.method)) return;
     events.push({ method: message.method, status: message.params.status?.type });
@@ -161,12 +192,53 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
   assert.ok(events.some(e => e.status === 'idle'), 'Independent watcher must receive idle status');
   assert.ok(outcomes.some(r => r.action === 'moved' && r.sectionId === sections['In Progress'].id));
   assert.ok(outcomes.some(r => r.action === 'moved' && r.sectionId === sections['For Review'].id));
+  await manager.drain();
+  assert.ok(fastMoves.some(m => m.active && m.previewEmpty), 'Move while the new task preview is still empty');
+  assert.ok(lifecycleTimings.some(r => r.action === 'moved' && r.rpcCounts['thread/list'] === undefined));
+  assert.ok(lifecycleTimings.some(r => r.action === 'moved' && r.rpcCounts['thread/list'] > 0));
+  t.diagnostic(JSON.stringify({ fastPathBeforePreview: true, activeWithoutList: true,
+    completionStillChecksList: true, desktopRendererVerified: false }));
+  captureLifecycle = false;
   const final = await actor.request('thread/read', { threadId: thread.id });
   assert.equal(final.thread.section?.id, sections['For Review'].id);
   // Simulate a missed terminal event in this isolated server, not the user's Desktop.
+  const moveNotifications = [];
+  let captureMove = true;
+  actor.subscribe(message => { if (captureMove && message.id == null && message.method) moveNotifications.push(message.method); });
   await actor.request('thread/section/move', { threadId: thread.id, sectionId: sections['In Progress'].id });
+  const rawReadback = await actor.request('thread/read', { threadId: thread.id, includeTurns: false });
+  captureMove = false;
+  assert.equal(rawReadback.thread.section?.id, sections['In Progress'].id);
+  t.diagnostic(JSON.stringify({ rawSectionWriteReadback: true,
+    notificationMethodsThroughReadback: [...new Set(moveNotifications)], desktopRefreshVerified: false }));
   const restartedObserver = createObserver(watcher, { threadIds: [thread.id], apply: true });
   assert.equal((await restartedObserver.reconcile(thread.id)).sectionId, sections['For Review'].id);
+  // Real local protocol metadata and pin protection. Only the Desktop move
+  // boundary is substituted: this isolated server has no Desktop renderer.
+  const pinId = '01984de2-8f74-7c91-a3b2-5c5e937cf318';
+  const mapping = {
+    inProgress: { desktopId: '10000000-0000-4000-8000-000000000001', localId: sections['In Progress'].id },
+    forReview: { desktopId: '10000000-0000-4000-8000-000000000002', localId: sections['For Review'].id },
+  };
+  let nativeMoves = 0;
+  const localAdapter = desktopMcpAdapter({ async request(method, params) {
+    if (method !== 'mcpServer/tool/call') return watcher.request(method, params);
+    assert.equal(params.tool, 'move_thread_to_sidebar_section');
+    assert.equal(params.arguments.hostId, 'local');
+    const destination = Object.values(mapping).find(s => s.desktopId === params.arguments.sectionId);
+    assert.ok(destination); nativeMoves++;
+    await actor.request('thread/section/move', { threadId: thread.id, sectionId: destination.localId });
+    return { content: [{ type: 'text', text: JSON.stringify(params.arguments) }] };
+  } }, thread.id, { forceStatusSections: mapping });
+  const forceObserver = createObserver(localAdapter, { threadIds: [thread.id], apply: true, forceStatus: true, allowProjectTasks: true });
+  await actor.request('thread/section/move', { threadId: thread.id, sectionId: pinId });
+  await assert.rejects(forceObserver.reconcile(thread.id), /Pinned/);
+  assert.equal(nativeMoves, 0);
+  await actor.request('thread/section/move', { threadId: thread.id, sectionId: sections['For Later'].id });
+  assert.equal((await forceObserver.reconcile(thread.id)).action, 'moved');
+  assert.equal(nativeMoves, 1);
+  assert.equal((await forceObserver.reconcile(thread.id)).action, 'unchanged');
+  t.diagnostic(JSON.stringify({ localPinProtection: true, forceLaterToReview: true, nativeDesktopMoveSubstituted: true }));
   const mcpResults = await Promise.all(mcpCalls);
   const markers = mcpResults.map(r => JSON.parse(r.content[0].text).marker);
   assert.ok(markers.includes('active'));
@@ -207,4 +279,35 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
     assert.equal(await listed(), true, 'A genuine user input makes the same task list-visible');
     t.diagnostic(JSON.stringify({ toolOnlyThreadVisible: false, toolFollowupVisible: false, afterUserInputVisible: true }));
   }
+  // Verify the archive invariant used by the fast path on this real binary:
+  // another local process cannot archive its active writer; the owning server
+  // unloads it when archived, and an archived task cannot be resumed directly.
+  secondChild = spawn(process.env.SIDEBAR_TEST_CODEX_BINARY, [...commandArgs.slice(0, -1), 'stdio://'], {
+    cwd: root, env: { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: root,
+      NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  secondChild.stderr.resume();
+  ({ actor: secondActor, watcher: secondWatcher } = await relayedClient(secondChild));
+  await actor.request('turn/start', { threadId: thread.id,
+    input: [{ type: 'text', text: 'Isolated active archive probe', text_elements: [] }] });
+  let activeSeen = false;
+  for (let i = 0; i < 100; i++) {
+    if ((await actor.request('thread/read', { threadId: thread.id })).thread.status.type === 'active') { activeSeen = true; break; }
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(activeSeen, true, 'Archive probe must operate on a genuinely active task');
+  const startEvent = { method: 'thread/status/changed', params: { threadId: thread.id, status: { type: 'active', activeFlags: [] } } };
+  const moveCount = fastMoves.length;
+  await actor.request('thread/section/move', { threadId: thread.id, sectionId: pinId });
+  await assert.rejects(manager.handle(startEvent), /Pinned/);
+  assert.equal(fastMoves.length, moveCount);
+  await actor.request('thread/section/move', { threadId: thread.id, sectionId: sections['For Review'].id });
+  await assert.rejects(secondActor.request('thread/archive', { threadId: thread.id }), /active writer/);
+  await actor.request('thread/archive', { threadId: thread.id });
+  assert.equal((await actor.request('thread/read', { threadId: thread.id })).thread.status.type, 'notLoaded');
+  await assert.rejects(manager.handle(startEvent), { code: 'TASK_NOT_VISIBLE' });
+  assert.equal(fastMoves.length, moveCount);
+  await assert.rejects(secondActor.request('thread/resume', { threadId: thread.id }), /archived/);
+  t.diagnostic(JSON.stringify({ fastPathNativePinnedProtected: true, fastPathArchivedTaskProtected: true,
+    crossProcessActiveArchiveRejected: true, archivedResumeRejected: true }));
 });

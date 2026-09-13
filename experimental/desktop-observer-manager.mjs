@@ -36,20 +36,33 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
   const pending = new Map();
   const retries = new Map();
   const retryDelays = [250, 750, 2000, 5000];
+  // Local starts may precede list visibility. Probe more often early, keeping
+  // the same eight-second timer budget and a finite number of fresh reads.
+  const visibilityRetryDelays = [250, 250, 250, 250, 500, 500, 1000, 2000, 3000];
   const retryable = new Set(['DESKTOP_MCP_UNAVAILABLE', 'TASK_NOT_VISIBLE', 'MEMBERSHIP_NOT_READY']);
   let stopped = false;
   let queue = Promise.resolve(), pumping = false, currentId = null, currentEntry = null;
   let scan = null, offset = 0, currentRecovery = false;
+  let forcePage = null, forceCursor = null, forceScanConfig = null;
   let currentTiming = null;
   // One summary per queue entry, never tool arguments, task text or raw errors.
   // The manager is serial; reused observers must charge the current entry.
-  async function measuredRequest(method, params) {
+  async function measuredRequest(method, params, transaction) {
     const timing = currentTiming;
     const tool = method === 'mcpServer/tool/call' ? params.tool : method;
     const started = now();
-    try { return await rpc.request(method, params); }
+    try {
+      const response = rpc.request(method, params);
+      // Abandon only the obsolete wait, not the wire request. The relay can
+      // share an identical unresolved list with the successor. No settled cache.
+      // Once a write starts, serialize its full readback before any successor.
+      return await (transaction.writeDispatched ? response : Promise.race([
+        response, transaction.cancelled.then(() => { throw superseded(); }),
+      ]));
+    }
     finally {
-      if (timing && ['list_threads', 'read_thread', 'move_thread_to_sidebar_section'].includes(tool)) {
+      if (timing && ['list_threads', 'read_thread', 'move_thread_to_sidebar_section',
+        'thread/read', 'thread/list', 'threadSection/list'].includes(tool)) {
         timing.rpcCounts[tool] = (timing.rpcCounts[tool] ?? 0) + 1;
         timing.rpcMs[tool] = (timing.rpcMs[tool] ?? 0) + Math.max(0, now() - started);
         if (tool === 'move_thread_to_sidebar_section') timing.moveAfterMs = Math.max(0, now() - timing.queuedAt);
@@ -84,11 +97,14 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
           if (stopped || !isManagedTask(config, id)) {
             observers.delete(id); action = 'skipped'; entry.resolve({ action }); continue;
           }
-          if (!observers.has(id) || currentRecovery) {
-            if (!observers.has(id) && observers.size >= 256) { action = 'skipped'; entry.resolve({ action, reason: 'task-limit' }); continue; }
+          // Force mode has no historical start dependency; rebuild its small
+          // adapter so a configuration change cannot retain old destinations.
+          if (!observers.has(id) || currentRecovery || config.forceStatusSections || observers.get(id).forcePolicy) {
+            if (!config.forceStatusSections && !observers.has(id) && observers.size >= 256) { action = 'skipped'; entry.resolve({ action, reason: 'task-limit' }); continue; }
             const guarded = { async request(method, params) {
               const current = validateProxyConfig(readConfig());
-              if (stopped || !isManagedTask(current, id) || (currentRecovery && (current.reconcileIntervalSeconds === 0
+              if (JSON.stringify(current.forceStatusSections) !== JSON.stringify(config.forceStatusSections)
+                  || stopped || !isManagedTask(current, id) || (currentRecovery && (current.reconcileIntervalSeconds === 0
                   || !isManagedTask(current, entry.context)))) throw Error('Policy changed');
               // Capture the running transaction, not a mutable latest version.
               const transaction = currentEntry;
@@ -97,7 +113,7 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
               };
               check();
               if (params.tool === 'move_thread_to_sidebar_section') transaction.writeDispatched = true;
-              try { return await measuredRequest(method, params); }
+              try { return await measuredRequest(method, params, transaction); }
               finally {
                 // Even a failed slow read must not retry an obsolete start.
                 // Once a write is dispatched, still finish its fresh readback.
@@ -105,8 +121,10 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
               }
             } };
             observers.set(id, createObserver(desktopMcpAdapter(guarded, id,
-              { contextThreadId: currentRecovery ? entry.context : id }),
-            { threadIds: [id], apply, allowProjectTasks: true, allowForLaterStart: true }));
+              { contextThreadId: currentRecovery ? entry.context : id, forceStatusSections: config.forceStatusSections,
+                activeFastPath: !currentRecovery && eventState(entry.latest, null)?.phase === 'active' }),
+            { threadIds: [id], apply, allowProjectTasks: true, allowForLaterStart: true, forceStatus: !!config.forceStatusSections }));
+            observers.get(id).forcePolicy = !!config.forceStatusSections;
           }
           const observer = observers.get(id);
           // Preserve the original server start notification when a burst has
@@ -132,13 +150,15 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
             continue;
           }
           const attempt = entry.retryAttempt ?? 0;
-          if (!stopped && entry.latest && retryable.has(error.code) && attempt < retryDelays.length && retries.size < 256) {
+          const delays = error.code === 'TASK_NOT_VISIBLE' && entry.start && observers.get(id)?.forcePolicy
+            ? visibilityRetryDelays : retryDelays;
+          if (!stopped && entry.latest && retryable.has(error.code) && attempt < delays.length && retries.size < 256) {
             const retry = { latest: entry.latest, start: entry.start, retryAttempt: attempt + 1 };
             retry.timer = setTimer(() => {
               if (retries.get(id) !== retry) return;
               // enqueue transfers real start evidence and cancels this timer.
               enqueue(id, retry.latest).then(onRetry).catch(() => {});
-            }, retryDelays[attempt]);
+            }, delays[attempt]);
             retry.timer?.unref?.();
             retries.set(id, retry);
             // New-task failures need only their actual start notification, not
@@ -148,6 +168,8 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
           } else observers.delete(id);
           entry.reject(error);
         } finally {
+          // Force classification depends only on fresh reads, not start history.
+          if (observers.get(id)?.forcePolicy) observers.delete(id);
           const endedAt = now();
           currentTiming = null;
           try {
@@ -178,6 +200,7 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
         return Promise.resolve({ action: 'skipped', reason: 'task-limit' });
       }
       entry = { queuedAt: now(), receivedAt: new Date().toISOString(), notifications: 0 };
+      entry.cancelled = new Promise(resolve => { entry.cancel = resolve; });
       entry.promise = new Promise((resolve, reject) => { entry.resolve = resolve; entry.reject = reject; });
       pending.set(id, entry);
     }
@@ -187,6 +210,7 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
       entry.latest = message; entry.state = state; entry.notifications++;
       if (running) {
         running.superseded = true;
+        running.cancel();
         entry.start ??= running.start;
       }
     }
@@ -217,6 +241,31 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
         const loaded = await guarded.request('thread/loaded/list', { limit: 1000 });
         if (!Array.isArray(loaded?.data)) throw Error('Invalid loaded task list');
         const contexts = loaded.data.filter(id => isManagedTask(config, id)).slice(0, 3);
+        if (config.forceStatusSections) {
+          if (!contexts.length) return { action: 'unavailable', reason: 'no-native-context' };
+          const fingerprint = JSON.stringify(config);
+          if (forceScanConfig !== fingerprint) { forceScanConfig = fingerprint; forcePage = null; forceCursor = null; }
+          if (!forcePage) {
+            const page = await guarded.request('thread/list', { archived: false, useStateDbOnly: true,
+              sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'], limit: 20,
+              sortKey: 'updated_at', cursor: forceCursor });
+            if (!Array.isArray(page?.data) || page.data.length > 20
+                || (page.nextCursor != null && (typeof page.nextCursor !== 'string' || page.nextCursor === forceCursor))) throw Error('Invalid local task page');
+            forcePage = { ids: page.data.map(t => t.id).filter(id => isManagedTask(config, id)), index: 0, next: page.nextCursor ?? null };
+          }
+          const result = { action: 'reconciled', candidates: forcePage.ids.length, checked: 0, moved: 0, errors: 0 };
+          const deadline = Date.now() + 10000;
+          while (forcePage.index < forcePage.ids.length && Date.now() < deadline) {
+            if (lifecycleBusy()) return { ...result, action: 'deferred', reason: 'lifecycle-busy' };
+            if (JSON.stringify(validateProxyConfig(readConfig())) !== fingerprint) break;
+            const id = forcePage.ids[forcePage.index++];
+            try { if ((await enqueue(id, null, contexts[0])).action === 'moved') result.moved++; } catch { result.errors++; }
+            result.checked++;
+          }
+          if (forcePage.index === forcePage.ids.length) { forceCursor = forcePage.next; forcePage = null; }
+          return result;
+        }
+        forceScanConfig = null; forcePage = null; forceCursor = null;
         let candidates, context;
         for (const id of contexts) {
           if (lifecycleBusy()) return { action: 'deferred', reason: 'lifecycle-busy' };

@@ -25,13 +25,18 @@ does not establish its activation or GUI behavior.
   terminal and unknown transitions supersede obsolete prewrite work.
 - Do not infer that an anonymous active event and a first explicit turn ID are
   the same turn. Preserve the real start evidence for the successor.
-- Superseded reads may settle but cannot issue an obsolete write or stale retry.
+- Superseded prewrite waits exit immediately so the successor can run. The relay
+  may share only an identical, still-unresolved list in the same task context;
+  there is no settled snapshot cache. Superseded wire reads may settle later but
+  cannot issue an obsolete write, stale retry or mutate published timing records.
   Once a write is dispatched, complete fresh readback before the next transaction.
 - Discard a superseded recovery observer so lifecycle work uses its own context.
 - Defer periodic repairs while lifecycle work is pending; keep repair batches
   bounded and round-robin. No model is invoked to classify tasks.
 - Write private, bounded, content-free timing records. See
   [Desktop proxy diagnostics](local-desktop-proxy.md#privacy-and-permissions).
+  Timing measures each transaction's logical RPC wait, ending on supersession;
+  overlapping waits on one shared wire request must not be summed as wire time.
 
 ## Baseline automated verification, 2026-09-13
 

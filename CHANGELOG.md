@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [0.4.0-beta.2] - Unreleased candidate
 
+- Add a force-status local running-event fast path: fresh active/no-attention tasks no longer wait for preview-filtered task-list inclusion. Keep Pinned/identity checks, fresh prewrite status and section/Project readback. Attention, terminal events, periodic compensation and default policy retain list checks. Gate the proof on the tested bundled build's archive/unload and active-writer behavior. Fresh GUI-created standalone and Project-child samples passed after normal activation; see [acceptance limits](docs/local-boundary-acceptance.md).
+
+- Shorten early force-status start-visibility retry gaps, with at most nine retries and eight seconds of timer waits for consecutive visibility failures. Keep transport/default-policy backoff, fresh Pinned/archival checks and cancellation unchanged. Add simulated delayed-visibility timing and scope/cancellation regressions. Denser retries alone failed the initial-latency gate; the active fast path above addresses that bottleneck.
+
+- Fix force-status new-task visibility gaps: treat absence from a valid local nonarchived list as `TASK_NOT_VISIBLE`, reusing the existing finite lifecycle retries. Retain fresh status/Pinned checks and archived exclusions; do not restore global enumeration or heartbeat. Add eight regressions; latest GUI-new-task evidence is recorded above.
+
+- Add explicit `forceStatusSections` opt-in: group local root tasks by current status, protecting only directly Pinned tasks. For Later, other manual groups and Project ancestry do not block child-task moves; Project containers are never moved. Replace global Desktop task listing with attached local App Server reads and paged local recovery. Existing configurations retain the default policy below. This opt-in requires separate installation and GUI acceptance; see [scope and rollback](docs/local-status-grouping.md).
+
 - Support local root child tasks of an unambiguous ordinary Projects entry, including children without direct sidebar membership. Move only the child and preserve its Project association; never move the Project container. Pinned tasks, other custom groups and ambiguous membership remain fail-closed. Pinned, For Later and other custom parent Projects continue to protect their children.
 - Allow a directly deferred For Later task to enter In Progress only after fresh reads confirm active with no attention flags, then complete through the normal For Review path. Idle, attention, unknown and stale-start states remain deferred; periodic compensation applies the same rule. Direct Pinned and Pinned Project protections are unchanged. This changes the Desktop runtime and requires new GUI acceptance after installation.
 - Preserve short-turn start evidence through bounded startup retries and periodic compensation; defer repairs while lifecycle work is pending.

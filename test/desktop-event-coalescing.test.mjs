@@ -216,6 +216,8 @@ test('lifecycle successor replaces a superseded observer using another recovery 
   await entered;
   config = { version: 1, mode: 'all-local', excludedThreadIds: ['recovery-context'] };
   const event = manager.handle(turn('turn/started', 'one'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(section, 'progress', 'Lifecycle must finish before the old recovery-context read returns');
   release();
   await Promise.all([scan, event]);
   assert.equal(section, 'progress');

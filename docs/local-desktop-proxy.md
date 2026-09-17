@@ -1,8 +1,8 @@
-# Local Desktop proxy (v0.4.0)
+# Local Desktop proxy (v0.4.1)
 
-This page describes v0.4.0. See [periodic compensation](local-compensation.md),
+This page describes v0.4.1. See [periodic compensation](local-compensation.md),
 [local lifecycle validation](local-new-task-validation.md) and the
-[release notes](release-notes-v0.4.0.md). Optional
+[release notes](release-notes-v0.4.1.md). Optional
 [original-icon integration](original-icon.md) enables the original icon to load
 the same proxy. The dedicated-launch behavior below applies without that opt-in.
 Disable original-icon integration before using the original icon as a bypass or
@@ -36,7 +36,7 @@ separate WebSocket research tests), and exactly one custom section each named
 `In Progress`, `For Review`, `For Later`. Supply your actual absolute paths:
 
 ```sh
-git clone --branch v0.4.0 --single-branch https://github.com/shichang4fun/codex-sidebar-flow.git
+git clone --branch v0.4.1 --single-branch https://github.com/shichang4fun/codex-sidebar-flow.git
 cd codex-sidebar-flow
 node scripts/install-desktop-proxy.mjs \
   --root /absolute/private/sidebar-flow-desktop \
@@ -47,7 +47,7 @@ node scripts/install-desktop-proxy.mjs \
 ```
 
 Inspect `git rev-parse HEAD` and compare it with the commit behind the published
-`v0.4.0` tag before installation. A version string alone is not proof of runtime
+`v0.4.1` tag before installation. A version string alone is not proof of runtime
 activation. Other app names/paths require matching build checks.
 
 The parent installation directory must exist. The dedicated root must be new or
@@ -219,12 +219,13 @@ a heartbeat.
 
 ## Verification status
 
-Current v0.4.0 status-grouping acceptance and runtime fingerprint are in the
-[release notes](release-notes-v0.4.0.md) and
-[running-client acceptance record](local-boundary-acceptance.md). Fresh GUI-created
-ordinary and Project-child tasks passed on the first Mac; the maintainer also
-confirmed second-Mac activation and verification. These are distinct from the
-historical default-policy evidence below.
+Current v0.4.1 status-grouping acceptance and runtime fingerprint are in the
+[release notes](release-notes-v0.4.1.md) and
+[running-client acceptance record](local-boundary-acceptance.md). The v0.4.1
+For Later lifecycle passed on the first Mac. Fresh GUI-created ordinary and
+Project-child tasks passed there under v0.4.0; the second-Mac activation and
+verification also applies only to v0.4.0. These are distinct from the historical
+default-policy evidence below and are not second-host v0.4.1 acceptance.
 
 ### Historical default-policy baseline
 

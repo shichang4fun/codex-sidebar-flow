@@ -1,6 +1,6 @@
 # Local periodic compensation patch
 
-Version: `0.4.0`. This does not re-enable legacy Hooks or model heartbeat.
+Version: `0.4.1`. This does not re-enable legacy Hooks or model heartbeat.
 The rules below describe the conservative default policy. Explicit
 [`forceStatusSections`](local-status-grouping.md) uses paged local recovery
 and protects only directly Pinned tasks; it does not use the global snapshot.
@@ -75,9 +75,9 @@ Do not publish those records or installation databases as acceptance evidence.
 
 ## Install and activate
 
-Run the [dedicated installer](local-desktop-proxy.md#setup) **from the reviewed
-development checkout**, not the unchanged old beta tag. Existing
-config and old immutable runtime snapshots are retained. The installer does not
+Run the [dedicated installer](local-desktop-proxy.md#setup) from the published
+`v0.4.1` tag. Existing config and old immutable runtime snapshots are retained.
+The installer does not
 replace code inside a running process: quit Codex normally after work finishes,
 then reopen through **Codex Sidebar Flow.app** or its launch command, or through
 the original icon after [explicitly enabling original-icon startup](original-icon.md). The old

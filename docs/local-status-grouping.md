@@ -1,8 +1,9 @@
-# Local status grouping — For Later policy update (unreleased)
+# Local status grouping — v0.4.1 For Later policy
 
-This checkout adds a direct For Later exception to the released v0.4.0 force
-policy. Existing v0.4.0 installations still overwrite For Later until upgraded.
-The released behavior and evidence remain in [v0.4.0 notes](release-notes-v0.4.0.md).
+v0.4.1 adds a direct For Later exception to the v0.4.0 force policy. Existing
+v0.4.0 installations still overwrite For Later until upgraded and relaunched.
+See [v0.4.1 release notes](release-notes-v0.4.1.md) and the historical
+[v0.4.0 notes](release-notes-v0.4.0.md).
 
 This is a new, explicitly selected policy, not a silent upgrade of existing
 manual-group protections. The released baseline targeted ChatGPT Desktop
@@ -53,10 +54,13 @@ completed, or a start superseded by a later status notification before processin
 also stays deferred. Resume a later turn or manually remove the task from For
 Later to release it. The final read/write race remains non-atomic.
 
-This patch is verified with synthetic regressions and isolated actual bundled
-App Server transports, not a live Desktop GUI acceptance. The inspected current
-app is 26.908.70816 (9275), bundled CLI 0.154.0-alpha.6.2. Do not reuse the older
-GUI sample above as acceptance of this policy change or the updated app build.
+The v0.4.1 policy passed synthetic regressions, all three isolated bundled App
+Server transports and a live Desktop lifecycle on app 26.908.70816 (9275),
+bundled CLI 0.154.0-alpha.6.2. In the live sample, manual deferral during an
+active turn survived that turn's completion; the next explicit turn moved to
+In Progress in 233 ms and completion moved to For Review in 285 ms. Readback
+finished in 24 ms. These observer timings do not measure rendered pixels or
+establish compatibility with other builds.
 
 ## Query path
 

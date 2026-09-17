@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-17
+
 - In explicit local status-grouping mode, preserve direct For Later placement
   until a current turn-start event strictly postdates the native section-entry
   time and the task is freshly active without attention flags. Recheck before
@@ -12,8 +14,11 @@ All notable changes to this project are documented here.
   already-completed starts. Keep direct Pinned protection, Project association,
   other custom-group behavior and the conservative default policy unchanged.
 - Add ordering/retry/restart regressions and isolated real-server timestamp and
-  deferred-resume coverage. No published tag or installed runtime is changed by
-  this source patch; fresh GUI acceptance is still required after installation.
+  deferred-resume coverage.
+- Accept the installed runtime on ChatGPT Desktop 26.908.70816 (9275): manual
+  deferral survived completion, the next turn moved to In Progress in 233 ms,
+  and completion moved to For Review in 285 ms. These are observer timings, not
+  rendered-pixel latency or a compatibility claim for other Desktop builds.
 
 ## [0.4.0] - 2026-09-14
 

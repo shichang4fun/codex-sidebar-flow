@@ -1,16 +1,13 @@
 # Codex Sidebar Flow
 
-**Unreleased policy update in this checkout:** directly deferred For Later tasks
-now stay put until a provably subsequent turn starts. This is not included in
-the published `v0.4.0` tag. See [policy and verification limits](docs/local-status-grouping.md).
-
-**v0.4.0** provides local status-driven grouping on the tested macOS Desktop
+**v0.4.1** provides local status-driven grouping on the tested macOS Desktop
 build, including
 [periodic compensation](docs/local-compensation.md),
 [optional original-icon startup](docs/original-icon.md), and
 [local Project-task lifecycle support and event queue optimizations](docs/local-new-task-validation.md).
-See the [release notes and compatibility boundary](docs/release-notes-v0.4.0.md).
-Install from the `v0.4.0` tag, not the default branch's historical instructions.
+Directly deferred For Later tasks now stay put until a provably subsequent turn
+starts. See the [release notes and compatibility boundary](docs/release-notes-v0.4.1.md).
+Install from the `v0.4.1` tag, not the default branch's historical instructions.
 
 ## Current local event-driven Desktop proxy
 
@@ -35,20 +32,22 @@ therefore **not** eligible, even when the child is not individually pinned.
 Remote tasks are not managed by this proxy.
 
 **New explicit opt-in:** [local status grouping with Pinned protection](docs/local-status-grouping.md)
-replaces the manual-group/Project-ancestor rules above. Only directly Pinned
-tasks remain protected; For Later and other custom groups follow runtime status.
+replaces the manual-group/Project-ancestor rules above. Directly Pinned tasks
+remain protected. Direct For Later placement remains deferred until a provably
+subsequent turn starts; other custom task groups follow runtime status.
 It uses local App Server reads instead of the global Desktop task list. Existing
 configurations keep the default policy. Fresh GUI-created standalone and
 Project-child tasks passed start/completion acceptance after normal activation;
 see [measured results and remaining limits](docs/local-boundary-acceptance.md).
 
-Start/completion movement passed real acceptance for ordinary and Project-child
-tasks on ChatGPT Desktop **26.908.40834 (8881)** with bundled Codex CLI
-**0.154.0-alpha.6.2**. This does not establish compatibility with all ChatGPT/Codex
-Desktop versions. This release is stable within its documented build and policy
-scope, not a guarantee of instantaneous/lossless delivery. New GUI-created
-ordinary and Project-child tasks passed under the explicit status-grouping mode;
-a second Mac's activation and verification were confirmed by the maintainer.
+The v0.4.1 For Later lifecycle passed real acceptance on ChatGPT Desktop
+**26.908.70816 (9275)** with bundled Codex CLI **0.154.0-alpha.6.2**. Earlier
+standalone and Project-child lifecycle samples used build 26.908.40834 (8881).
+This does not establish compatibility with all ChatGPT/Codex Desktop versions.
+This release is stable within its documented build and policy scope, not a
+guarantee of instantaneous/lossless delivery. A second Mac's v0.4.0 activation
+and verification were previously confirmed by the maintainer; v0.4.1 remote-host
+behavior is outside this release's scope.
 Approval/cancellation UI has not been separately accepted, and pinning between
 the final read and move remains a documented race.
 See [protocol research and verification boundaries](docs/local-official-api-prototype.md).

@@ -1,11 +1,36 @@
-# Local boundary acceptance — 2026-09-13
+# Local boundary acceptance
 
-Runtime: `6f9bb693d394c999c4da7c4d59445f149c876fe7ad5998ace0d0383df649b1dd`.
+This record separates evidence by release and Desktop build. Evidence from an
+earlier section does not establish compatibility for later versions.
+
+## v0.4.1 For Later acceptance — 2026-09-17
+
+After a normal user relaunch, process-path inspection confirmed runtime
+`b86111ebc364120494d4c08b1548fbecfc208e159d3a8c07324099d1608b81af`
+on ChatGPT Desktop 26.908.70816 (9275), bundled CLI 0.154.0-alpha.6.2.
+The existing task was moved to For Later during an active turn. That placement
+survived both the running state and the turn's completion. A subsequent explicit
+turn start moved it to In Progress, and its completion moved it to For Review.
+
+| Event | Result | Observer move time |
+| --- | --- | ---: |
+| Manual deferral during active turn | Stayed in For Later through completion | no move |
+| Subsequent `turn/started` | Moved to In Progress | 233 ms |
+| `turn/completed` | Moved to For Review | 285 ms |
+| Following `turn/started` | Moved back to In Progress | 240 ms |
+
+The completion readback took 24 ms. Records came from the private installed
+observer timing ring and were cross-checked against native sidebar membership.
+They contain no prompt text. This sample closes the direct For Later lifecycle
+gate for the named build; it does not cover remote hosts, native approval/cancel
+UI, other Desktop builds, rendered-pixel latency or the non-atomic final move.
+
+## v0.4.0 new-task acceptance — 2026-09-14
+
 Build boundary: ChatGPT Desktop 26.908.40834 (8881), bundled CLI
 0.154.0-alpha.6.2. Mode: explicit local status grouping with direct Pinned
-protection; compensation interval 600 seconds.
-
-## Latest new-task acceptance — 2026-09-14
+protection; compensation interval 600 seconds. The preceding 2026-09-13 runtime
+was `6f9bb693d394c999c4da7c4d59445f149c876fe7ad5998ace0d0383df649b1dd`.
 
 After a normal user relaunch, process-path inspection and observer records
 confirmed runtime `0ce55b498559bb339b894a86b291223cac1d6ae66412bfec7cc77a7279937336`.
@@ -28,12 +53,13 @@ an atomic pin/write guarantee, other Desktop builds or a latency SLA.
 
 ## Second-Mac confirmation — 2026-09-14
 
-A second Mac installed exact implementation commit
+A second Mac installed the v0.4.0 exact implementation commit
 `796969bb8cae2639d5f62a969b386fd9c83653ab` with the same twelve-file runtime hash.
 Its installation records report 324 passing tests, zero failures, three opt-in
 skips, both syntax checks passing and all three bundled App Server tests passing.
-The installed build matches the boundary above. Host-specific section mappings
-were resolved locally; no private identities or raw logs are included here.
+The installed build matches the v0.4.0 boundary above; this is not v0.4.1
+second-host acceptance. Host-specific section mappings were resolved locally;
+no private identities or raw logs are included here.
 
 The maintainer subsequently confirmed the new runtime was loaded and verification
 completed. This is maintainer-reported acceptance: the controller could not read
@@ -76,10 +102,9 @@ visibility behavior.
 | Native approval/input UI and manual cancellation | Computer Use denied | Blocked; not accepted |
 | Pin exactly between final read and native write | No atomic compare-and-set API | Not proven; documented residual race |
 
-For Later observation includes a loaded idle notification before the new active
-turn: status mode may first move idle For Later to For Review, then active to
-In Progress. This follows the selected policy; For Later is not an idle-state
-protection in this mode.
+The historical matrix used the preceding policy, where a loaded idle notification
+could move For Later to For Review. v0.4.1 replaces that behavior: direct For
+Later remains deferred until a provably subsequent explicit turn starts.
 
 ## Checks and findings
 

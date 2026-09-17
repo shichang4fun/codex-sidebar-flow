@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- In explicit local status-grouping mode, preserve direct For Later placement
+  until a current turn-start event strictly postdates the native section-entry
+  time and the task is freshly active without attention flags. Recheck before
+  writing; completion, recovery and stale events cannot undo manual deferral.
+- Fail closed for missing timestamps, same-second ordering and superseded or
+  already-completed starts. Keep direct Pinned protection, Project association,
+  other custom-group behavior and the conservative default policy unchanged.
+- Add ordering/retry/restart regressions and isolated real-server timestamp and
+  deferred-resume coverage. No published tag or installed runtime is changed by
+  this source patch; fresh GUI acceptance is still required after installation.
+
 ## [0.4.0] - 2026-09-14
 
 - Promote the reviewed local Desktop runtime from implementation commit

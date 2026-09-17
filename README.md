@@ -1,5 +1,9 @@
 # Codex Sidebar Flow
 
+**Unreleased policy update in this checkout:** directly deferred For Later tasks
+now stay put until a provably subsequent turn starts. This is not included in
+the published `v0.4.0` tag. See [policy and verification limits](docs/local-status-grouping.md).
+
 **v0.4.0** provides local status-driven grouping on the tested macOS Desktop
 build, including
 [periodic compensation](docs/local-compensation.md),

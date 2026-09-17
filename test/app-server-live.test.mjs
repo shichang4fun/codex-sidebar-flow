@@ -235,10 +235,37 @@ for (const transport of ['websocket', 'stdio-relay', 'stdio-proxy']) test(`real 
   await assert.rejects(forceObserver.reconcile(thread.id), /Pinned/);
   assert.equal(nativeMoves, 0);
   await actor.request('thread/section/move', { threadId: thread.id, sectionId: sections['For Later'].id });
-  assert.equal((await forceObserver.reconcile(thread.id)).action, 'moved');
-  assert.equal(nativeMoves, 1);
-  assert.equal((await forceObserver.reconcile(thread.id)).action, 'unchanged');
-  t.diagnostic(JSON.stringify({ localPinProtection: true, forceLaterToReview: true, nativeDesktopMoveSubstituted: true }));
+  const deferred = (await actor.request('thread/read', { threadId: thread.id })).thread;
+  assert.ok(Number.isFinite(deferred.sectionEnteredAt), 'Real section entry time must be exposed');
+  await assert.rejects(forceObserver.reconcile(thread.id), /For Later/);
+  assert.equal(nativeMoves, 0);
+  assert.equal((await manager.reconcile()).moved, 0, 'Recovery cannot undo manual deferral');
+  // Server timestamps have second precision. Wait for provable ordering, not
+  // an assumed subsecond ordering or a synthetic lifecycle notification.
+  await new Promise(resolve => setTimeout(resolve, Math.max(0, (deferred.sectionEnteredAt + 1) * 1000 - Date.now() + 30)));
+  const laterResults = []; let actualStart;
+  let finishLater, failLater;
+  const laterDone = new Promise((resolve, reject) => { finishLater = resolve; failLater = reject; });
+  // WebSocket watcher is a second connection: it receives status broadcasts,
+  // not the owning actor's turn notifications. Use the real owner event stream,
+  // matching the Desktop's single attached stdio connection.
+  const stopLater = (transport === 'websocket' ? actor : watcher).subscribe(message => {
+    if (message.params?.threadId !== thread.id || !['turn/started', 'turn/completed', 'thread/status/changed'].includes(message.method)) return;
+    if (message.method === 'turn/started') actualStart = message.params.turn;
+    manager.handle(message).then(result => {
+      laterResults.push(result);
+      if (message.method === 'turn/completed') finishLater();
+    }, failLater);
+  });
+  try {
+    await actor.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: 'Say OK again', text_elements: [] }] });
+    await laterDone; await manager.drain();
+  } finally { stopLater(); }
+  assert.ok(actualStart.startedAt > deferred.sectionEnteredAt, 'New turn must postdate manual section entry');
+  assert.ok(laterResults.some(r => r.action === 'moved' && r.sectionId === sections['In Progress'].id));
+  assert.equal((await actor.request('thread/read', { threadId: thread.id })).thread.section.id, sections['For Review'].id);
+  t.diagnostic(JSON.stringify({ localPinProtection: true, forLaterRecoveryProtected: true,
+    subsequentNativeTurnUnlocks: true, nativeDesktopMoveSubstituted: true }));
   const mcpResults = await Promise.all(mcpCalls);
   const markers = mcpResults.map(r => JSON.parse(r.content[0].text).marker);
   assert.ok(markers.includes('active'));

@@ -11,17 +11,19 @@ const sections = {
 };
 const names = { inProgress: 'In Progress', forReview: 'For Review' };
 const pinnedId = '01984de2-8f74-7c91-a3b2-5c5e937cf318';
-function fixture({ sourceSection = 'custom', status = { type: 'active', activeFlags: [] }, onCall = () => {}, activeFastPath = false } = {}) {
+const laterId = '20000000-0000-4000-8000-000000000003';
+function fixture({ sourceSection = 'custom', status = { type: 'active', activeFlags: [] }, onCall = () => {}, activeFastPath = false, forLaterStart = null } = {}) {
   const calls = [], moves = [];
   const state = { archived: false, mappingValid: true, recordMove: true, thread: {
     id: 'task', cwd: '/fixture', source: 'appServer', parentThreadId: null, ephemeral: false,
-    projectId: 'project', section: { id: sourceSection, name: sourceSection }, status,
+    projectId: 'project', section: { id: sourceSection, name: sourceSection === laterId ? 'For Later' : sourceSection }, sectionEnteredAt: 100, status,
   } };
   const rpc = { async request(method, params = {}) {
     calls.push({ method, params }); onCall({ method, params, state, calls });
     if (method === 'threadSection/list' && state.sectionPages) return state.sectionPages[params.cursor ?? 'first'];
     if (method === 'threadSection/list') return { data: state.mappingValid ? [
       ...Object.entries(sections).map(([key, s]) => ({ id: s.localId, name: names[key] })),
+      { id: laterId, name: 'For Later' },
       ...state.missingPinnedSection ? [] : [{ id: pinnedId, name: 'Pinned' }],
     ] : [], nextCursor: null };
     if (method === 'thread/loaded/list') return { data: ['task'], nextCursor: null };
@@ -40,10 +42,136 @@ function fixture({ sourceSection = 'custom', status = { type: 'active', activeFl
     if (state.recordMove) state.thread.section = { id: s[1].localId, name: names[s[0]] };
     return { content: [{ type: 'text', text: JSON.stringify(params.arguments) }] };
   } };
-  const adapter = desktopMcpAdapter(rpc, 'task', { forceStatusSections: sections, activeFastPath });
+  const adapter = desktopMcpAdapter(rpc, 'task', { forceStatusSections: sections, activeFastPath, forLaterStart });
   const observer = createObserver(adapter, { threadIds: ['task'], apply: true, forceStatus: true, allowProjectTasks: true });
   return { rpc, adapter, observer, state, calls, moves };
 }
+
+const newStart = (startedAt = 101) => ({ method: 'turn/started', params: {
+  threadId: 'task', turn: { id: 'new-turn', startedAt },
+} });
+function laterManager(t, f, options = {}) {
+  const manager = createDesktopObserverManager(f.rpc, {
+    readConfig: () => ({ version: 1, mode: 'all-local', forceStatusSections: sections }), ...options,
+  });
+  t.after(() => manager.stop());
+  return manager;
+}
+
+for (const status of [{ type: 'idle' }, { type: 'systemError' },
+  { type: 'active', activeFlags: [] }, { type: 'active', activeFlags: ['waitingOnApproval'] }]) {
+  test(`For Later survives compensation for ${JSON.stringify(status)}`, async t => {
+    const f = fixture({ sourceSection: laterId, status });
+    const manager = laterManager(t, f);
+    assert.equal((await manager.reconcile()).moved, 0);
+    assert.equal(f.moves.length, 0);
+    assert.equal(f.state.thread.section.id, laterId);
+  });
+}
+
+for (const message of [
+  { method: 'thread/status/changed', params: { threadId: 'task', status: { type: 'active', activeFlags: [] } } },
+  { method: 'thread/started', params: { thread: { id: 'task', status: { type: 'active', activeFlags: [] } } } },
+  { method: 'turn/completed', params: { threadId: 'task', turn: { id: 'old-turn', status: 'completed' } } },
+  newStart(99), newStart(100), newStart(null), newStart(NaN), newStart(-1),
+]) test(`For Later rejects non-subsequent start evidence ${JSON.stringify(message)}`, async t => {
+  const f = fixture({ sourceSection: laterId });
+  assert.equal((await laterManager(t, f).handle(message)).action, 'skipped');
+  assert.equal(f.moves.length, 0);
+});
+
+for (const entered of [null, undefined, NaN, -1]) test(`For Later needs authoritative placement time ${entered}`, async t => {
+  const f = fixture({ sourceSection: laterId }); f.state.thread.sectionEnteredAt = entered;
+  assert.equal((await laterManager(t, f).handle(newStart())).action, 'skipped');
+  assert.equal(f.moves.length, 0);
+});
+
+test('For Later leaves on a subsequent turn then completes into review', async t => {
+  const f = fixture({ sourceSection: laterId }); const manager = laterManager(t, f);
+  assert.equal((await manager.handle(newStart())).action, 'moved');
+  assert.equal(f.state.thread.section.id, sections.inProgress.localId);
+  f.state.thread.status = { type: 'idle' };
+  await manager.handle({ method: 'turn/completed', params: { threadId: 'task', turn: { id: 'new-turn', status: 'completed' } } });
+  assert.equal(f.state.thread.section.id, sections.forReview.localId);
+  assert.equal(f.state.thread.projectId, 'project');
+});
+
+test('manual deferral during a running turn survives its duplicate start and completion', async t => {
+  const f = fixture(); const manager = laterManager(t, f);
+  await manager.handle(newStart());
+  f.state.thread.section = { id: laterId, name: 'For Later' }; f.state.thread.sectionEnteredAt = 102;
+  assert.equal((await manager.handle(newStart())).action, 'skipped');
+  f.state.thread.status = { type: 'idle' };
+  await manager.handle({ method: 'turn/completed', params: { threadId: 'task', turn: { id: 'new-turn', status: 'completed' } } });
+  await manager.reconcile();
+  assert.equal(f.moves.length, 1); assert.equal(f.state.thread.section.id, laterId);
+});
+
+test('manual For Later before final native write revokes the old start', async t => {
+  const f = fixture({ onCall({ method, state, calls }) {
+    if (method === 'thread/read' && calls.filter(c => c.method === method).length === 3) {
+      state.thread.section = { id: laterId, name: 'For Later' }; state.thread.sectionEnteredAt = 102;
+    }
+  } });
+  assert.equal((await laterManager(t, f).handle(newStart())).action, 'skipped');
+  assert.equal(f.moves.length, 0);
+});
+
+test('a queued start superseded by completion cannot release For Later', async t => {
+  const f = fixture({ sourceSection: laterId }); const manager = laterManager(t, f);
+  const a = manager.handle(newStart()); f.state.thread.status = { type: 'idle' };
+  const b = manager.handle({ method: 'turn/completed', params: { threadId: 'task', turn: { id: 'new-turn', status: 'completed' } } });
+  await Promise.all([a, b]); assert.equal(f.moves.length, 0);
+});
+
+test('For Later protection survives manager restart with no retained turn history', async t => {
+  const f = fixture({ sourceSection: laterId }); f.state.thread.sectionEnteredAt = 102;
+  const old = laterManager(t, f); old.stop();
+  const restarted = laterManager(t, f);
+  await restarted.reconcile(); await restarted.handle(newStart());
+  assert.equal(f.moves.length, 0);
+});
+
+test('For Later ID is protected even if exact read omits the section name', async t => {
+  const f = fixture({ sourceSection: laterId }); delete f.state.thread.section.name;
+  assert.equal((await laterManager(t, f).reconcile()).moved, 0);
+  assert.equal(f.moves.length, 0);
+});
+
+test('For Later name is protected when the listing has not exposed its ID', async t => {
+  const f = fixture({ sourceSection: laterId }); f.state.thread.section.id = 'new-later';
+  assert.equal((await laterManager(t, f).reconcile()).moved, 0);
+  assert.equal(f.moves.length, 0);
+});
+
+test('latest active status cannot borrow a coalesced turn start to unlock For Later', async t => {
+  const f = fixture({ sourceSection: laterId }); const manager = laterManager(t, f);
+  const start = manager.handle(newStart());
+  const active = manager.handle({ method: 'thread/status/changed', params: {
+    threadId: 'task', status: { type: 'active', activeFlags: [] },
+  } });
+  await Promise.all([start, active]); assert.equal(f.moves.length, 0);
+});
+
+for (const status of [{ type: 'idle' }, { type: 'active', activeFlags: ['waitingOnUserInput'] }]) {
+  test(`subsequent start cannot release an already terminal or waiting For Later task ${JSON.stringify(status)}`, async t => {
+    const f = fixture({ sourceSection: laterId, status });
+    assert.equal((await laterManager(t, f).handle(newStart())).action, 'skipped');
+    assert.equal(f.moves.length, 0);
+  });
+}
+
+test('a subsequent start does not override direct Pinned', async t => {
+  const f = fixture({ sourceSection: pinnedId });
+  await assert.rejects(laterManager(t, f).handle(newStart()), /Pinned/);
+  assert.equal(f.moves.length, 0);
+});
+
+test('For Later needs valid explicit turn identity', async t => {
+  const f = fixture({ sourceSection: laterId }); const start = newStart(); start.params.turn.id = '';
+  assert.equal((await laterManager(t, f).handle(start)).action, 'skipped');
+  assert.equal(f.moves.length, 0);
+});
 
 test('force section mapping is explicit and validated in configuration', () => {
   const base = { version: 1, mode: 'all-local' };
@@ -116,7 +244,7 @@ test('force status notifications do not exhaust retained observer slots', async 
     params: { threadId: `task-${i}`, status: { type: 'idle' } } })).action, 'unchanged');
 });
 
-for (const sourceSection of ['later', 'custom', 'progress', 'review']) {
+for (const sourceSection of ['custom', 'progress', 'review']) {
   test(`force active task out of ${sourceSection} using local reads only`, async () => {
     const f = fixture({ sourceSection });
     const result = await f.observer.reconcile('task');
@@ -147,7 +275,7 @@ test('an unsupported local pinned projection fails closed', async () => {
 for (const status of [{ type: 'idle' }, { type: 'systemError' },
   { type: 'active', activeFlags: ['waitingOnApproval'] }, { type: 'active', activeFlags: ['waitingOnUserInput'] }]) {
   test(`force ${JSON.stringify(status)} into review without prior start evidence`, async () => {
-    const f = fixture({ status, sourceSection: 'later' });
+    const f = fixture({ status, sourceSection: 'custom' });
     assert.equal((await f.observer.reconcile('task')).action, 'moved');
     assert.equal(f.state.thread.section.id, sections.forReview.localId);
   });
@@ -280,6 +408,15 @@ test('pinning during visibility delay blocks the retained start', async t => {
   const f = startupFixture(t);
   await assert.rejects(f.manager.handle(f.start), { code: 'TASK_NOT_VISIBLE' });
   f.state.listVisible = true; f.state.thread.section = { id: pinnedId, name: 'Pinned' };
+  await f.retry();
+  assert.equal(f.moves.length, 0); assert.equal(f.timers.size, 0);
+});
+
+test('For Later placement during a retry revokes the earlier explicit start', async t => {
+  const f = startupFixture(t);
+  await assert.rejects(f.manager.handle(newStart()), { code: 'TASK_NOT_VISIBLE' });
+  f.state.listVisible = true; f.state.thread.status = { type: 'active', activeFlags: [] };
+  f.state.thread.section = { id: laterId, name: 'For Later' }; f.state.thread.sectionEnteredAt = 102;
   await f.retry();
   assert.equal(f.moves.length, 0); assert.equal(f.timers.size, 0);
 });

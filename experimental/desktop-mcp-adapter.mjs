@@ -2,7 +2,7 @@
 // calls. Desktop owns logical section IDs and invalidation. Never forge _meta.
 import { PINNED_SECTION_ID, validateForceStatusSections } from './desktop-proxy-config.mjs';
 
-export function desktopMcpAdapter(rpc, threadId, { contextThreadId = threadId, forceStatusSections, activeFastPath = false } = {}) {
+export function desktopMcpAdapter(rpc, threadId, { contextThreadId = threadId, forceStatusSections, activeFastPath = false, forLaterStart = null } = {}) {
   if ([threadId, contextThreadId].some(id => typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id))) {
     throw Error('Explicit task identity required');
   }
@@ -24,7 +24,7 @@ export function desktopMcpAdapter(rpc, threadId, { contextThreadId = threadId, f
     try { return JSON.parse(text[0].text); } catch { throw Error('Invalid Desktop MCP JSON'); }
   }
   if (forceStatusSections !== undefined) return forceStatusAdapter(rpc, threadId,
-    validateForceStatusSections(forceStatusSections), call, activeFastPath);
+    validateForceStatusSections(forceStatusSections), call, activeFastPath, forLaterStart);
   async function snapshot() {
     const data = await call('list_threads', { limit: 50 });
     // Unknown protection is unavailable data, not a permanent task-policy
@@ -135,15 +135,30 @@ export function desktopMcpAdapter(rpc, threadId, { contextThreadId = threadId, f
   return adapter;
 }
 
-// Explicit opt-in: only direct Pinned placement is protected. Read only the
+// Explicit opt-in: Pinned is protected; For Later requires a subsequent start.
+// Read only the
 // attached local server; use the native Desktop move solely for UI invalidation.
 // Configured logical/raw IDs are deployment inputs, not inferred from task data.
-function forceStatusAdapter(rpc, threadId, mapping, call, activeFastPath) {
+function forceStatusAdapter(rpc, threadId, mapping, call, activeFastPath, forLaterStart) {
   // Reserved App Server section in the tested Desktop build, not a user ID.
   const pinnedId = PINNED_SECTION_ID;
   const names = { inProgress: 'In Progress', forReview: 'For Review' };
   const roots = ['cli', 'vscode', 'exec', 'appServer', 'unknown'];
+  let laterIds = new Set();
   let previous;
+  function protectDeferred(t) {
+    if (t.section?.name !== 'For Later' && !laterIds.has(t.section?.id)) return;
+    const seconds = value => Number.isFinite(value) && value >= 0;
+    // Both timestamps belong to the attached server. Never infer ordering from
+    // wall-clock receipt, updatedAt, an old active notification or retry age.
+    // Second-resolution ties and builds without these fields fail closed.
+    if (typeof forLaterStart?.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(forLaterStart.id)
+        || !seconds(forLaterStart.startedAt) || !seconds(t.sectionEnteredAt)
+        || forLaterStart.startedAt <= t.sectionEnteredAt
+        || t.status?.type !== 'active' || !Array.isArray(t.status.activeFlags) || t.status.activeFlags.length) {
+      throw Object.assign(Error('Protected For Later task'), { code: 'FOR_LATER_PROTECTED' });
+    }
+  }
   async function local(method, params = {}) {
     try { return await rpc.request(method, params); }
     catch (error) {
@@ -158,6 +173,7 @@ function forceStatusAdapter(rpc, threadId, mapping, call, activeFastPath) {
         || (t.hostId !== undefined && t.hostId !== 'local') || t.archived || t.isArchived) throw Error('Ineligible local task');
     if (t.section?.id === pinnedId) throw Error('Protected Pinned task');
     if (t.section !== null && (typeof t.section?.id !== 'string' || !t.section.id)) throw Error('Unknown local placement');
+    protectDeferred(t);
     return t;
   }
   async function nonarchived(t) {
@@ -197,6 +213,7 @@ function forceStatusAdapter(rpc, threadId, mapping, call, activeFastPath) {
       seen.add(cursor);
     } while (cursor !== null);
     if (data.filter(s => s.id === pinnedId).length !== 1) throw Error('Missing local pinned projection');
+    laterIds = new Set(data.filter(s => s.name === 'For Later').map(s => s.id));
     return Object.entries(mapping).map(([key, pair]) => {
       const matches = data.filter(s => s.id === pair.localId || s.name === names[key]);
       if (matches.length !== 1 || matches[0].id !== pair.localId || matches[0].name !== names[key]) throw Error('Configured section changed');

@@ -1,7 +1,11 @@
-# Local status grouping with Pinned protection — v0.4.0 opt-in
+# Local status grouping — For Later policy update (unreleased)
+
+This checkout adds a direct For Later exception to the released v0.4.0 force
+policy. Existing v0.4.0 installations still overwrite For Later until upgraded.
+The released behavior and evidence remain in [v0.4.0 notes](release-notes-v0.4.0.md).
 
 This is a new, explicitly selected policy, not a silent upgrade of existing
-manual-group protections. It targets the inspected ChatGPT Desktop
+manual-group protections. The released baseline targeted ChatGPT Desktop
 26.908.40834 (8881), bundled Codex CLI 0.154.0-alpha.6.2. Other builds need new
 verification. Protocol tests do not establish real Desktop GUI acceptance.
 
@@ -16,16 +20,43 @@ acceptance. See [current and historical evidence](local-boundary-acceptance.md).
 | Local root task | Result |
 | --- | --- |
 | Directly Pinned | No move |
+| Directly in For Later | Keep placement unless a provably subsequent turn starts; see below |
 | Active, no attention flags | In Progress |
 | Active, waiting for approval/user input | For Review |
 | Idle or systemError | For Review, without requiring remembered start evidence |
 | Unknown/notLoaded, malformed status or identity | No move |
 | Archived, ephemeral, subagent, excluded or remote | No move |
 
-For Later and other custom task groups are overwritten according to status.
+Other custom task groups are overwritten according to status.
 Project association and the Project's group are not classification inputs.
 Only the task moves: Project containers are never moved, including pinned
-containers. A child is protected only if the child itself is Pinned.
+containers. Parent placement does not protect a child.
+
+### For Later means deferred
+
+Only a current explicit `turn/started` event can release a directly deferred
+task. The attached server's `turn.startedAt` must be strictly greater than the
+fresh task's `sectionEnteredAt`, and fresh status must still be active with no
+attention flags. These checks repeat immediately before the native write.
+After a successful move to In Progress, completion follows the normal review rule.
+
+Idle, completion, attention, ordinary active notifications and periodic recovery
+cannot release For Later. Moving a running task there invalidates earlier start
+evidence, including delayed/retried starts. No persistent history or additional
+global/remote query is introduced; the timestamps come from the same server.
+For Later is identified by its current native section name or the local section
+list's ID. Renaming it removes the named rule, like other named destinations.
+
+Both timestamps have second precision. Missing/invalid fields or same-second
+operations stay deferred; unknown ordering is not guessed. A short turn already
+completed, or a start superseded by a later status notification before processing,
+also stays deferred. Resume a later turn or manually remove the task from For
+Later to release it. The final read/write race remains non-atomic.
+
+This patch is verified with synthetic regressions and isolated actual bundled
+App Server transports, not a live Desktop GUI acceptance. The inspected current
+app is 26.908.70816 (9275), bundled CLI 0.154.0-alpha.6.2. Do not reuse the older
+GUI sample above as acceptance of this policy change or the updated app build.
 
 ## Query path
 
@@ -65,8 +96,9 @@ retry delays of 250, 250, 250, 250, 500, 500, 1000, 2000 and 3000 ms, each after
 the preceding failure. Transport failures, idle-only events and the default
 policy retain the original 250, 750, 2000 and 5000 ms backoff.
 New tasks may start before their first user message makes them list-visible.
-Every retry rereads status and Pinned placement; an already-completed task goes
-directly to For Review. Missing/archived tasks never become eligible merely by
+Every retry rereads status and protected placement; an already-completed task
+goes directly to For Review unless directly deferred in For Later.
+Missing/archived tasks never become eligible merely by
 retrying. Invalid responses remain errors, and periodic recovery does not start
 a separate retry timer. Consecutive start-visibility failures allow at most nine
 retries (previously four), with the same eight seconds of timer waits, excluding

@@ -122,6 +122,7 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
             } };
             observers.set(id, createObserver(desktopMcpAdapter(guarded, id,
               { contextThreadId: currentRecovery ? entry.context : id, forceStatusSections: config.forceStatusSections,
+                forLaterStart: !currentRecovery && entry.latest?.method === 'turn/started' ? entry.latest.params?.turn : null,
                 activeFastPath: !currentRecovery && eventState(entry.latest, null)?.phase === 'active' }),
             { threadIds: [id], apply, allowProjectTasks: true, allowForLaterStart: true, forceStatus: !!config.forceStatusSections }));
             observers.get(id).forcePolicy = !!config.forceStatusSections;
@@ -141,6 +142,10 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
               && ['moved', 'unchanged'].includes(result.action))) observers.delete(id);
           action = result.action; entry.resolve(result);
         } catch (error) {
+          if (error.code === 'FOR_LATER_PROTECTED') {
+            observers.delete(id); action = 'skipped';
+            entry.resolve({ action, reason: 'for-later' }); continue;
+          }
           if (error.code === 'DESKTOP_RECONCILIATION_SUPERSEDED') {
             // Recovery may borrow another task's native-tool context. A real
             // lifecycle successor must rebuild with its own target context.

@@ -106,7 +106,8 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
       return status.activeFlags.length ? sections.forReview.sectionId : sections.inProgress.sectionId;
     }
     if (['idle', 'systemError'].includes(status?.type)
-        && (forceStatus || activeSeen.has(id) || thread.section?.id === sections.inProgress.sectionId)) return sections.forReview.sectionId;
+        && (activeSeen.has(id) || thread.section?.id === sections.inProgress.sectionId
+          || (forceStatus && thread.section?.id === sections.forReview.sectionId))) return sections.forReview.sectionId;
     return null;
   }
 
@@ -125,7 +126,13 @@ export function createObserver(rpc, { threadIds, apply = false, excludeThreadIds
     // user text. Preserve a short turn's start even if the current read is idle.
     const eventStatus = message?.method === 'thread/status/changed' ? message.params?.status
       : message?.method === 'thread/started' ? message.params?.thread?.status : null;
-    if (eligible(thread, id, sections) && (message?.method === 'turn/started' || (eventStatus?.type === 'active'
+    // Opening history also emits idle snapshots. Only an actual terminal turn
+    // notification can recover a missed start; a terminal snapshot cannot.
+    const completedTurn = forceStatus && message?.method === 'turn/completed'
+      && typeof message.params?.turn?.id === 'string' && message.params.turn.id.length > 0
+      && message.params.turn.id.length <= 128
+      && ['completed', 'interrupted', 'failed'].includes(message.params.turn.status);
+    if (eligible(thread, id, sections) && (completedTurn || message?.method === 'turn/started' || (eventStatus?.type === 'active'
         && Array.isArray(eventStatus.activeFlags)
         && eventStatus.activeFlags.every(f => ['waitingOnApproval', 'waitingOnUserInput'].includes(f))))) activeSeen.add(id);
     const target = destination(thread, id, sections);

@@ -24,11 +24,17 @@ acceptance. See [current and historical evidence](local-boundary-acceptance.md).
 | Directly in For Later | Keep placement unless a provably subsequent turn starts; see below |
 | Active, no attention flags | In Progress |
 | Active, waiting for approval/user input | For Review |
-| Idle or systemError | For Review, without requiring remembered start evidence |
+| Idle or systemError after observed execution, an explicit terminal turn event, or from In Progress | For Review |
+| Idle or systemError snapshot from untouched history | Keep placement; opening history is not execution |
 | Unknown/notLoaded, malformed status or identity | No move |
 | Archived, ephemeral, subagent, excluded or remote | No move |
 
 Other custom task groups are overwritten according to status.
+Since v0.4.2, merely opening an idle historical task or encountering it
+during periodic recovery does not move it to For Review. A real start/active
+event, validated terminal turn event, or existing In Progress placement is
+required; tasks already in For Review remain unchanged. This applies equally to
+standalone and Project-child tasks. Direct Pinned and For Later rules still win.
 Project association and the Project's group are not classification inputs.
 Only the task moves: Project containers are never moved, including pinned
 containers. Parent placement does not protect a child.

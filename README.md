@@ -1,5 +1,9 @@
 # Codex Sidebar Flow
 
+**v0.4.2 patch:** opening idle history no longer moves the task to For Review.
+See [verification, compatibility and rollback](docs/release-notes-v0.4.2.md).
+The previously published v0.4.1 baseline is described below.
+
 **v0.4.1** provides local status-driven grouping on the tested macOS Desktop
 build, including
 [periodic compensation](docs/local-compensation.md),

@@ -272,14 +272,49 @@ test('an unsupported local pinned projection fails closed', async () => {
   assert.equal(f.moves.length, 0);
 });
 
-for (const status of [{ type: 'idle' }, { type: 'systemError' },
-  { type: 'active', activeFlags: ['waitingOnApproval'] }, { type: 'active', activeFlags: ['waitingOnUserInput'] }]) {
+for (const status of [{ type: 'active', activeFlags: ['waitingOnApproval'] }, { type: 'active', activeFlags: ['waitingOnUserInput'] }]) {
   test(`force ${JSON.stringify(status)} into review without prior start evidence`, async () => {
     const f = fixture({ status, sourceSection: 'custom' });
     assert.equal((await f.observer.reconcile('task')).action, 'moved');
     assert.equal(f.state.thread.section.id, sections.forReview.localId);
   });
 }
+
+for (const projectId of [null, 'project']) for (const sourceSection of [null, 'custom']) {
+  test(`opening historical idle task preserves placement (${projectId}, ${sourceSection})`, async t => {
+    const f = fixture({ status: { type: 'idle' } });
+    f.state.thread.projectId = projectId;
+    f.state.thread.section = sourceSection ? { id: sourceSection } : null;
+    const manager = laterManager(t, f);
+    for (const method of ['thread/started', 'thread/status/changed']) {
+      await manager.handle({ method, params: method === 'thread/started'
+        ? { thread: structuredClone(f.state.thread) }
+        : { threadId: 'task', status: { type: 'idle' } } });
+    }
+    await manager.reconcile();
+    assert.equal(f.moves.length, 0);
+    assert.equal(f.state.thread.section?.id ?? null, sourceSection);
+    // A subsequent real execution still follows the full lifecycle.
+    f.state.thread.status = { type: 'active', activeFlags: [] };
+    await manager.handle(newStart());
+    f.state.thread.status = { type: 'idle' };
+    await manager.handle({ method: 'turn/completed', params: {
+      threadId: 'task', turn: { id: 'new-turn', status: 'completed' },
+    } });
+    assert.deepEqual(f.moves.map(m => m.sectionId), [sections.inProgress.desktopId, sections.forReview.desktopId]);
+  });
+}
+
+test('explicit completion recovers a missed start, while terminal snapshots do not', async t => {
+  const f = fixture({ status: { type: 'systemError' } });
+  const manager = laterManager(t, f);
+  assert.equal((await manager.reconcile()).moved, 0);
+  assert.equal(f.moves.length, 0);
+  await manager.handle({ method: 'turn/completed', params: {
+    threadId: 'task', turn: { id: 'failed-turn', status: 'failed' },
+  } });
+  assert.deepEqual(f.moves.map(m => m.sectionId), [sections.forReview.desktopId]);
+});
 
 for (const status of [{ type: 'notLoaded' }, { type: 'active' }, { type: 'active', activeFlags: ['unknown'] }]) {
   test(`unknown runtime status does not authorize movement: ${JSON.stringify(status)}`, async () => {

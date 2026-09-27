@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-27
+
+- Do not classify opening idle history as completed execution in local status
+  grouping. Review movement requires execution evidence or existing In Progress
+  placement; explicit terminal turn events can recover missed starts. Add
+  standalone/Project-child opening and recovery regressions. Pinned and For
+  Later protections remain unchanged.
+- After relaunch on ChatGPT Desktop 26.924.20706 (11431), the user confirmed
+  that opening an idle historical task without execution preserved placement.
+  The current running task moved in approximately 484 ms (observer timing,
+  not rendered-pixel latency). See the scoped v0.4.2 verification notes.
+
 ## [0.4.1] - 2026-09-17
 
 - In explicit local status-grouping mode, preserve direct For Later placement

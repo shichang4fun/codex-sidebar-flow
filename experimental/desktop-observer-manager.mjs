@@ -97,8 +97,8 @@ export function createDesktopObserverManager(rpc, { readConfig, apply = true,
           if (stopped || !isManagedTask(config, id)) {
             observers.delete(id); action = 'skipped'; entry.resolve({ action }); continue;
           }
-          // Force mode has no historical start dependency; rebuild its small
-          // adapter so a configuration change cannot retain old destinations.
+          // Rebuild the force-mode adapter for fresh event hints and destinations.
+          // Terminal recovery uses this event's evidence or In Progress placement.
           if (!observers.has(id) || currentRecovery || config.forceStatusSections || observers.get(id).forcePolicy) {
             if (!config.forceStatusSections && !observers.has(id) && observers.size >= 256) { action = 'skipped'; entry.resolve({ action, reason: 'task-limit' }); continue; }
             const guarded = { async request(method, params) {
